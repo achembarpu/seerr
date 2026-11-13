@@ -1,6 +1,7 @@
 import TheMovieDb from '@server/api/themoviedb';
 import type { TmdbSearchMultiResponse } from '@server/api/themoviedb/interfaces';
 import Media from '@server/entity/Media';
+import { searchMedia } from '@server/lib/mediaSearch';
 import { findSearchProvider } from '@server/lib/search';
 import logger from '@server/logger';
 import { mapSearchResults } from '@server/models/Search';
@@ -26,9 +27,10 @@ searchRoutes.get('/', async (req, res, next) => {
     } else {
       const tmdb = new TheMovieDb();
 
-      results = await tmdb.searchMulti({
+      results = await searchMedia({
+        search: tmdb.searchMulti,
         query: queryString,
-        page: Number(req.query.page),
+        page: Number(req.query.page) || 1,
         language: (req.query.language as string) ?? req.locale,
       });
     }
