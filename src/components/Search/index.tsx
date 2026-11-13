@@ -17,6 +17,8 @@ const messages = defineMessages('components.Search', {
   search: 'Search',
   searchresults: 'Search Results',
   suggestions: 'Possible title matches',
+  imdbAttribution:
+    'Information courtesy of IMDb (https://www.imdb.com). Used with permission.',
 });
 
 const Search = () => {
@@ -68,6 +70,9 @@ const Search = () => {
           <div className="mb-5 mt-1">
             <Header>{intl.formatMessage(messages.suggestions)}</Header>
           </div>
+          <p className="mb-3 text-sm text-gray-400">
+            {intl.formatMessage(messages.imdbAttribution)}
+          </p>
           <ListView
             items={suggestions}
             isEmpty={false}

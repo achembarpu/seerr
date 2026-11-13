@@ -67,7 +67,7 @@ const messages = defineMessages('components.Settings.SettingsMain', {
     'Hide media that has been requested from the discover pages but not search results',
   localTitleSearch: 'Local typo-tolerant title search',
   localTitleSearchTip:
-    'Download and refresh TMDB and IMDb title indexes in the background. IMDb data is for personal, non-commercial use and is subject to IMDb terms.',
+    'Download and refresh TMDB and IMDb title indexes in the background. IMDb permits a personal movie database for individual personal, non-commercial use, subject to its terms.',
   cacheImages: 'Enable Image Caching',
   cacheImagesTip:
     'Cache externally sourced images (requires a significant amount of disk space)',
