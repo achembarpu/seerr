@@ -17,6 +17,11 @@ export interface TitleMatch extends IndexedTitle {
   score: number;
 }
 
+export interface ImdbRating {
+  sourceId: string;
+  votes: number;
+}
+
 interface CandidateRow extends IndexedTitle {
   source: IndexSource;
 }
@@ -124,6 +129,12 @@ export class SearchIndex {
     await this.run(
       'CREATE TABLE IF NOT EXISTS index_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)'
     );
+    await this.run(
+      'CREATE TABLE IF NOT EXISTS imdb_votes (sourceId TEXT PRIMARY KEY, votes INTEGER NOT NULL) WITHOUT ROWID'
+    );
+    await this.run(
+      'CREATE TEMP TABLE IF NOT EXISTS incoming_votes (sourceId TEXT PRIMARY KEY, votes INTEGER NOT NULL) WITHOUT ROWID'
+    );
     await this.run(`CREATE TEMP TABLE IF NOT EXISTS incoming_titles (
       sourceId TEXT PRIMARY KEY,
       mediaType TEXT NOT NULL,
@@ -180,6 +191,15 @@ export class SearchIndex {
       throw new Error(
         'Refusing to replace the search index with an empty import'
       );
+    const [previous] = await this.all<{ count: number }>(
+      'SELECT count(*) AS count FROM titles WHERE source = ?',
+      [source]
+    );
+    if (previous.count > 1000 && count < previous.count * 0.5) {
+      throw new Error(
+        'Refusing to replace the search index with an incomplete import'
+      );
+    }
     let releasePublication: () => void = () => undefined;
     this.publication = new Promise<void>((resolve) => {
       releasePublication = resolve;
@@ -224,7 +244,67 @@ export class SearchIndex {
     this.importing = undefined;
   }
 
-  async version(source: IndexSource): Promise<string | undefined> {
+  async beginRatingsImport(): Promise<void> {
+    if (this.importing)
+      throw new Error('A search index import is already running');
+    this.importing = 'imdb';
+    try {
+      await this.run('DELETE FROM incoming_votes');
+    } catch (error) {
+      this.importing = undefined;
+      throw error;
+    }
+  }
+
+  async writeRatingsBatch(ratings: ImdbRating[]): Promise<void> {
+    for (let offset = 0; offset < ratings.length; offset += 300) {
+      const batch = ratings.slice(offset, offset + 300);
+      await this.run(
+        `INSERT OR REPLACE INTO incoming_votes VALUES ${batch.map(() => '(?,?)').join(',')}`,
+        batch.flatMap(({ sourceId, votes }) => [sourceId, votes])
+      );
+    }
+  }
+
+  async finishRatingsImport(version: string): Promise<void> {
+    const [{ count }] = await this.all<{ count: number }>(
+      'SELECT count(*) AS count FROM incoming_votes'
+    );
+    if (!count)
+      throw new Error('Refusing to replace IMDb ratings with an empty import');
+    const [previous] = await this.all<{ count: number }>(
+      'SELECT count(*) AS count FROM imdb_votes'
+    );
+    if (previous.count > 1000 && count < previous.count * 0.5)
+      throw new Error(
+        'Refusing to replace IMDb ratings with an incomplete import'
+      );
+    let release: () => void = () => undefined;
+    this.publication = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await this.run('BEGIN IMMEDIATE');
+      await this.run('DELETE FROM imdb_votes');
+      await this.run('INSERT INTO imdb_votes SELECT * FROM incoming_votes');
+      await this.run(
+        'INSERT OR REPLACE INTO index_metadata(key, value) VALUES (?, ?)',
+        ['imdb-ratings', version]
+      );
+      await this.run('COMMIT');
+      this.importing = undefined;
+    } catch (error) {
+      await this.run('ROLLBACK').catch(() => undefined);
+      throw error;
+    } finally {
+      this.publication = undefined;
+      release();
+    }
+  }
+
+  async version(
+    source: IndexSource | 'imdb-ratings'
+  ): Promise<string | undefined> {
     const rows = await this.all<{ value: string }>(
       'SELECT value FROM index_metadata WHERE key = ?',
       [source]
@@ -241,8 +321,9 @@ export class SearchIndex {
       .map((gram) => `"${gram.replace(/"/g, '""')}"`)
       .join(' OR ');
     const candidates = await this.all<CandidateRow>(
-      `SELECT t.source, t.sourceId, t.mediaType, t.title, t.originalTitle, t.popularity
+      `SELECT t.source, t.sourceId, t.mediaType, t.title, t.originalTitle, CASE WHEN t.source = 'imdb' THEN COALESCE(v.votes, 0) ELSE t.popularity END AS popularity
       FROM title_fts JOIN titles t ON t.id = title_fts.rowid
+      LEFT JOIN imdb_votes v ON t.source = 'imdb' AND t.sourceId = v.sourceId
       WHERE title_fts MATCH ? ORDER BY rank LIMIT 5000`,
       [expression]
     );

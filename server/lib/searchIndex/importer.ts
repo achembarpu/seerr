@@ -1,4 +1,5 @@
 import type {
+  ImdbRating,
   IndexSource,
   IndexedTitle,
   SearchIndex,
@@ -16,6 +17,25 @@ const imdbTypes: Record<string, IndexedTitle['mediaType']> = {
   tvSeries: 'tv',
   tvMiniSeries: 'tv',
 };
+
+export async function* parseImdbRatings(
+  lines: AsyncIterable<string>
+): AsyncGenerator<ImdbRating> {
+  let header = true;
+  for await (const line of lines) {
+    if (header) {
+      if (line !== 'tconst\taverageRating\tnumVotes')
+        throw new Error('Invalid IMDb ratings header');
+      header = false;
+      continue;
+    }
+    const [sourceId, , count] = line.split('\t');
+    const votes = Number(count);
+    if (/^tt\d+$/.test(sourceId) && Number.isSafeInteger(votes) && votes >= 0)
+      yield { sourceId, votes };
+  }
+  if (header) throw new Error('IMDb ratings dataset is empty');
+}
 
 /** Read the official IMDb TSV without retaining the dataset in memory. */
 export async function* parseImdbTitles(
@@ -185,6 +205,46 @@ export async function refreshImdb(
     parseImdbTitles(decompressLines(response.data)),
     version
   );
+}
+
+export async function refreshImdbRatings(
+  index: SearchIndex
+): Promise<number | undefined> {
+  const previous = await index.version('imdb-ratings');
+  const response = await client.get<Readable>(
+    'https://datasets.imdbws.com/title.ratings.tsv.gz',
+    {
+      headers: previous ? { 'If-None-Match': previous } : undefined,
+      validateStatus: (status) => status === 200 || status === 304,
+    }
+  );
+  if (response.status === 304) {
+    response.data.destroy();
+    return undefined;
+  }
+  const version =
+    typeof response.headers.etag === 'string' ? response.headers.etag : '';
+  await index.beginRatingsImport();
+  let count = 0;
+  let batch: ImdbRating[] = [];
+  try {
+    for await (const rating of parseImdbRatings(
+      decompressLines(response.data)
+    )) {
+      batch.push(rating);
+      count++;
+      if (batch.length === 1000) {
+        await index.writeRatingsBatch(batch);
+        batch = [];
+      }
+    }
+    await index.writeRatingsBatch(batch);
+    await index.finishRatingsImport(version);
+    return count;
+  } catch (error) {
+    index.abortImport();
+    throw error;
+  }
 }
 
 export async function refreshTmdb(

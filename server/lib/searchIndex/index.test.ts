@@ -98,4 +98,19 @@ describe('local title search index', () => {
     await assert.rejects(index.finishImport('empty'), /empty import/);
     assert.equal(await index.version('imdb'), undefined);
   });
+
+  it('uses IMDb vote counts as a modest ranking signal and retains them on failure', async () => {
+    await index.beginImport('imdb');
+    await index.writeBatch([movie('tt1', 'Mandala'), movie('tt2', 'Mandela')]);
+    await index.finishImport('titles');
+    await index.beginRatingsImport();
+    await index.writeRatingsBatch([{ sourceId: 'tt2', votes: 20000 }]);
+    await index.finishRatingsImport('ratings');
+    assert.equal((await index.search('mandla'))[0]?.sourceId, 'tt2');
+    await index.beginRatingsImport();
+    await assert.rejects(index.finishRatingsImport('empty'));
+    index.abortImport();
+    assert.equal((await index.search('mandla'))[0]?.sourceId, 'tt2');
+    assert.equal(await index.version('imdb-ratings'), 'ratings');
+  });
 });
