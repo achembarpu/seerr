@@ -65,6 +65,9 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   hideRequested: 'Hide Requested Media',
   hideRequestedTip:
     'Hide media that has been requested from the discover pages but not search results',
+  localTitleSearch: 'Local typo-tolerant title search',
+  localTitleSearchTip:
+    'Download and refresh TMDB and IMDb title indexes in the background. IMDb data is for personal, non-commercial use and is subject to IMDb terms.',
   cacheImages: 'Enable Image Caching',
   cacheImagesTip:
     'Cache externally sourced images (requires a significant amount of disk space)',
@@ -180,6 +183,7 @@ const SettingsMain = () => {
             blocklistedTagsLimit: data?.blocklistedTagsLimit || 50,
             partialRequestsEnabled: data?.partialRequestsEnabled,
             enableSpecialEpisodes: data?.enableSpecialEpisodes,
+            localTitleSearch: data?.localTitleSearch,
             cacheImages: data?.cacheImages,
             youtubeUrl: data?.youtubeUrl,
             versionCheck: data?.versionCheck,
@@ -204,6 +208,7 @@ const SettingsMain = () => {
                 blocklistedTagsLimit: values.blocklistedTagsLimit,
                 partialRequestsEnabled: values.partialRequestsEnabled,
                 enableSpecialEpisodes: values.enableSpecialEpisodes,
+                localTitleSearch: values.localTitleSearch,
                 cacheImages: values.cacheImages,
                 youtubeUrl: values.youtubeUrl,
                 versionCheck: values?.versionCheck,
@@ -315,6 +320,27 @@ const SettingsMain = () => {
                       typeof errors.applicationUrl === 'string' && (
                         <div className="error">{errors.applicationUrl}</div>
                       )}
+                  </div>
+                </div>
+                <div className="form-row">
+                  <label htmlFor="localTitleSearch" className="checkbox-label">
+                    {intl.formatMessage(messages.localTitleSearch)}
+                    <span className="label-tip">
+                      {intl.formatMessage(messages.localTitleSearchTip)}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      type="checkbox"
+                      id="localTitleSearch"
+                      name="localTitleSearch"
+                      onChange={() =>
+                        setFieldValue(
+                          'localTitleSearch',
+                          !values.localTitleSearch
+                        )
+                      }
+                    />
                   </div>
                 </div>
                 <div className="form-row">

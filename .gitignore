@@ -75,6 +75,9 @@ tsconfig.tsbuildinfo
 # Webstorm
 .idea
 
+# Local search index
+config/search-index.sqlite3*
+
 # Config Cache Directory
 config/cache
 

@@ -1,13 +1,95 @@
 import TheMovieDb from '@server/api/themoviedb';
-import type { TmdbSearchMultiResponse } from '@server/api/themoviedb/interfaces';
+import type {
+  TmdbMovieResult,
+  TmdbSearchMultiResponse,
+  TmdbTvResult,
+} from '@server/api/themoviedb/interfaces';
 import Media from '@server/entity/Media';
 import { searchMedia } from '@server/lib/mediaSearch';
 import { findSearchProvider } from '@server/lib/search';
+import searchIndex from '@server/lib/searchIndex/service';
 import logger from '@server/logger';
-import { mapSearchResults } from '@server/models/Search';
+import {
+  mapMovieDetailsToResult,
+  mapSearchResults,
+  mapTvDetailsToResult,
+} from '@server/models/Search';
 import { Router } from 'express';
 
 const searchRoutes = Router();
+
+searchRoutes.get('/suggestions', async (req, res) => {
+  const query =
+    typeof req.query.query === 'string' ? req.query.query.trim() : '';
+  if (
+    query.length < 3 ||
+    query.length > 120 ||
+    findSearchProvider(query.toLowerCase())
+  )
+    return res.status(200).json({ results: [] });
+  try {
+    const matches = await searchIndex.search(query);
+    const tmdb = new TheMovieDb();
+    const language = (req.query.language as string) ?? req.locale;
+    const resolved = await Promise.allSettled(
+      matches.map(
+        async (match): Promise<TmdbMovieResult | TmdbTvResult | undefined> => {
+          if (match.source === 'imdb') {
+            const result = await tmdb.getByExternalId({
+              externalId: match.sourceId,
+              type: 'imdb',
+              language,
+            });
+            const item =
+              match.mediaType === 'movie'
+                ? result.movie_results[0]
+                : result.tv_results[0];
+            return item
+              ? ({ ...item, media_type: match.mediaType } as
+                  | TmdbMovieResult
+                  | TmdbTvResult)
+              : undefined;
+          }
+          return match.mediaType === 'movie'
+            ? mapMovieDetailsToResult(
+                await tmdb.getMovie({
+                  movieId: Number(match.sourceId),
+                  language,
+                })
+              )
+            : mapTvDetailsToResult(
+                await tmdb.getTvShow({ tvId: Number(match.sourceId), language })
+              );
+        }
+      )
+    );
+    const seen = new Set<string>();
+    const results: (TmdbMovieResult | TmdbTvResult)[] = [];
+    for (const value of resolved) {
+      if (value.status !== 'fulfilled' || !value.value) continue;
+      const result = value.value;
+      const key = `${result.media_type}:${result.id}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        results.push(result);
+      }
+    }
+    const media = await Media.getRelatedMedia(
+      req.user,
+      results.map((result) => ({
+        tmdbId: result.id,
+        mediaType: result.media_type,
+      }))
+    );
+    return res.status(200).json({ results: mapSearchResults(results, media) });
+  } catch (error) {
+    logger.warn('Unable to retrieve local search suggestions', {
+      label: 'Search',
+      errorMessage: error instanceof Error ? error.message : String(error),
+    });
+    return res.status(200).json({ results: [] });
+  }
+});
 
 searchRoutes.get('/', async (req, res, next) => {
   const queryString = req.query.query as string;

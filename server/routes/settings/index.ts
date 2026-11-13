@@ -21,6 +21,7 @@ import ImageProxy from '@server/lib/imageproxy';
 import { Permission } from '@server/lib/permissions';
 import { jellyfinFullScanner } from '@server/lib/scanners/jellyfin';
 import { plexFullScanner } from '@server/lib/scanners/plex';
+import searchIndex from '@server/lib/searchIndex/service';
 import type { JobId, Library, MainSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
@@ -83,6 +84,7 @@ settingsRoutes.post('/main', async (req, res) => {
 
   settings.main = merge(settings.main, req.body);
   await settings.save();
+  searchIndex.start();
 
   return res.status(200).json(settings.main);
 });

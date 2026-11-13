@@ -37,6 +37,12 @@ Check out our documentation for instructions on how to install and run Seerr:
 
 https://docs.seerr.dev/getting-started/
 
+## Local title search
+
+Administrators can enable local typo-tolerant title search in General Settings. Seerr downloads IMDb title and vote datasets and TMDB title exports, builds a local index in the configuration directory, and refreshes it daily. Building the index needs disk space and network access; normal TMDB search remains available while it builds or if a refresh fails. The suggestions section appears alongside regular search results, including people.
+
+The IMDb datasets are available for personal, non-commercial use and are subject to [IMDb's terms](https://data.imdb.com/non-commercial-datasets/). Enable this feature only if your use complies. Disabling it stops new refreshes and suggestions but retains the rebuildable index on disk. An import already in progress may finish.
+
 ## Preview
 
 <img src="./public/preview.jpg" alt="Seerr application preview" />

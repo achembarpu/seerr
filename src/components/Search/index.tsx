@@ -11,10 +11,12 @@ import type {
 } from '@server/models/Search';
 import { useRouter } from 'next/router';
 import { useIntl } from 'react-intl';
+import useSWR from 'swr';
 
 const messages = defineMessages('components.Search', {
   search: 'Search',
   searchresults: 'Search Results',
+  suggestions: 'Possible title matches',
 });
 
 const Search = () => {
@@ -37,6 +39,23 @@ const Search = () => {
     { hideAvailable: false, hideBlocklisted: false, hideRequested: false }
   );
 
+  const query =
+    typeof router.query.query === 'string' ? router.query.query : '';
+  const { data: suggestionsData } = useSWR<{
+    results: (MovieResult | TvResult)[];
+  }>(
+    query.length >= 3
+      ? `/api/v1/search/suggestions?query=${encodeURIComponent(query)}`
+      : null,
+    { revalidateOnFocus: false }
+  );
+  const visible = new Set(
+    titles.map((title) => `${title.mediaType}:${title.id}`)
+  );
+  const suggestions = (suggestionsData?.results ?? []).filter(
+    (title) => !visible.has(`${title.mediaType}:${title.id}`)
+  );
+
   if (error) {
     return <ErrorPage statusCode={500} />;
   }
@@ -44,12 +63,26 @@ const Search = () => {
   return (
     <>
       <PageTitle title={intl.formatMessage(messages.search)} />
+      {suggestions.length > 0 && (
+        <>
+          <div className="mb-5 mt-1">
+            <Header>{intl.formatMessage(messages.suggestions)}</Header>
+          </div>
+          <ListView
+            items={suggestions}
+            isEmpty={false}
+            isLoading={false}
+            isReachingEnd
+            onScrollBottom={() => undefined}
+          />
+        </>
+      )}
       <div className="mb-5 mt-1">
         <Header>{intl.formatMessage(messages.searchresults)}</Header>
       </div>
       <ListView
         items={titles}
-        isEmpty={isEmpty}
+        isEmpty={isEmpty && suggestions.length === 0}
         isLoading={
           isLoadingInitialData || (isLoadingMore && (titles?.length ?? 0) > 0)
         }
