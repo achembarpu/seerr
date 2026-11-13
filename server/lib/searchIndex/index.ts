@@ -24,7 +24,11 @@ export interface ImdbRating {
 
 interface CandidateRow extends IndexedTitle {
   source: IndexSource;
+  searchTitle: string;
+  searchOriginalTitle: string;
 }
+
+const SEARCH_CACHE_SIZE = 128;
 
 // Combining marks and joiners are part of words in scripts such as Tamil and
 // Malayalam. Keep them instead of treating them as punctuation.
@@ -36,8 +40,7 @@ export const normalizeTitle = (value: string): string =>
     .trim()
     .replace(/\s+/g, ' ');
 
-const similarity = (query: string, value: string): number => {
-  const name = normalizeTitle(value);
+const similarity = (query: string, name: string): number => {
   if (!name) return 0;
 
   let score = jaro(query, name).similarity;
@@ -66,10 +69,14 @@ const trigrams = (query: string): string[] => {
 /** A disposable, independently rebuildable search index. */
 export class SearchIndex {
   private database: sqlite3.Database;
+  private reader?: sqlite3.Database;
   private importing?: IndexSource;
   private publication?: Promise<void>;
+  private revision = 0;
+  private readonly searchCache = new Map<string, TitleMatch[]>();
+  private readonly pendingSearches = new Map<string, Promise<TitleMatch[]>>();
 
-  constructor(filename: string) {
+  constructor(private readonly filename: string) {
     this.database = new sqlite3.Database(filename);
   }
 
@@ -84,9 +91,13 @@ export class SearchIndex {
     });
   }
 
-  private all<T>(sql: string, params: (string | number)[] = []): Promise<T[]> {
+  private all<T>(
+    sql: string,
+    params: (string | number)[] = [],
+    database = this.database
+  ): Promise<T[]> {
     return new Promise((resolve, reject) => {
-      this.database.all<T>(sql, params, (error, rows) =>
+      database.all<T>(sql, params, (error, rows) =>
         error ? reject(error) : resolve(rows)
       );
     });
@@ -144,6 +155,17 @@ export class SearchIndex {
       searchOriginalTitle TEXT NOT NULL,
       popularity REAL NOT NULL
     ) WITHOUT ROWID`);
+    // A separate connection can read the last committed WAL snapshot while a
+    // large import is published. In-memory databases are connection-local.
+    if (this.filename && this.filename !== ':memory:' && !this.reader) {
+      this.reader = await new Promise<sqlite3.Database>((resolve, reject) => {
+        const reader: sqlite3.Database = new sqlite3.Database(
+          this.filename,
+          sqlite3.OPEN_READONLY,
+          (error) => (error ? reject(error) : resolve(reader))
+        );
+      });
+    }
   }
 
   async beginImport(source: IndexSource): Promise<void> {
@@ -165,15 +187,20 @@ export class SearchIndex {
     for (let offset = 0; offset < titles.length; offset += 100) {
       const batch = titles.slice(offset, offset + 100);
       const values = batch.map(() => '(?,?,?,?,?,?,?)').join(',');
-      const params = batch.flatMap((item) => [
-        item.sourceId,
-        item.mediaType,
-        item.title,
-        item.originalTitle,
-        normalizeTitle(item.title),
-        normalizeTitle(item.originalTitle),
-        item.popularity,
-      ]);
+      const params = batch.flatMap((item) => {
+        const title = normalizeTitle(item.title);
+        return [
+          item.sourceId,
+          item.mediaType,
+          item.title,
+          item.originalTitle,
+          title,
+          item.originalTitle === item.title
+            ? title
+            : normalizeTitle(item.originalTitle),
+          item.popularity,
+        ];
+      });
       await this.run(
         `INSERT OR REPLACE INTO incoming_titles VALUES ${values}`,
         params
@@ -230,6 +257,8 @@ export class SearchIndex {
         [source, version]
       );
       await this.run('COMMIT');
+      this.revision++;
+      this.searchCache.clear();
       this.importing = undefined;
     } catch (error) {
       await this.run('ROLLBACK').catch(() => undefined);
@@ -297,6 +326,8 @@ export class SearchIndex {
         ['imdb-ratings', version]
       );
       await this.run('COMMIT');
+      this.revision++;
+      this.searchCache.clear();
       this.importing = undefined;
     } catch (error) {
       await this.run('ROLLBACK').catch(() => undefined);
@@ -338,28 +369,71 @@ export class SearchIndex {
   }
 
   async search(query: string, limit = 20): Promise<TitleMatch[]> {
-    await this.publication;
+    if (!this.reader) await this.publication;
     const normalized = normalizeTitle(query);
     const grams = trigrams(normalized);
     if (!grams.length) return [];
+    const revision = this.revision;
+    const key = `${revision}:${limit}:${normalized}`;
+    const cached = this.searchCache.get(key);
+    if (cached) {
+      this.searchCache.delete(key);
+      this.searchCache.set(key, cached);
+      return cached.map((match) => ({ ...match }));
+    }
+
+    let pending = this.pendingSearches.get(key);
+    if (!pending) {
+      pending = this.findMatches(normalized, grams, limit);
+      this.pendingSearches.set(key, pending);
+    }
+    try {
+      const matches = await pending;
+      if (revision === this.revision) {
+        this.searchCache.delete(key);
+        this.searchCache.set(key, matches);
+        if (this.searchCache.size > SEARCH_CACHE_SIZE) {
+          const oldest = this.searchCache.keys().next().value;
+          if (oldest !== undefined) this.searchCache.delete(oldest);
+        }
+      }
+      return matches.map((match) => ({ ...match }));
+    } finally {
+      if (this.pendingSearches.get(key) === pending)
+        this.pendingSearches.delete(key);
+    }
+  }
+
+  private async findMatches(
+    normalized: string,
+    grams: string[],
+    limit: number
+  ): Promise<TitleMatch[]> {
     const expression = grams
       .map((gram) => `"${gram.replace(/"/g, '""')}"`)
       .join(' OR ');
     const candidates = await this.all<CandidateRow>(
-      `SELECT t.source, t.sourceId, t.mediaType, t.title, t.originalTitle, CASE WHEN t.source = 'imdb' THEN COALESCE(v.votes, 0) ELSE t.popularity END AS popularity
+      `SELECT t.source, t.sourceId, t.mediaType, t.title, t.originalTitle, t.searchTitle, t.searchOriginalTitle, CASE WHEN t.source = 'imdb' THEN COALESCE(v.votes, 0) ELSE t.popularity END AS popularity
       FROM title_fts JOIN titles t ON t.id = title_fts.rowid
       LEFT JOIN imdb_votes v ON t.source = 'imdb' AND t.sourceId = v.sourceId
       WHERE title_fts MATCH ? ORDER BY rank LIMIT 5000`,
-      [expression]
+      [expression],
+      this.reader
     );
     return candidates
-      .map((candidate) => ({
-        ...candidate,
-        score: Math.max(
-          similarity(normalized, candidate.title),
-          similarity(normalized, candidate.originalTitle)
-        ),
-      }))
+      .map(({ searchTitle, searchOriginalTitle, ...candidate }) => {
+        const titleScore = similarity(normalized, searchTitle);
+        return {
+          ...candidate,
+          score:
+            searchOriginalTitle === searchTitle
+              ? titleScore
+              : Math.max(
+                  titleScore,
+                  similarity(normalized, searchOriginalTitle)
+                ),
+        };
+      })
       .filter((candidate) => candidate.score >= 0.78)
       .sort(
         (a, b) =>
@@ -372,8 +446,16 @@ export class SearchIndex {
   }
 
   async close(): Promise<void> {
-    await new Promise<void>((resolve, reject) =>
-      this.database.close((error) => (error ? reject(error) : resolve()))
+    const databases = this.reader
+      ? [this.reader, this.database]
+      : [this.database];
+    await Promise.all(
+      databases.map(
+        (database) =>
+          new Promise<void>((resolve, reject) =>
+            database.close((error) => (error ? reject(error) : resolve()))
+          )
+      )
     );
   }
 }

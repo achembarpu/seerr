@@ -119,7 +119,10 @@ const SettingsMain = () => {
     mutate: refreshSearchIndexStatus,
   } = useSWR<SearchIndexStatus>(
     data?.localTitleSearch ? '/api/v1/settings/search-index' : null,
-    { refreshInterval: 3000, revalidateOnFocus: false }
+    {
+      refreshInterval: (status) => (status?.refreshing ? 3000 : 30000),
+      revalidateOnFocus: false,
+    }
   );
   const sourceLabels = {
     imdb: messages.searchIndexImdb,

@@ -1,6 +1,6 @@
 import { SearchIndex } from '@server/lib/searchIndex';
 import {
-  decompressLines,
+  decompressLineBatches,
   importTitleStream,
   parseImdbTitles,
   parseTmdbTitles,
@@ -25,10 +25,11 @@ describe('search index imports', () => {
       'tt2\ttvSeries\tExample Series\t\\N\t0',
       'tt3\ttvEpisode\tEpisode\tEpisode\t0',
       'tt4\tmovie\tAdult\tAdult\t1',
+      'tt5\tconstructor\tInvalid\tInvalid\t0',
     ].join('\n');
     const result = [];
     for await (const row of parseImdbTitles(
-      decompressLines(compressedLines(text))
+      decompressLineBatches(compressedLines(text))
     ))
       result.push(row);
     assert.equal(result.length, 2);
@@ -44,7 +45,7 @@ describe('search index imports', () => {
     ].join('\n');
     const result = [];
     for await (const row of parseTmdbTitles(
-      decompressLines(compressedLines(text)),
+      decompressLineBatches(compressedLines(text)),
       'movie'
     ))
       result.push(row);
@@ -53,6 +54,27 @@ describe('search index imports', () => {
       ['987895']
     );
     assert.equal(result[0].title, 'மாவீரன்');
+  });
+
+  it('reads batched lines with reordered headers, split Unicode, and CRLF endings', async () => {
+    const text = [
+      'originalTitle\tisAdult\tprimaryTitle\ttitleType\ttconst',
+      'மாவீரன்\t0\tMaaveeran\tmovie\ttt22543326',
+      'Episode\t0\tEpisode\ttvEpisode\ttt2',
+      'പത്താ\t0\tBaththa\tmovie\ttt44090278',
+    ].join('\r\n');
+    const rows = [];
+    for await (const row of parseImdbTitles(
+      decompressLineBatches(compressedLines(text))
+    ))
+      rows.push(row);
+    assert.deepEqual(
+      rows.map((row) => [row.sourceId, row.originalTitle]),
+      [
+        ['tt22543326', 'மாவீரன்'],
+        ['tt44090278', 'പത്താ'],
+      ]
+    );
   });
 
   it('keeps the existing index when a compressed import is truncated', async () => {
@@ -64,14 +86,14 @@ describe('search index imports', () => {
       await importTitleStream(
         index,
         'imdb',
-        parseImdbTitles(decompressLines(compressedLines(text))),
+        parseImdbTitles(decompressLineBatches(compressedLines(text))),
         'v1'
       );
       await assert.rejects(
         importTitleStream(
           index,
           'imdb',
-          parseImdbTitles(decompressLines(compressedLines(text, true))),
+          parseImdbTitles(decompressLineBatches(compressedLines(text, true))),
           'v2'
         )
       );

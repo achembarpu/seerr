@@ -11,109 +11,125 @@ import type { Readable } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 import { createGunzip } from 'node:zlib';
 
-const imdbTypes: Record<string, IndexedTitle['mediaType']> = {
-  movie: 'movie',
-  tvMovie: 'movie',
-  tvSeries: 'tv',
-  tvMiniSeries: 'tv',
-};
+const imdbTypes: Record<string, IndexedTitle['mediaType']> = Object.assign(
+  Object.create(null),
+  {
+    movie: 'movie',
+    tvMovie: 'movie',
+    tvSeries: 'tv',
+    tvMiniSeries: 'tv',
+  }
+);
+
+type Lines = AsyncIterable<readonly string[]>;
 
 export async function* parseImdbRatings(
-  lines: AsyncIterable<string>
+  lines: Lines
 ): AsyncGenerator<ImdbRating> {
   let header = true;
-  for await (const line of lines) {
-    if (header) {
-      if (line !== 'tconst\taverageRating\tnumVotes')
-        throw new Error('Invalid IMDb ratings header');
-      header = false;
-      continue;
+  for await (const chunk of lines) {
+    for (const line of chunk) {
+      if (header) {
+        if (line !== 'tconst\taverageRating\tnumVotes')
+          throw new Error('Invalid IMDb ratings header');
+        header = false;
+        continue;
+      }
+      const [sourceId, , count] = line.split('\t');
+      const votes = Number(count);
+      if (/^tt\d+$/.test(sourceId) && Number.isSafeInteger(votes) && votes >= 0)
+        yield { sourceId, votes };
     }
-    const [sourceId, , count] = line.split('\t');
-    const votes = Number(count);
-    if (/^tt\d+$/.test(sourceId) && Number.isSafeInteger(votes) && votes >= 0)
-      yield { sourceId, votes };
   }
   if (header) throw new Error('IMDb ratings dataset is empty');
 }
 
 /** Read the official IMDb TSV without retaining the dataset in memory. */
 export async function* parseImdbTitles(
-  lines: AsyncIterable<string>
+  lines: Lines
 ): AsyncGenerator<IndexedTitle> {
-  let columns: Map<string, number> | undefined;
-  for await (const line of lines) {
-    if (!columns) {
-      columns = new Map(line.split('\t').map((name, index) => [name, index]));
-      for (const field of [
-        'tconst',
-        'titleType',
-        'primaryTitle',
-        'originalTitle',
-        'isAdult',
-      ]) {
-        if (!columns.has(field))
-          throw new Error(`IMDb title dataset is missing ${field}`);
+  let columns: Record<string, number> | undefined;
+  for await (const chunk of lines) {
+    for (const line of chunk) {
+      if (!columns) {
+        const headers = line.split('\t');
+        columns = {};
+        for (const field of [
+          'tconst',
+          'titleType',
+          'primaryTitle',
+          'originalTitle',
+          'isAdult',
+        ]) {
+          const index = headers.indexOf(field);
+          if (index < 0)
+            throw new Error(`IMDb title dataset is missing ${field}`);
+          columns[field] = index;
+        }
+        continue;
       }
-      continue;
+      // In the published dataset titleType is the second column. Most rows
+      // are episodes or other excluded types, so avoid splitting those rows.
+      let mediaType: IndexedTitle['mediaType'] | undefined;
+      if (columns.titleType === 1) {
+        const firstTab = line.indexOf('\t');
+        const secondTab = line.indexOf('\t', firstTab + 1);
+        if (firstTab < 0 || secondTab < 0) continue;
+        mediaType = imdbTypes[line.slice(firstTab + 1, secondTab)];
+        if (!mediaType) continue;
+      }
+      const fields = line.split('\t');
+      mediaType ??= imdbTypes[fields[columns.titleType]];
+      if (!mediaType || fields[columns.isAdult] !== '0') continue;
+      const id = fields[columns.tconst] ?? '';
+      const title = fields[columns.primaryTitle] ?? '';
+      const original = fields[columns.originalTitle] ?? '';
+      if (!/^tt\d+$/.test(id) || !title || title === '\\N') continue;
+      yield {
+        sourceId: id,
+        mediaType,
+        title,
+        originalTitle: original && original !== '\\N' ? original : title,
+        popularity: 0,
+      };
     }
-    const fields = line.split('\t');
-    const get = (name: string): string =>
-      fields[columns?.get(name) ?? -1] ?? '';
-    const id = get('tconst');
-    const title = get('primaryTitle');
-    const original = get('originalTitle');
-    const mediaType = imdbTypes[get('titleType')];
-    if (
-      !mediaType ||
-      get('isAdult') !== '0' ||
-      !/^tt\d+$/.test(id) ||
-      !title ||
-      title === '\\N'
-    )
-      continue;
-    yield {
-      sourceId: id,
-      mediaType,
-      title,
-      originalTitle: original && original !== '\\N' ? original : title,
-      popularity: 0,
-    };
   }
   if (!columns) throw new Error('IMDb title dataset is empty');
 }
 
 /** Read TMDB's newline-delimited daily ID export. */
 export async function* parseTmdbTitles(
-  lines: AsyncIterable<string>,
+  lines: Lines,
   mediaType: IndexedTitle['mediaType']
 ): AsyncGenerator<IndexedTitle> {
-  for await (const line of lines) {
-    if (!line.trim()) continue;
-    const data: unknown = JSON.parse(line);
-    if (!data || typeof data !== 'object')
-      throw new Error('Invalid TMDB title record');
-    const row = data as Record<string, unknown>;
-    const title =
-      row[mediaType === 'movie' ? 'original_title' : 'original_name'];
-    if (
-      typeof row.id !== 'number' ||
-      !Number.isSafeInteger(row.id) ||
-      typeof title !== 'string'
-    ) {
-      throw new Error('Invalid TMDB title record');
+  for await (const chunk of lines) {
+    for (const line of chunk) {
+      if (!line.trim()) continue;
+      const data: unknown = JSON.parse(line);
+      if (!data || typeof data !== 'object')
+        throw new Error('Invalid TMDB title record');
+      const row = data as Record<string, unknown>;
+      const title =
+        row[mediaType === 'movie' ? 'original_title' : 'original_name'];
+      if (
+        typeof row.id !== 'number' ||
+        !Number.isSafeInteger(row.id) ||
+        typeof title !== 'string'
+      ) {
+        throw new Error('Invalid TMDB title record');
+      }
+      if (!title || row.adult === true) continue;
+      yield {
+        sourceId: String(row.id),
+        mediaType,
+        title,
+        originalTitle: title,
+        popularity:
+          typeof row.popularity === 'number' && Number.isFinite(row.popularity)
+            ? Math.max(0, row.popularity)
+            : 0,
+      };
     }
-    if (!title || row.adult === true) continue;
-    yield {
-      sourceId: String(row.id),
-      mediaType,
-      title,
-      originalTitle: title,
-      popularity:
-        typeof row.popularity === 'number' && Number.isFinite(row.popularity)
-          ? Math.max(0, row.popularity)
-          : 0,
-    };
   }
 }
 
@@ -151,9 +167,10 @@ const client = axios.create({ timeout: 120000, responseType: 'stream' });
 client.interceptors.request.use(proxyRequestInterceptor);
 client.interceptors.request.use(userAgentRequestInterceptor);
 
-export async function* decompressLines(
+/** Batch complete lines so filtered-out rows do not each require an async yield. */
+export async function* decompressLineBatches(
   stream: Readable
-): AsyncGenerator<string> {
+): AsyncGenerator<string[]> {
   const gunzip = createGunzip();
   const decoder = new StringDecoder('utf8');
   let pending = '';
@@ -162,15 +179,19 @@ export async function* decompressLines(
   try {
     for await (const chunk of gunzip) {
       pending += decoder.write(chunk as Buffer);
-      let newline = pending.indexOf('\n');
-      while (newline !== -1) {
-        yield pending.slice(0, newline).replace(/\r$/, '');
-        pending = pending.slice(newline + 1);
-        newline = pending.indexOf('\n');
+      if (pending.includes('\n')) {
+        const lines = pending.split('\n');
+        pending = lines.pop() ?? '';
+        for (let index = 0; index < lines.length; index++) {
+          if (lines[index].endsWith('\r'))
+            lines[index] = lines[index].slice(0, -1);
+        }
+        yield lines;
       }
     }
     pending += decoder.end();
-    if (pending) yield pending.replace(/\r$/, '');
+    if (pending)
+      yield [pending.endsWith('\r') ? pending.slice(0, -1) : pending];
   } finally {
     stream.destroy();
     gunzip.destroy();
@@ -207,7 +228,7 @@ export async function refreshImdb(
   return importTitleStream(
     index,
     'imdb',
-    parseImdbTitles(decompressLines(response.data)),
+    parseImdbTitles(decompressLineBatches(response.data)),
     version,
     signal
   );
@@ -237,7 +258,7 @@ export async function refreshImdbRatings(
   let batch: ImdbRating[] = [];
   try {
     for await (const rating of parseImdbRatings(
-      decompressLines(response.data)
+      decompressLineBatches(response.data)
     )) {
       signal?.throwIfAborted();
       batch.push(rating);
@@ -279,7 +300,7 @@ export async function refreshTmdb(
     return importTitleStream(
       index,
       source,
-      parseTmdbTitles(decompressLines(response.data), mediaType),
+      parseTmdbTitles(decompressLineBatches(response.data), mediaType),
       date,
       signal
     );
