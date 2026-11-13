@@ -113,4 +113,41 @@ describe('local title search index', () => {
     assert.equal((await index.search('mandla'))[0]?.sourceId, 'tt2');
     assert.equal(await index.version('imdb-ratings'), 'ratings');
   });
+
+  it('can suggest a popular misspelled title alongside an obscure exact title', async () => {
+    await index.beginImport('tmdb-movie');
+    await index.writeBatch([
+      movie('1', 'Mandla'),
+      movie('2', 'Mandela', 'Mandela', 10000),
+    ]);
+    await index.finishImport('v1');
+    assert.equal((await index.search('mandla'))[0]?.sourceId, '2');
+  });
+
+  it('refreshes changed ratings and removes ratings absent from the new dataset', async () => {
+    await index.beginImport('imdb');
+    await index.writeBatch([
+      movie('tt1', 'Mandela'),
+      movie('tt2', 'Mandela Film'),
+    ]);
+    await index.finishImport('titles');
+    await index.beginRatingsImport();
+    await index.writeRatingsBatch([
+      { sourceId: 'tt1', votes: 10 },
+      { sourceId: 'tt2', votes: 20 },
+    ]);
+    await index.finishRatingsImport('ratings1');
+    await index.beginRatingsImport();
+    await index.writeRatingsBatch([{ sourceId: 'tt1', votes: 15 }]);
+    await index.finishRatingsImport('ratings2');
+    const results = await index.search('mandela');
+    assert.equal(
+      results.find((result) => result.sourceId === 'tt1')?.popularity,
+      15
+    );
+    assert.equal(
+      results.find((result) => result.sourceId === 'tt2')?.popularity,
+      0
+    );
+  });
 });

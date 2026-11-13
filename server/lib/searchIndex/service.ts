@@ -9,21 +9,70 @@ import logger from '@server/logger';
 import { appDataPath } from '@server/utils/appDataVolume';
 import path from 'path';
 
-class SearchIndexService {
+export type Source = 'imdb' | 'imdb-ratings' | 'tmdb-movie' | 'tmdb-tv';
+export interface SearchIndexStatus {
+  enabled: boolean;
+  refreshing: boolean;
+  currentSource?: Source;
+  nextRefreshAt?: string;
+  failedSources: Source[];
+  sources: Record<Source, { available: boolean; lastChecked?: string }>;
+}
+
+const interval = 24 * 60 * 60 * 1000;
+const retryInterval = 60 * 60 * 1000;
+const sources: Source[] = ['imdb', 'imdb-ratings', 'tmdb-movie', 'tmdb-tv'];
+
+export class SearchIndexService {
+  constructor(
+    private readonly enabled: () => boolean = () =>
+      getSettings().main.localTitleSearch,
+    private readonly createIndex: () => SearchIndex = () =>
+      new SearchIndex(path.join(appDataPath(), 'search-index.sqlite3')),
+    private readonly refreshSource: (
+      source: Source,
+      index: SearchIndex,
+      signal: AbortSignal
+    ) => Promise<number | undefined> = (source, index, signal) => {
+      switch (source) {
+        case 'imdb':
+          return refreshImdb(index, signal);
+        case 'imdb-ratings':
+          return refreshImdbRatings(index, signal);
+        case 'tmdb-movie':
+          return refreshTmdb(index, 'movie', signal);
+        case 'tmdb-tv':
+          return refreshTmdb(index, 'tv', signal);
+      }
+    }
+  ) {}
   private index?: SearchIndex;
   private opening?: Promise<SearchIndex>;
-  private refreshing = false;
+  private controller?: AbortController;
   private timer?: NodeJS.Timeout;
+  private nextRefreshAt?: string;
+  private currentSource?: Source;
+  private failedSources: Source[] = [];
+  private sourceStatus: SearchIndexStatus['sources'] = {
+    imdb: { available: false },
+    'imdb-ratings': { available: false },
+    'tmdb-movie': { available: false },
+    'tmdb-tv': { available: false },
+  };
 
   private async open(): Promise<SearchIndex> {
     if (this.index) return this.index;
     if (!this.opening) {
       this.opening = (async () => {
-        const index = new SearchIndex(
-          path.join(appDataPath(), 'search-index.sqlite3')
-        );
+        const index = this.createIndex();
         try {
           await index.initialize();
+          for (const source of sources) {
+            this.sourceStatus[source] = {
+              available: (await index.version(source)) !== undefined,
+              lastChecked: await index.lastChecked(source),
+            };
+          }
           this.index = index;
           return index;
         } catch (error) {
@@ -37,58 +86,111 @@ class SearchIndexService {
     return this.opening;
   }
 
+  status(): SearchIndexStatus {
+    return {
+      enabled: this.enabled(),
+      refreshing: !!this.controller,
+      currentSource: this.currentSource,
+      nextRefreshAt: this.nextRefreshAt,
+      failedSources: [...this.failedSources],
+      sources: Object.fromEntries(
+        sources.map((source) => [source, { ...this.sourceStatus[source] }])
+      ) as SearchIndexStatus['sources'],
+    };
+  }
+
+  /** Called on startup and after settings are saved. */
   start(): void {
-    if (!this.timer) {
-      this.timer = setInterval(
-        () => {
-          void this.refresh();
-        },
-        24 * 60 * 60 * 1000
-      );
-      this.timer.unref();
+    if (!this.enabled()) {
+      if (this.timer) clearTimeout(this.timer);
+      this.timer = undefined;
+      this.nextRefreshAt = undefined;
+      this.controller?.abort();
+      return;
     }
+    if (!this.controller && !this.timer) void this.refresh();
+  }
+
+  refreshNow(): boolean {
+    if (!this.enabled() || this.controller) return false;
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.nextRefreshAt = undefined;
     void this.refresh();
+    return true;
+  }
+
+  private schedule(delay: number): void {
+    this.nextRefreshAt = new Date(Date.now() + delay).toISOString();
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      this.nextRefreshAt = undefined;
+      void this.refresh();
+    }, delay);
+    this.timer.unref();
   }
 
   private async refresh(): Promise<void> {
-    if (this.refreshing || !getSettings().main.localTitleSearch) return;
-    this.refreshing = true;
+    if (this.controller || !this.enabled()) return;
+    const controller = new AbortController();
+    this.controller = controller;
+    this.failedSources = [];
     try {
       const index = await this.open();
-      for (const [name, task] of [
-        ['IMDb titles', () => refreshImdb(index)],
-        ['IMDb ratings', () => refreshImdbRatings(index)],
-        ['TMDB movies', () => refreshTmdb(index, 'movie')],
-        ['TMDB series', () => refreshTmdb(index, 'tv')],
-      ] as const) {
-        if (!getSettings().main.localTitleSearch) break;
+      for (const source of sources) {
+        if (controller.signal.aborted) break;
+        this.currentSource = source;
         try {
-          const count = await task();
+          const count = await this.refreshSource(
+            source,
+            index,
+            controller.signal
+          );
+          controller.signal.throwIfAborted();
+          const lastChecked = new Date().toISOString();
+          await index.markChecked(source, lastChecked);
+          this.sourceStatus[source] = {
+            available: (await index.version(source)) !== undefined,
+            lastChecked,
+          };
           if (count !== undefined)
-            logger.info(`Updated ${name} search index`, {
+            logger.info('Updated local title search index', {
               label: 'Search',
+              source,
               count,
             });
         } catch (error) {
-          logger.warn(`Unable to update ${name} search index`, {
+          if (controller.signal.aborted) break;
+          this.failedSources.push(source);
+          logger.warn('Unable to update local title search index', {
             label: 'Search',
+            source,
             errorMessage:
               error instanceof Error ? error.message : String(error),
           });
         }
       }
     } catch (error) {
-      logger.warn('Unable to open search index', {
-        label: 'Search',
-        errorMessage: error instanceof Error ? error.message : String(error),
-      });
+      if (!controller.signal.aborted) {
+        this.failedSources = [...sources];
+        logger.warn('Unable to open local title search index', {
+          label: 'Search',
+          errorMessage: error instanceof Error ? error.message : String(error),
+        });
+      }
     } finally {
-      this.refreshing = false;
+      this.currentSource = undefined;
+      this.controller = undefined;
+      if (this.enabled()) {
+        if (controller.signal.aborted) this.start();
+        else
+          this.schedule(this.failedSources.length ? retryInterval : interval);
+      }
     }
   }
 
   async search(query: string) {
-    if (!getSettings().main.localTitleSearch || !this.index) return [];
+    if (!this.enabled() || !this.index) return [];
     return this.index.search(query, 10);
   }
 }

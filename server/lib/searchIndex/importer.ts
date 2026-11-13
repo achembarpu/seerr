@@ -121,13 +121,15 @@ export async function importTitleStream(
   index: SearchIndex,
   source: IndexSource,
   titles: AsyncIterable<IndexedTitle>,
-  version: string
+  version: string,
+  signal?: AbortSignal
 ): Promise<number> {
   await index.beginImport(source);
   let count = 0;
   let batch: IndexedTitle[] = [];
   try {
     for await (const title of titles) {
+      signal?.throwIfAborted();
       batch.push(title);
       count++;
       if (batch.length === 1000) {
@@ -136,6 +138,7 @@ export async function importTitleStream(
       }
     }
     await index.writeBatch(batch);
+    signal?.throwIfAborted();
     await index.finishImport(version);
     return count;
   } catch (error) {
@@ -183,13 +186,15 @@ const previousExportDate = (daysAgo: number): string => {
 };
 
 export async function refreshImdb(
-  index: SearchIndex
+  index: SearchIndex,
+  signal?: AbortSignal
 ): Promise<number | undefined> {
   const previous = await index.version('imdb');
   const response = await client.get<Readable>(
     'https://datasets.imdbws.com/title.basics.tsv.gz',
     {
       headers: previous ? { 'If-None-Match': previous } : undefined,
+      signal,
       validateStatus: (status) => status === 200 || status === 304,
     }
   );
@@ -203,18 +208,21 @@ export async function refreshImdb(
     index,
     'imdb',
     parseImdbTitles(decompressLines(response.data)),
-    version
+    version,
+    signal
   );
 }
 
 export async function refreshImdbRatings(
-  index: SearchIndex
+  index: SearchIndex,
+  signal?: AbortSignal
 ): Promise<number | undefined> {
   const previous = await index.version('imdb-ratings');
   const response = await client.get<Readable>(
     'https://datasets.imdbws.com/title.ratings.tsv.gz',
     {
       headers: previous ? { 'If-None-Match': previous } : undefined,
+      signal,
       validateStatus: (status) => status === 200 || status === 304,
     }
   );
@@ -231,6 +239,7 @@ export async function refreshImdbRatings(
     for await (const rating of parseImdbRatings(
       decompressLines(response.data)
     )) {
+      signal?.throwIfAborted();
       batch.push(rating);
       count++;
       if (batch.length === 1000) {
@@ -239,6 +248,7 @@ export async function refreshImdbRatings(
       }
     }
     await index.writeRatingsBatch(batch);
+    signal?.throwIfAborted();
     await index.finishRatingsImport(version);
     return count;
   } catch (error) {
@@ -249,20 +259,30 @@ export async function refreshImdbRatings(
 
 export async function refreshTmdb(
   index: SearchIndex,
-  mediaType: IndexedTitle['mediaType']
+  mediaType: IndexedTitle['mediaType'],
+  signal?: AbortSignal
 ): Promise<number | undefined> {
   const source: IndexSource = mediaType === 'movie' ? 'tmdb-movie' : 'tmdb-tv';
   const previous = await index.version(source);
-  const date = previousExportDate(1);
-  if (previous === date) return undefined;
   const type = mediaType === 'movie' ? 'movie' : 'tv_series';
-  const response = await client.get<Readable>(
-    `https://files.tmdb.org/p/exports/${type}_ids_${date}.json.gz`
-  );
-  return importTitleStream(
-    index,
-    source,
-    parseTmdbTitles(decompressLines(response.data), mediaType),
-    date
-  );
+  for (const daysAgo of [1, 2]) {
+    const date = previousExportDate(daysAgo);
+    if (previous === date) return undefined;
+    const response = await client.get<Readable>(
+      `https://files.tmdb.org/p/exports/${type}_ids_${date}.json.gz`,
+      { signal, validateStatus: (status) => status === 200 || status === 404 }
+    );
+    if (response.status === 404) {
+      response.data.destroy();
+      continue;
+    }
+    return importTitleStream(
+      index,
+      source,
+      parseTmdbTitles(decompressLines(response.data), mediaType),
+      date,
+      signal
+    );
+  }
+  throw new Error(`TMDB ${mediaType} exports are not available`);
 }

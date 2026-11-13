@@ -17,6 +17,7 @@ import { isValidURL } from '@app/utils/urlValidationHelper';
 import { ArrowDownOnSquareIcon } from '@heroicons/react/24/outline';
 import { ArrowPathIcon } from '@heroicons/react/24/solid';
 import type { UserSettingsGeneralResponse } from '@server/interfaces/api/userSettingsInterfaces';
+import type { SearchIndexStatus } from '@server/lib/searchIndex/service';
 import type { MainSettings } from '@server/lib/settings';
 import type { AvailableLocale } from '@server/types/languages';
 import axios from 'axios';
@@ -67,7 +68,21 @@ const messages = defineMessages('components.Settings.SettingsMain', {
     'Hide media that has been requested from the discover pages but not search results',
   localTitleSearch: 'Local typo-tolerant title search',
   localTitleSearchTip:
-    'Download and refresh TMDB and IMDb title indexes in the background. IMDb permits a personal movie database for individual personal, non-commercial use, subject to its terms.',
+    'Download and refresh TMDB and IMDb title indexes in the background. IMDb permits a personal movie database for individual personal, non-commercial use, subject to its terms. Save settings to apply.',
+  localTitleSearchTerms: 'IMDb terms',
+  searchIndexImdb: 'IMDb titles',
+  searchIndexRatings: 'IMDb ratings',
+  searchIndexMovies: 'TMDB movies',
+  searchIndexTv: 'TMDB series',
+  searchIndexUpdating: 'Updating',
+  searchIndexWaiting: 'Waiting for first download',
+  searchIndexReady: 'Ready',
+  searchIndexFailed: 'Update failed; retry scheduled',
+  searchIndexNext: 'Next update: {date}',
+  searchIndexChecked: 'Last checked: {date}',
+  searchIndexRefresh: 'Refresh now',
+  searchIndexRefreshFailed: 'Could not start the search index refresh.',
+  searchIndexStatusFailed: 'Could not load the search index status.',
   cacheImages: 'Enable Image Caching',
   cacheImagesTip:
     'Cache externally sourced images (requires a significant amount of disk space)',
@@ -98,6 +113,20 @@ const SettingsMain = () => {
   const { data: userData } = useSWR<UserSettingsGeneralResponse>(
     currentUser ? `/api/v1/user/${currentUser.id}/settings/main` : null
   );
+  const {
+    data: searchIndexStatus,
+    error: searchIndexError,
+    mutate: refreshSearchIndexStatus,
+  } = useSWR<SearchIndexStatus>(
+    data?.localTitleSearch ? '/api/v1/settings/search-index' : null,
+    { refreshInterval: 3000, revalidateOnFocus: false }
+  );
+  const sourceLabels = {
+    imdb: messages.searchIndexImdb,
+    'imdb-ratings': messages.searchIndexRatings,
+    'tmdb-movie': messages.searchIndexMovies,
+    'tmdb-tv': messages.searchIndexTv,
+  } as const;
 
   const MainSettingsSchema = Yup.object().shape({
     applicationTitle: Yup.string().required(
@@ -326,7 +355,15 @@ const SettingsMain = () => {
                   <label htmlFor="localTitleSearch" className="checkbox-label">
                     {intl.formatMessage(messages.localTitleSearch)}
                     <span className="label-tip">
-                      {intl.formatMessage(messages.localTitleSearchTip)}
+                      {intl.formatMessage(messages.localTitleSearchTip)}{' '}
+                      <a
+                        href="https://help.imdb.com/article/imdb/general-information/can-i-use-imdb-data-in-my-software/G5JTRESSHJBBHTGX"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="underline"
+                      >
+                        {intl.formatMessage(messages.localTitleSearchTerms)}
+                      </a>
                     </span>
                   </label>
                   <div className="form-input-area">
@@ -343,6 +380,98 @@ const SettingsMain = () => {
                     />
                   </div>
                 </div>
+                {data?.localTitleSearch && (
+                  <div className="form-row">
+                    <div className="form-input-area">
+                      {searchIndexError && (
+                        <p className="text-sm text-red-400">
+                          {intl.formatMessage(messages.searchIndexStatusFailed)}
+                        </p>
+                      )}
+                      {searchIndexStatus && (
+                        <>
+                          {Object.entries(sourceLabels).map(
+                            ([source, label]) => {
+                              const key = source as keyof typeof sourceLabels;
+                              const sourceStatus =
+                                searchIndexStatus.sources[key];
+                              const status =
+                                searchIndexStatus.currentSource === key
+                                  ? messages.searchIndexUpdating
+                                  : searchIndexStatus.failedSources.includes(
+                                        key
+                                      )
+                                    ? messages.searchIndexFailed
+                                    : sourceStatus.available
+                                      ? messages.searchIndexReady
+                                      : messages.searchIndexWaiting;
+                              return (
+                                <p
+                                  key={key}
+                                  className="mb-1 text-sm text-gray-300"
+                                >
+                                  {intl.formatMessage(label)}:{' '}
+                                  {intl.formatMessage(status)}
+                                  {sourceStatus.lastChecked && (
+                                    <>
+                                      {' '}
+                                      ·{' '}
+                                      {intl.formatMessage(
+                                        messages.searchIndexChecked,
+                                        {
+                                          date: intl.formatDate(
+                                            sourceStatus.lastChecked,
+                                            {
+                                              dateStyle: 'medium',
+                                              timeStyle: 'short',
+                                            }
+                                          ),
+                                        }
+                                      )}
+                                    </>
+                                  )}
+                                </p>
+                              );
+                            }
+                          )}
+                          {searchIndexStatus.nextRefreshAt && (
+                            <p className="mb-2 text-sm text-gray-400">
+                              {intl.formatMessage(messages.searchIndexNext, {
+                                date: intl.formatDate(
+                                  searchIndexStatus.nextRefreshAt,
+                                  { dateStyle: 'medium', timeStyle: 'short' }
+                                ),
+                              })}
+                            </p>
+                          )}
+                          <Button
+                            type="button"
+                            buttonSize="sm"
+                            disabled={searchIndexStatus.refreshing}
+                            onClick={async () => {
+                              try {
+                                await axios.post(
+                                  '/api/v1/settings/search-index/refresh'
+                                );
+                                await refreshSearchIndexStatus();
+                              } catch {
+                                addToast(
+                                  intl.formatMessage(
+                                    messages.searchIndexRefreshFailed
+                                  ),
+                                  { autoDismiss: true, appearance: 'error' }
+                                );
+                                await refreshSearchIndexStatus();
+                              }
+                            }}
+                          >
+                            {intl.formatMessage(messages.searchIndexRefresh)}
+                          </Button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
                 <div className="form-row">
                   <label htmlFor="cacheImages" className="checkbox-label">
                     <span className="mr-2">

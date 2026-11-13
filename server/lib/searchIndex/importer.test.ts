@@ -81,4 +81,35 @@ describe('search index imports', () => {
       await index.close();
     }
   });
+
+  it('keeps the previous index when an import is cancelled before publication', async () => {
+    const index = new SearchIndex(':memory:');
+    await index.initialize();
+    try {
+      const oldTitle = {
+        sourceId: 'tt1',
+        mediaType: 'movie' as const,
+        title: 'Old Film',
+        originalTitle: 'Old Film',
+        popularity: 0,
+      };
+      async function* initial() {
+        yield oldTitle;
+      }
+      await importTitleStream(index, 'imdb', initial(), 'v1');
+      const controller = new AbortController();
+      async function* interrupted() {
+        yield { ...oldTitle, title: 'New Film' };
+        controller.abort();
+      }
+      await assert.rejects(
+        importTitleStream(index, 'imdb', interrupted(), 'v2', controller.signal)
+      );
+      assert.equal(await index.version('imdb'), 'v1');
+      assert.equal((await index.search('old film'))[0]?.sourceId, 'tt1');
+      assert.deepEqual(await index.search('new film'), []);
+    } finally {
+      await index.close();
+    }
+  });
 });

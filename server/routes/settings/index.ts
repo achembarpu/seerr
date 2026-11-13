@@ -89,6 +89,19 @@ settingsRoutes.post('/main', async (req, res) => {
   return res.status(200).json(settings.main);
 });
 
+settingsRoutes.get('/search-index', (_req, res) => {
+  res.status(200).json(searchIndex.status());
+});
+
+settingsRoutes.post('/search-index/refresh', (_req, res) => {
+  if (!searchIndex.refreshNow()) {
+    return res
+      .status(409)
+      .json({ message: 'Search index is disabled or already refreshing.' });
+  }
+  return res.status(202).json(searchIndex.status());
+});
+
 settingsRoutes.get('/network', (req, res) => {
   const settings = getSettings();
 

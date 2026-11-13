@@ -2266,6 +2266,52 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/MainSettings'
+  /settings/search-index:
+    get:
+      summary: Get local title search index status
+      tags:
+        - settings
+      responses:
+        '200':
+          description: Local title search index status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  refreshing:
+                    type: boolean
+                  currentSource:
+                    type: string
+                  nextRefreshAt:
+                    type: string
+                    format: date-time
+                  failedSources:
+                    type: array
+                    items:
+                      type: string
+                  sources:
+                    type: object
+                    additionalProperties:
+                      type: object
+                      properties:
+                        available:
+                          type: boolean
+                        lastChecked:
+                          type: string
+                          format: date-time
+  /settings/search-index/refresh:
+    post:
+      summary: Refresh the local title search index
+      tags:
+        - settings
+      responses:
+        '202':
+          description: Refresh started
+        '409':
+          description: Index is disabled or already refreshing
   /settings/network:
     get:
       summary: Get network settings

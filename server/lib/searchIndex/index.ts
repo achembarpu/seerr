@@ -285,8 +285,13 @@ export class SearchIndex {
     });
     try {
       await this.run('BEGIN IMMEDIATE');
-      await this.run('DELETE FROM imdb_votes');
-      await this.run('INSERT INTO imdb_votes SELECT * FROM incoming_votes');
+      await this.run(`INSERT INTO imdb_votes(sourceId, votes)
+        SELECT sourceId, votes FROM incoming_votes WHERE 1
+        ON CONFLICT(sourceId) DO UPDATE SET votes = excluded.votes
+        WHERE imdb_votes.votes != excluded.votes`);
+      await this.run(
+        'DELETE FROM imdb_votes WHERE NOT EXISTS (SELECT 1 FROM incoming_votes WHERE incoming_votes.sourceId = imdb_votes.sourceId)'
+      );
       await this.run(
         'INSERT OR REPLACE INTO index_metadata(key, value) VALUES (?, ?)',
         ['imdb-ratings', version]
@@ -310,6 +315,26 @@ export class SearchIndex {
       [source]
     );
     return rows[0]?.value;
+  }
+
+  async lastChecked(
+    source: IndexSource | 'imdb-ratings'
+  ): Promise<string | undefined> {
+    const rows = await this.all<{ value: string }>(
+      'SELECT value FROM index_metadata WHERE key = ?',
+      [`checked:${source}`]
+    );
+    return rows[0]?.value;
+  }
+
+  async markChecked(
+    source: IndexSource | 'imdb-ratings',
+    time: string
+  ): Promise<void> {
+    await this.run(
+      'INSERT OR REPLACE INTO index_metadata(key, value) VALUES (?, ?)',
+      [`checked:${source}`, time]
+    );
   }
 
   async search(query: string, limit = 20): Promise<TitleMatch[]> {
