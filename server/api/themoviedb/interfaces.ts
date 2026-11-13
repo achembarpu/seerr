@@ -193,6 +193,25 @@ export interface TmdbMovieDetails {
   };
 }
 
+/** Fields required to render a movie result, available without appended data. */
+export type TmdbMovieSearchDetails = Pick<
+  TmdbMovieDetails,
+  | 'id'
+  | 'adult'
+  | 'backdrop_path'
+  | 'poster_path'
+  | 'genres'
+  | 'original_language'
+  | 'original_title'
+  | 'overview'
+  | 'popularity'
+  | 'release_date'
+  | 'title'
+  | 'video'
+  | 'vote_average'
+  | 'vote_count'
+>;
+
 export interface TmdbVideo {
   id: string;
   key: string;
@@ -303,6 +322,24 @@ export interface TmdbTvDetails {
     results?: { [iso_3166_1: string]: TmdbWatchProviders };
   };
 }
+
+/** Fields required to render a TV result, available without appended data. */
+export type TmdbTvSearchDetails = Pick<
+  TmdbTvDetails,
+  | 'id'
+  | 'backdrop_path'
+  | 'poster_path'
+  | 'first_air_date'
+  | 'genres'
+  | 'name'
+  | 'origin_country'
+  | 'original_language'
+  | 'original_name'
+  | 'overview'
+  | 'popularity'
+  | 'vote_average'
+  | 'vote_count'
+>;
 
 export interface TmdbTvScanDetails {
   id: number;

@@ -52,13 +52,16 @@ searchRoutes.get('/suggestions', async (req, res) => {
           }
           return match.mediaType === 'movie'
             ? mapMovieDetailsToResult(
-                await tmdb.getMovie({
+                await tmdb.getMovieSearchDetails({
                   movieId: Number(match.sourceId),
                   language,
                 })
               )
             : mapTvDetailsToResult(
-                await tmdb.getTvShow({ tvId: Number(match.sourceId), language })
+                await tmdb.getTvSearchDetails({
+                  tvId: Number(match.sourceId),
+                  language,
+                })
               );
         }
       )

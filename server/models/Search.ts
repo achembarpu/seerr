@@ -1,11 +1,11 @@
 import type {
   TmdbCollectionResult,
-  TmdbMovieDetails,
   TmdbMovieResult,
+  TmdbMovieSearchDetails,
   TmdbPersonDetails,
   TmdbPersonResult,
-  TmdbTvDetails,
   TmdbTvResult,
+  TmdbTvSearchDetails,
 } from '@server/api/themoviedb/interfaces';
 import { MediaType as MainMediaType } from '@server/constants/media';
 import type Media from '@server/entity/Media';
@@ -179,7 +179,7 @@ export const mapSearchResults = (
   });
 
 export const mapMovieDetailsToResult = (
-  movieDetails: TmdbMovieDetails
+  movieDetails: TmdbMovieSearchDetails
 ): TmdbMovieResult => ({
   id: movieDetails.id,
   media_type: 'movie',
@@ -199,7 +199,7 @@ export const mapMovieDetailsToResult = (
 });
 
 export const mapTvDetailsToResult = (
-  tvDetails: TmdbTvDetails
+  tvDetails: TmdbTvSearchDetails
 ): TmdbTvResult => ({
   id: tvDetails.id,
   media_type: 'tv',

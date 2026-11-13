@@ -14,6 +14,7 @@ import type {
   TmdbKeywordSearchResponse,
   TmdbLanguage,
   TmdbMovieDetails,
+  TmdbMovieSearchDetails,
   TmdbNetwork,
   TmdbPersonCombinedCredits,
   TmdbPersonDetails,
@@ -25,6 +26,7 @@ import type {
   TmdbSeasonWithEpisodes,
   TmdbTvDetails,
   TmdbTvScanDetails,
+  TmdbTvSearchDetails,
   TmdbUpcomingMoviesResponse,
   TmdbWatchProviderDetails,
   TmdbWatchProviderRegion,
@@ -323,6 +325,36 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
       );
     }
   };
+
+  /** Fetch only the fields needed for a search card. */
+  public async getMovieSearchDetails({
+    movieId,
+    language = this.locale,
+  }: {
+    movieId: number;
+    language?: string;
+  }): Promise<TmdbMovieSearchDetails> {
+    return this.get<TmdbMovieSearchDetails>(
+      `/movie/${movieId}`,
+      { params: { language } },
+      43200
+    );
+  }
+
+  /** Fetch only the fields needed for a search card. */
+  public async getTvSearchDetails({
+    tvId,
+    language = this.locale,
+  }: {
+    tvId: number;
+    language?: string;
+  }): Promise<TmdbTvSearchDetails> {
+    return this.get<TmdbTvSearchDetails>(
+      `/tv/${tvId}`,
+      { params: { language } },
+      TV_DETAILS_TTL
+    );
+  }
 
   public getMovie = async ({
     movieId,
