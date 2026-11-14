@@ -28,6 +28,156 @@ const doc = (
   ...overrides,
 });
 
+type VersionTestInternals = {
+  all: (
+    sql: string,
+    params?: (string | number)[],
+    db?: unknown
+  ) => Promise<unknown[]>;
+  run: (
+    sql: string,
+    params?: (string | number | Buffer | null)[],
+    db?: unknown
+  ) => Promise<void>;
+  lexicalTask?: Promise<void>;
+};
+
+const versionTestStore = async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-version-'));
+  const filename = path.join(directory, 'store.sqlite3');
+  const store = new SmartStore(filename);
+  await store.initialize();
+  store.pauseLexical();
+  await (store as unknown as VersionTestInternals).lexicalTask;
+  return { directory, filename, store };
+};
+
+it('tracks local and external document changes without invalidating on local lexical work', async () => {
+  const { directory, filename, store } = await versionTestStore();
+  let other: SmartStore | undefined;
+  try {
+    const initial = await store.documentVersion();
+    assert.ok(initial);
+    await store.setState('lexicalCursor', '1');
+    const internal = store as unknown as VersionTestInternals;
+    await internal.run(
+      'INSERT INTO smart_fts(rowid, title, overview) VALUES (?, ?, ?)',
+      [90, 'A', 'B']
+    );
+    assert.equal(await store.documentVersion(), initial);
+    await store.upsertBatch([]);
+    assert.equal(await store.documentVersion(), initial);
+    await store.upsert(doc('1'), quantize([1, 0]));
+    const inserted = await store.documentVersion();
+    assert.notEqual(inserted, initial);
+    await store.remove('tmdb', 'movie', '1');
+    const deleted = await store.documentVersion();
+    assert.notEqual(deleted, inserted);
+    other = new SmartStore(filename);
+    await other.upsert(doc('2'), quantize([1, 0]));
+    const externalInsert = await store.documentVersion();
+    assert.notEqual(externalInsert, deleted);
+    await other.remove('tmdb', 'movie', '2');
+    assert.notEqual(await store.documentVersion(), externalInsert);
+  } finally {
+    await other?.close();
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('withholds document versions throughout overlapping local writes, including failures', async () => {
+  const { directory, store } = await versionTestStore();
+  try {
+    const before = await store.documentVersion();
+    const internal = store as unknown as VersionTestInternals;
+    const run = internal.run.bind(store);
+    const releases: (() => void)[] = [];
+    internal.run = async (...args) => {
+      if (
+        args[0].startsWith('INSERT INTO smart_documents') ||
+        args[0].startsWith('DELETE FROM smart_documents')
+      )
+        await new Promise<void>((resolve) => releases.push(resolve));
+      return run(...args);
+    };
+    const first = store.upsert(doc('1'), quantize([1, 0]));
+    const second = store.remove('tmdb', 'movie', '2');
+    assert.equal(releases.length, 2);
+    assert.equal(await store.documentVersion(), undefined);
+    releases[0]();
+    await first;
+    assert.equal(await store.documentVersion(), undefined);
+    releases[1]();
+    await second;
+    const after = await store.documentVersion();
+    assert.notEqual(after, before);
+    internal.run = run;
+    await assert.rejects(
+      store.upsert(
+        doc('3', { source: null as unknown as string }),
+        quantize([1, 0])
+      ),
+      /SQLITE_CONSTRAINT/
+    );
+    assert.notEqual(await store.documentVersion(), after);
+  } finally {
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('rejects unsafe versions on a racing write, DB error, close, or reopen', async () => {
+  const { directory, filename, store } = await versionTestStore();
+  let reopened: SmartStore | undefined;
+  let closed = false;
+  try {
+    const initial = await store.documentVersion();
+    const internal = store as unknown as VersionTestInternals;
+    const all = internal.all.bind(store);
+    let release: () => void = () => undefined;
+    let entered: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    internal.all = async (...args) => {
+      const rows = await all(...args);
+      if (args[0] === 'PRAGMA data_version') {
+        entered();
+        await gate;
+      }
+      return rows;
+    };
+    const racing = store.documentVersion();
+    await started;
+    await store.upsert(doc('1'), quantize([1, 0]));
+    release();
+    assert.equal(await racing, undefined);
+    internal.all = async (...args) => {
+      if (args[0] === 'PRAGMA data_version')
+        throw new Error('Injected version read error');
+      return all(...args);
+    };
+    await assert.rejects(
+      store.documentVersion(),
+      /Injected version read error/
+    );
+    internal.all = all;
+    await store.close();
+    closed = true;
+    await assert.rejects(store.documentVersion(), /closing/);
+    reopened = new SmartStore(filename);
+    assert.notEqual(await reopened.documentVersion(), initial);
+  } finally {
+    if (!closed) await store.close();
+    await reopened?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 it('keeps scored vectors and documents consistent while the index changes', async () => {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-snapshot-'));
   const store = new SmartStore(path.join(directory, 'store.sqlite3'));

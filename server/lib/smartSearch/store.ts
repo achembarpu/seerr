@@ -1,4 +1,4 @@
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import sqlite3 from 'sqlite3';
 import type { SmartDocument, SmartFilters, SmartMediaType } from './types';
 import { prepareCosine } from './vectors';
@@ -78,6 +78,9 @@ export class SmartStore {
   private lexicalTotal = 0;
   private lexicalError?: string;
   private readonly activeSearches = new Set<Promise<void>>();
+  private readonly documentVersionId = randomUUID();
+  private documentRevision = 0;
+  private activeDocumentWrites = 0;
   constructor(private readonly filename: string) {
     this.db = new sqlite3.Database(filename);
   }
@@ -328,6 +331,41 @@ export class SmartStore {
       value,
     ]);
   }
+
+  /**
+   * Opaque cache token for document contents and vectors. A local write that
+   * is in flight (or overlaps the PRAGMA) makes the version unavailable.
+   * SQLite's data_version observes commits on other connections; our local
+   * revision covers this connection, whose own commits do not change it.
+   */
+  async documentVersion(): Promise<string | undefined> {
+    if (this.closing) throw new Error('Search index is closing');
+    if (this.activeDocumentWrites) return undefined;
+    const revision = this.documentRevision;
+    const rows = await this.all<{ data_version: number }>(
+      'PRAGMA data_version'
+    );
+    if (this.closing) throw new Error('Search index is closing');
+    if (this.activeDocumentWrites || revision !== this.documentRevision)
+      return undefined;
+    const externalVersion = rows[0]?.data_version;
+    if (!Number.isSafeInteger(externalVersion))
+      throw new Error('Unable to read search index version');
+    return `${this.documentVersionId}:${revision}:${externalVersion}`;
+  }
+
+  private async writeDocuments(write: () => Promise<void>): Promise<void> {
+    this.activeDocumentWrites++;
+    this.documentRevision++;
+    try {
+      await write();
+    } finally {
+      // Advance even on failure: callers cannot assume a failed write had no
+      // observable effects, and overlapping writes remain unavailable.
+      this.documentRevision++;
+      this.activeDocumentWrites--;
+    }
+  }
   async existing(
     source: string,
     type: SmartMediaType,
@@ -369,11 +407,13 @@ export class SmartStore {
       vector,
       JSON.stringify(document),
     ]);
-    await this.run(
-      `INSERT INTO smart_documents(source, sourceId, mediaType, language, year, voteAverage, voteCount, genres, hash, vector, document) VALUES ${values}
+    await this.writeDocuments(() =>
+      this.run(
+        `INSERT INTO smart_documents(source, sourceId, mediaType, language, year, voteAverage, voteCount, genres, hash, vector, document) VALUES ${values}
       ON CONFLICT(source, sourceId, mediaType) DO UPDATE SET language=excluded.language, year=excluded.year, voteAverage=excluded.voteAverage, voteCount=excluded.voteCount, genres=excluded.genres, hash=excluded.hash, vector=excluded.vector, document=excluded.document
       WHERE smart_documents.hash != excluded.hash OR smart_documents.document != excluded.document`,
-      params
+        params
+      )
     );
   }
   async remove(
@@ -381,9 +421,11 @@ export class SmartStore {
     type: SmartMediaType,
     id: string
   ): Promise<void> {
-    await this.run(
-      'DELETE FROM smart_documents WHERE source = ? AND mediaType = ? AND sourceId = ?',
-      [source, type, id]
+    await this.writeDocuments(() =>
+      this.run(
+        'DELETE FROM smart_documents WHERE source = ? AND mediaType = ? AND sourceId = ?',
+        [source, type, id]
+      )
     );
   }
   async count(): Promise<number> {

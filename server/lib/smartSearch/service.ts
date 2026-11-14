@@ -1,6 +1,7 @@
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { appDataPath } from '@server/utils/appDataVolume';
+import { performance } from 'node:perf_hooks';
 import path from 'path';
 import { setTimeout as delay } from 'timers/promises';
 import { EmbeddingEngine } from './engine';
@@ -29,6 +30,10 @@ type Cursor = {
 const firstYear = 1870;
 const interval = 24 * 60 * 60 * 1000;
 const retryInterval = 60 * 60 * 1000;
+const rerankCacheLimit = 1024;
+const rerankCacheTtl = 5 * 60 * 1000;
+const denseCacheLimit = 8;
+const denseCacheTtl = 30 * 1000;
 const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 
 /** Keep offline upstream discovery from blocking the local index indefinitely. */
@@ -169,10 +174,20 @@ export class SmartSearchService {
   private rerankerRetryAt = 0;
   private rerankerBusy = false;
   private rerankerDone?: Promise<void>;
+  private rerankCacheGeneration = 0;
+  private readonly rerankScoreCache = new Map<
+    string,
+    { score: number; expiresAt: number }
+  >();
   private retrievalWarning?: string;
   private denseBusy = false;
   private denseWaiters = 0;
   private denseDone?: Promise<void>;
+  private denseCacheGeneration = 0;
+  private readonly denseCache = new Map<
+    string,
+    { version: string; expiresAt: number; matches: SmartMatch[] }
+  >();
   private rerankerIdle?: NodeJS.Timeout;
   private closing = false;
   private store?: SmartStore;
@@ -243,6 +258,7 @@ export class SmartSearchService {
 
   private async prepareReranker(): Promise<void> {
     if (!this.rerankerEnabled()) return;
+    if (this.reranker.phase !== 'ready') this.clearRerankScores();
     if (this.rerankerIdle) clearTimeout(this.rerankerIdle);
     this.rerankerIdle = undefined;
     if (this.runtimeController.signal.aborted)
@@ -263,11 +279,38 @@ export class SmartSearchService {
     this.rerankerIdle = setTimeout(
       () => {
         this.reranker.stop();
+        this.clearRerankScores();
         this.rerankerIdle = undefined;
       },
       15 * 60 * 1000
     );
     this.rerankerIdle.unref();
+  }
+
+  private clearRerankScores(): void {
+    this.rerankCacheGeneration++;
+    this.rerankScoreCache.clear();
+  }
+
+  private clearDenseCache(): void {
+    this.denseCacheGeneration++;
+    this.denseCache.clear();
+  }
+
+  private cachedRerankScore(key: string, now: number): number | undefined {
+    const value = this.rerankScoreCache.get(key);
+    if (!value) return undefined;
+    this.rerankScoreCache.delete(key);
+    if (value.expiresAt <= now) return undefined;
+    this.rerankScoreCache.set(key, value);
+    return value.score;
+  }
+
+  private rememberRerankScore(key: string, score: number, now: number): void {
+    this.rerankScoreCache.delete(key);
+    this.rerankScoreCache.set(key, { score, expiresAt: now + rerankCacheTtl });
+    while (this.rerankScoreCache.size > rerankCacheLimit)
+      this.rerankScoreCache.delete(this.rerankScoreCache.keys().next().value!);
   }
 
   private async rerank(
@@ -278,39 +321,92 @@ export class SmartSearchService {
   ): Promise<SmartMatch[]> {
     if (!this.rerankerEnabled() || !candidates.length) return candidates;
     if (this.reranker.phase !== 'ready') {
+      this.clearRerankScores();
       if (this.reranker.phase === 'idle' && Date.now() >= this.rerankerRetryAt)
         void this.prepareReranker()
           .then(() => this.releaseReranker())
           .catch(() => undefined);
       return candidates;
     }
-    if (this.rerankerBusy && this.rerankerDone) {
+    const configured =
+      Number(getSettings().main.smartSearchRerankCandidates) || 40;
+    const limit = Math.max(1, Math.min(maxCandidates, 80, configured));
+    const prefix = candidates.slice(0, limit);
+    const docs = prefix.map(({ document }) =>
+      `Title: ${document.title}. Description: ${document.overview}`.slice(
+        0,
+        700
+      )
+    );
+    const modelQuery = query.slice(0, 600);
+    const keys = docs.map((doc) => JSON.stringify([modelQuery, doc]));
+    const generation = this.rerankCacheGeneration;
+    const readScores = () => {
+      const now = performance.now();
+      return keys.map((key) => this.cachedRerankScore(key, now));
+    };
+    let values = readScores();
+    if (
+      values.some((score) => score === undefined) &&
+      this.rerankerBusy &&
+      this.rerankerDone
+    ) {
       await Promise.race([this.rerankerDone, delay(750)]);
-      if (this.rerankerBusy) return candidates;
+      if (this.rerankerBusy || generation !== this.rerankCacheGeneration)
+        return candidates;
+      values = readScores();
     }
-    this.rerankerBusy = true;
-    let finish: () => void = () => undefined;
-    this.rerankerDone = new Promise<void>((resolve) => {
-      finish = resolve;
+    if (!this.rerankerEnabled() || this.reranker.phase !== 'ready')
+      return candidates;
+    const missing = new Map<string, string>();
+    values.forEach((score, index) => {
+      if (score === undefined) missing.set(keys[index], docs[index]);
     });
+    let finish: () => void = () => undefined;
+    if (missing.size) {
+      this.rerankerBusy = true;
+      this.rerankerDone = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+    }
     try {
-      const configured =
-        Number(getSettings().main.smartSearchRerankCandidates) || 40;
-      const limit = Math.max(1, Math.min(maxCandidates, 80, configured));
-      const prefix = candidates.slice(0, limit);
-      const docs = prefix.map(({ document }) =>
-        `Title: ${document.title}. Description: ${document.overview}`.slice(
-          0,
-          700
+      if (missing.size) {
+        const missingKeys = [...missing.keys()];
+        const newScores = await this.reranker.rerank(
+          modelQuery,
+          [...missing.values()],
+          timeout
+        );
+        if (
+          newScores.length !== missingKeys.length ||
+          newScores.some((score) => !Number.isFinite(score))
         )
-      );
-      const scores = await this.reranker.rerank(
-        query.slice(0, 600),
-        docs,
-        timeout
-      );
-      this.rerankerError = undefined;
-      this.rerankerRetryAt = 0;
+          throw new Error('Invalid reranker response');
+        if (
+          generation !== this.rerankCacheGeneration ||
+          !this.rerankerEnabled() ||
+          this.reranker.phase !== 'ready'
+        )
+          return candidates;
+        const now = performance.now();
+        missingKeys.forEach((key, index) =>
+          this.rememberRerankScore(key, newScores[index], now)
+        );
+        const computed = new Map(
+          missingKeys.map((key, index) => [key, newScores[index]])
+        );
+        // Keep scores that were valid when the request started. A cached
+        // entry can expire while inference for the other documents runs.
+        values = values.map(
+          (score, index) => score ?? computed.get(keys[index])
+        );
+        this.rerankerError = undefined;
+        this.rerankerRetryAt = 0;
+      }
+      const scores = values.map((score) => {
+        if (score === undefined) throw new Error('Incomplete reranker scores');
+        return score;
+      });
       const baseline = prefix.map(
         (item, index): SmartMatch => ({
           ...item,
@@ -327,6 +423,7 @@ export class SmartSearchService {
         candidates.slice(limit)
       );
     } catch (error) {
+      this.clearRerankScores();
       this.rerankerError =
         error instanceof Error ? error.message : String(error);
       logger.warn('Smart reranking unavailable; using hybrid order', {
@@ -335,9 +432,11 @@ export class SmartSearchService {
       });
       return candidates;
     } finally {
-      this.rerankerBusy = false;
-      finish();
-      this.rerankerDone = undefined;
+      if (missing.size) {
+        this.rerankerBusy = false;
+        finish();
+        this.rerankerDone = undefined;
+      }
       this.releaseReranker();
     }
   }
@@ -345,6 +444,8 @@ export class SmartSearchService {
   start(): void {
     if (this.closing) return;
     if (!this.enabled()) {
+      this.clearRerankScores();
+      this.clearDenseCache();
       if (this.timer) clearTimeout(this.timer);
       this.timer = undefined;
       this.nextRefreshAt = undefined;
@@ -380,6 +481,8 @@ export class SmartSearchService {
   }
 
   reconfigure(): void {
+    this.clearRerankScores();
+    this.clearDenseCache();
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.nextRefreshAt = undefined;
@@ -737,8 +840,83 @@ export class SmartSearchService {
     filters: SmartFilters,
     limit: number
   ): Promise<SmartMatch[]> {
-    if (!this.store) throw new Error('Local semantic search is unavailable');
-    if (this.denseBusy) {
+    const store = this.store;
+    if (!store) throw new Error('Local semantic search is unavailable');
+    const requestedVector = Buffer.from(vector);
+    const requestedFilters = { ...filters };
+    const cacheKey = JSON.stringify([
+      requestedVector.toString('base64'),
+      limit,
+      requestedFilters.mediaType,
+      requestedFilters.language,
+      requestedFilters.yearFrom,
+      requestedFilters.yearTo,
+      requestedFilters.genre,
+      requestedFilters.minRating,
+      requestedFilters.minVotes,
+    ]);
+    const cacheable =
+      Number.isFinite(limit) &&
+      [
+        requestedFilters.yearFrom,
+        requestedFilters.yearTo,
+        requestedFilters.genre,
+        requestedFilters.minRating,
+        requestedFilters.minVotes,
+      ].every((value) => value === undefined || Number.isFinite(value));
+    const generation = this.denseCacheGeneration;
+    const version = async () => {
+      try {
+        return await store.documentVersion();
+      } catch {
+        // An unavailable version must never make the optimization fail a
+        // search or return an unverified cached result.
+        this.denseCache.clear();
+        return undefined;
+      }
+    };
+    const findCached = async () => {
+      const current = await version();
+      if (
+        !cacheable ||
+        !current ||
+        generation !== this.denseCacheGeneration ||
+        this.store !== store
+      )
+        return { current: undefined, matches: undefined };
+      const entry = this.denseCache.get(cacheKey);
+      if (
+        !entry ||
+        entry.version !== current ||
+        entry.expiresAt <= performance.now()
+      ) {
+        this.denseCache.delete(cacheKey);
+        return { current, matches: undefined };
+      }
+      try {
+        const matches = structuredClone(entry.matches);
+        const after = await version();
+        if (
+          after !== current ||
+          entry.expiresAt <= performance.now() ||
+          generation !== this.denseCacheGeneration ||
+          this.store !== store
+        ) {
+          if (this.denseCache.get(cacheKey) === entry)
+            this.denseCache.delete(cacheKey);
+          return { current: undefined, matches: undefined };
+        }
+        this.denseCache.delete(cacheKey);
+        this.denseCache.set(cacheKey, entry);
+        return { current, matches };
+      } catch {
+        this.denseCache.delete(cacheKey);
+        return { current, matches: undefined };
+      }
+    };
+    let lookup = await findCached();
+    if (lookup.matches) return lookup.matches;
+    while (this.denseBusy) {
       if (this.denseWaiters >= 2 || !this.denseDone)
         throw new Error('Local semantic search is busy');
       this.denseWaiters++;
@@ -748,6 +926,10 @@ export class SmartSearchService {
         this.denseWaiters--;
       }
       if (this.denseBusy) throw new Error('Local semantic search is busy');
+      // The preceding scan may have populated the cache, or a writer may
+      // have changed the index while this request was waiting.
+      lookup = await findCached();
+      if (lookup.matches) return lookup.matches;
     }
     this.denseBusy = true;
     let finish: () => void = () => undefined;
@@ -755,7 +937,39 @@ export class SmartSearchService {
       finish = resolve;
     });
     try {
-      return await this.store.search(vector, filters, limit);
+      const matches = await store.search(
+        requestedVector,
+        requestedFilters,
+        limit
+      );
+      if (
+        lookup.current &&
+        generation === this.denseCacheGeneration &&
+        this.store === store &&
+        !this.closing
+      ) {
+        const after = await version();
+        if (
+          after === lookup.current &&
+          generation === this.denseCacheGeneration &&
+          this.store === store &&
+          !this.closing
+        ) {
+          try {
+            this.denseCache.delete(cacheKey);
+            this.denseCache.set(cacheKey, {
+              version: after,
+              expiresAt: performance.now() + denseCacheTtl,
+              matches: structuredClone(matches),
+            });
+            while (this.denseCache.size > denseCacheLimit)
+              this.denseCache.delete(this.denseCache.keys().next().value!);
+          } catch {
+            this.denseCache.delete(cacheKey);
+          }
+        }
+      }
+      return matches;
     } finally {
       this.denseBusy = false;
       finish();
@@ -1075,6 +1289,8 @@ export class SmartSearchService {
   }
 
   async close(): Promise<void> {
+    this.clearRerankScores();
+    this.clearDenseCache();
     this.closing = true;
     if (this.timer) clearTimeout(this.timer);
     if (this.idleTimer) clearTimeout(this.idleTimer);

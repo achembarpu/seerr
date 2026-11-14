@@ -1,7 +1,8 @@
 import { getSettings } from '@server/lib/settings';
 import { mkdtemp, rm } from 'fs/promises';
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { performance } from 'node:perf_hooks';
+import { describe, it, mock } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import os from 'os';
 import path from 'path';
@@ -480,6 +481,314 @@ describe('hybrid retrieval resilience', () => {
 });
 
 describe('bounded search work', () => {
+  it('caches dense results only for the same vector, filters, limit and index version', async () => {
+    const service = new SmartSearchService(() => true);
+    let version = 'one';
+    let searches = 0;
+    const internal = service as unknown as {
+      store: {
+        documentVersion: () => Promise<string | undefined>;
+        search: (
+          vector: Buffer,
+          filters: { minRating?: number },
+          limit: number
+        ) => Promise<{ document: SmartDocument; score: number }[]>;
+      };
+      searchDense: (
+        vector: Buffer,
+        filters: { minRating?: number },
+        limit: number
+      ) => Promise<{ document: SmartDocument; score: number }[]>;
+    };
+    internal.store = {
+      async documentVersion() {
+        return version;
+      },
+      async search(_vector, filters, limit) {
+        searches++;
+        return [
+          {
+            document: {
+              ...document,
+              card: { ...document.card },
+              title: version,
+              voteAverage: 9,
+            },
+            score: 0.8,
+          },
+          {
+            document: {
+              ...document,
+              card: { ...document.card },
+              sourceId: 'other',
+              title: 'other',
+              voteAverage: 4,
+            },
+            score: 0.7,
+          },
+        ]
+          .filter(
+            (item) =>
+              !filters.minRating ||
+              item.document.voteAverage >= filters.minRating
+          )
+          .slice(0, limit);
+      },
+    };
+    const vector = Buffer.from([1, 2]);
+    const first = await internal.searchDense(vector, {}, 2);
+    first[0].document.title = 'mutated by caller';
+    first[0].document.card.id = 'mutated by caller';
+    const cached = await internal.searchDense(vector, {}, 2);
+    assert.equal(cached[0].document.title, 'one');
+    assert.equal(cached[0].document.card.id, 12);
+    assert.equal(searches, 1);
+    assert.equal(
+      (await internal.searchDense(vector, { minRating: 8 }, 2)).length,
+      1
+    );
+    assert.equal((await internal.searchDense(vector, {}, 1)).length, 1);
+    assert.equal(searches, 3);
+    version = 'two';
+    assert.equal(
+      (await internal.searchDense(vector, {}, 2))[0].document.title,
+      'two'
+    );
+    assert.equal(searches, 4);
+  });
+
+  it('does not cache scans when the index changes during the scan or its version is unavailable', async () => {
+    const service = new SmartSearchService(() => true);
+    let version: string | undefined = 'one';
+    let searches = 0;
+    let release: () => void = () => undefined;
+    let started: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const internal = service as unknown as {
+      store: {
+        documentVersion: () => Promise<string | undefined>;
+        search: () => Promise<{ document: SmartDocument; score: number }[]>;
+      };
+      searchDense: (
+        vector: Buffer,
+        filters: object,
+        limit: number
+      ) => Promise<{ document: SmartDocument; score: number }[]>;
+    };
+    internal.store = {
+      async documentVersion() {
+        return version;
+      },
+      async search() {
+        searches++;
+        if (searches === 1) {
+          started();
+          await gate;
+        }
+        return [
+          {
+            document: { ...document, title: version ?? 'unavailable' },
+            score: 0.8,
+          },
+        ];
+      },
+    };
+    const vector = Buffer.from([1, 2]);
+    const inFlight = internal.searchDense(vector, {}, 1);
+    await startedPromise;
+    version = 'two';
+    release();
+    await inFlight;
+    await internal.searchDense(vector, {}, 1);
+    assert.equal(searches, 2);
+    version = undefined;
+    await internal.searchDense(vector, {}, 1);
+    await internal.searchDense(vector, {}, 1);
+    assert.equal(searches, 4);
+  });
+
+  it('reuses an in-flight identical scan after it completes', async () => {
+    const service = new SmartSearchService(() => true);
+    let searches = 0;
+    let release: () => void = () => undefined;
+    let started: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const internal = service as unknown as {
+      store: {
+        documentVersion: () => Promise<string>;
+        search: () => Promise<{ document: SmartDocument; score: number }[]>;
+      };
+      searchDense: (
+        vector: Buffer,
+        filters: object,
+        limit: number
+      ) => Promise<{ document: SmartDocument; score: number }[]>;
+    };
+    internal.store = {
+      async documentVersion() {
+        return 'stable';
+      },
+      async search() {
+        searches++;
+        started();
+        await gate;
+        return [
+          { document: { ...document, card: { ...document.card } }, score: 0.8 },
+        ];
+      },
+    };
+    const vector = Buffer.from([1, 2]);
+    const first = internal.searchDense(vector, {}, 1);
+    await startedPromise;
+    const second = internal.searchDense(vector, {}, 1);
+    release();
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(searches, 1);
+    a[0].document.card.id = 'changed';
+    assert.equal(b[0].document.card.id, 12);
+  });
+
+  it('bounds dense cache entries and expires them on monotonic time', async () => {
+    let now = 0;
+    const clock = mock.method(performance, 'now', () => now);
+    const service = new SmartSearchService(() => true);
+    let searches = 0;
+    const internal = service as unknown as {
+      store: {
+        documentVersion: () => Promise<string>;
+        search: () => Promise<{ document: SmartDocument; score: number }[]>;
+      };
+      searchDense: (
+        vector: Buffer,
+        filters: object,
+        limit: number
+      ) => Promise<{ document: SmartDocument; score: number }[]>;
+    };
+    internal.store = {
+      async documentVersion() {
+        return 'stable';
+      },
+      async search() {
+        searches++;
+        return [{ document, score: 0.8 }];
+      },
+    };
+    try {
+      for (let i = 0; i < 9; i++)
+        await internal.searchDense(Buffer.from([i]), {}, 1);
+      await internal.searchDense(Buffer.from([0]), {}, 1);
+      await internal.searchDense(Buffer.from([0]), {}, 1);
+      assert.equal(searches, 10);
+      now = 30_001;
+      await internal.searchDense(Buffer.from([0]), {}, 1);
+      assert.equal(searches, 11);
+    } finally {
+      clock.mock.restore();
+    }
+  });
+
+  it('does not serve a cached result when the index changes during a cache hit', async () => {
+    const service = new SmartSearchService(() => true);
+    let version = 'one';
+    let readsBeforeChange = -1;
+    let searches = 0;
+    const internal = service as unknown as {
+      store: {
+        documentVersion: () => Promise<string>;
+        search: () => Promise<{ document: SmartDocument; score: number }[]>;
+      };
+      searchDense: (
+        vector: Buffer,
+        filters: object,
+        limit: number
+      ) => Promise<{ document: SmartDocument; score: number }[]>;
+    };
+    internal.store = {
+      async documentVersion() {
+        if (readsBeforeChange === 0) version = 'two';
+        if (readsBeforeChange >= 0) readsBeforeChange--;
+        return version;
+      },
+      async search() {
+        searches++;
+        return [{ document: { ...document, title: version }, score: 0.8 }];
+      },
+    };
+    const vector = Buffer.from([1, 2]);
+    assert.equal(
+      (await internal.searchDense(vector, {}, 1))[0].document.title,
+      'one'
+    );
+    readsBeforeChange = 1;
+    assert.equal(
+      (await internal.searchDense(vector, {}, 1))[0].document.title,
+      'two'
+    );
+    assert.equal(searches, 2);
+  });
+
+  it('bypasses the cache on version errors and clears it on reconfigure and close', async () => {
+    const service = new SmartSearchService(() => true);
+    let searches = 0;
+    let versionError = false;
+    let searchError = true;
+    const internal = service as unknown as {
+      start: () => void;
+      store: {
+        documentVersion: () => Promise<string>;
+        search: () => Promise<{ document: SmartDocument; score: number }[]>;
+        close: () => Promise<void>;
+      };
+      searchDense: (
+        vector: Buffer,
+        filters: object,
+        limit: number
+      ) => Promise<{ document: SmartDocument; score: number }[]>;
+    };
+    internal.start = () => undefined;
+    internal.store = {
+      async documentVersion() {
+        if (versionError) throw new Error('version unavailable');
+        return 'stable';
+      },
+      async search() {
+        searches++;
+        if (searchError) {
+          searchError = false;
+          throw new Error('scan failed');
+        }
+        return [{ document, score: 0.8 }];
+      },
+      async close() {},
+    };
+    const vector = Buffer.from([1, 2]);
+    await assert.rejects(internal.searchDense(vector, {}, 1), /scan failed/);
+    await internal.searchDense(vector, {}, 1);
+    await internal.searchDense(vector, {}, 1);
+    assert.equal(searches, 2);
+    versionError = true;
+    await internal.searchDense(vector, {}, 1);
+    await internal.searchDense(vector, {}, 1);
+    assert.equal(searches, 4);
+    versionError = false;
+    await internal.searchDense(vector, {}, 1);
+    service.reconfigure();
+    await internal.searchDense(vector, {}, 1);
+    assert.equal(searches, 6);
+    await service.close();
+    await assert.rejects(internal.searchDense(vector, {}, 1), /unavailable/);
+  });
+
   it('waits briefly for an in-flight dense scan instead of dropping the next request', async () => {
     const service = new SmartSearchService(() => true);
     let release: () => void = () => undefined;
@@ -648,6 +957,334 @@ it('blends reranking with initial retrieval so strong multilingual hits remain v
     if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
     settings.smartSearchRerank = originalRerank;
     settings.smartSearchRerankCandidates = originalLimit;
+  }
+});
+
+it('reuses exact reranker scores but re-evaluates changed queries and descriptions', async () => {
+  const settings = getSettings().main;
+  const previous = settings.smartSearchRerank;
+  settings.smartSearchRerank = true;
+  const service = new SmartSearchService(() => true);
+  const calls: { query: string; docs: string[] }[] = [];
+  const internal = service as unknown as {
+    reranker: {
+      phase: string;
+      rerank: (query: string, docs: string[]) => Promise<number[]>;
+    };
+    rerank: (
+      query: string,
+      candidates: { document: SmartDocument; score: number }[]
+    ) => Promise<{ document: SmartDocument; relevanceScore?: number }[]>;
+    rerankerIdle?: NodeJS.Timeout;
+  };
+  internal.reranker = {
+    phase: 'ready',
+    async rerank(query, docs) {
+      calls.push({ query, docs: [...docs] });
+      return docs.map((doc) => (doc.includes('New description') ? 0.9 : 0.6));
+    },
+  };
+  const candidate = (title: string, overview: string, voteAverage = 7) => ({
+    document: { ...document, sourceId: title, title, overview, voteAverage },
+    score: 0.5,
+  });
+  const a = candidate('A', 'Original description');
+  const b = candidate('B', 'Another description');
+  try {
+    const first = await internal.rerank('a query', [a, b]);
+    const second = await internal.rerank('a query', [a, b]);
+    assert.deepEqual(second, first);
+    assert.equal(calls.length, 1);
+    const updated = await internal.rerank('a query', [
+      candidate('A', 'Original description', 9),
+      candidate('B', 'New description'),
+    ]);
+    assert.equal(calls.length, 2);
+    assert.equal(calls[1].docs.length, 1);
+    assert.equal(
+      updated.find((x) => x.document.title === 'A')?.document.voteAverage,
+      9
+    );
+    assert.equal(
+      updated.find((x) => x.document.title === 'B')?.relevanceScore,
+      0.9
+    );
+    await internal.rerank('another query', [a, b]);
+    assert.equal(calls.length, 3);
+    assert.equal(calls[2].docs.length, 2);
+  } finally {
+    if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
+    settings.smartSearchRerank = previous;
+  }
+});
+
+it('bounds reranker score cache entries and recomputes evicted scores', async () => {
+  const settings = getSettings().main;
+  const previousEnabled = settings.smartSearchRerank;
+  const previousLimit = settings.smartSearchRerankCandidates;
+  settings.smartSearchRerank = true;
+  settings.smartSearchRerankCandidates = 80;
+  const service = new SmartSearchService(() => true);
+  const calls: number[] = [];
+  const internal = service as unknown as {
+    reranker: {
+      phase: string;
+      rerank: (query: string, docs: string[]) => Promise<number[]>;
+    };
+    rerank: (
+      query: string,
+      candidates: { document: SmartDocument; score: number }[]
+    ) => Promise<unknown[]>;
+    rerankerIdle?: NodeJS.Timeout;
+  };
+  internal.reranker = {
+    phase: 'ready',
+    async rerank(_query, docs) {
+      calls.push(docs.length);
+      return docs.map(() => 0.9);
+    },
+  };
+  const candidates = Array.from({ length: 80 }, (_, index) => ({
+    document: { ...document, sourceId: String(index), title: `Title ${index}` },
+    score: 0.5,
+  }));
+  try {
+    for (let i = 0; i < 13; i++)
+      await internal.rerank(`query ${i}`, candidates);
+    await internal.rerank('query 0', candidates);
+    assert.equal(calls.length, 14);
+    assert.equal(calls[13], 16);
+  } finally {
+    if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
+    settings.smartSearchRerank = previousEnabled;
+    settings.smartSearchRerankCandidates = previousLimit;
+  }
+});
+
+it('retains a valid cache hit if it expires during inference for other documents', async () => {
+  const settings = getSettings().main;
+  const previous = settings.smartSearchRerank;
+  settings.smartSearchRerank = true;
+  let now = 0;
+  const clock = mock.method(performance, 'now', () => now);
+  const service = new SmartSearchService(() => true);
+  const internal = service as unknown as {
+    reranker: {
+      phase: string;
+      rerank: (query: string, docs: string[]) => Promise<number[]>;
+    };
+    rerank: (
+      query: string,
+      candidates: { document: SmartDocument; score: number }[]
+    ) => Promise<{ document: SmartDocument; relevanceScore?: number }[]>;
+    rerankerIdle?: NodeJS.Timeout;
+  };
+  internal.reranker = {
+    phase: 'ready',
+    async rerank(_query, docs) {
+      if (docs.some((doc) => doc.includes('New item'))) now += 2;
+      return docs.map((doc) => (doc.includes('New item') ? 0.8 : 0.9));
+    },
+  };
+  const a = { document: { ...document, title: 'Original item' }, score: 0.5 };
+  const b = {
+    document: { ...document, sourceId: 'new', title: 'New item' },
+    score: 0.4,
+  };
+  try {
+    await internal.rerank('query', [a]);
+    now = 5 * 60 * 1000 - 1;
+    const results = await internal.rerank('query', [a, b]);
+    assert.equal(
+      results.find((item) => item.document.title === 'Original item')
+        ?.relevanceScore,
+      0.9
+    );
+    assert.equal(
+      results.find((item) => item.document.title === 'New item')
+        ?.relevanceScore,
+      0.8
+    );
+  } finally {
+    clock.mock.restore();
+    if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
+    settings.smartSearchRerank = previous;
+  }
+});
+
+it('reuses scores without caching filtered results or old ratings', async () => {
+  const settings = getSettings().main;
+  const previous = settings.smartSearchRerank;
+  settings.smartSearchRerank = true;
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      return [[1, 0]];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  let calls = 0;
+  const items = [
+    {
+      document: { ...document, sourceId: 'one', title: 'One', voteAverage: 9 },
+      score: 0.8,
+    },
+    {
+      document: { ...document, sourceId: 'two', title: 'Two', voteAverage: 5 },
+      score: 0.7,
+    },
+  ];
+  const internal = service as unknown as {
+    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    searchDense: (
+      vector: Buffer,
+      filters: { minRating?: number }
+    ) => Promise<typeof items>;
+    reranker: {
+      phase: string;
+      rerank: (query: string, docs: string[]) => Promise<number[]>;
+    };
+    idleTimer?: NodeJS.Timeout;
+    rerankerIdle?: NodeJS.Timeout;
+  };
+  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.searchDense = async (_vector, filters) =>
+    items.filter(
+      (item) =>
+        !filters.minRating || item.document.voteAverage >= filters.minRating
+    );
+  internal.reranker = {
+    phase: 'ready',
+    async rerank(_query, docs) {
+      calls++;
+      return docs.map(() => 0.9);
+    },
+  };
+  try {
+    assert.equal((await service.search('a short query', {})).length, 2);
+    const filtered = await service.search('a short query', { minRating: 8 });
+    assert.deepEqual(
+      filtered.map((item) => item.document.sourceId),
+      ['one']
+    );
+    assert.equal(calls, 1);
+    items[0].document.voteAverage = 6;
+    const updated = await service.search('a short query', {});
+    assert.equal(
+      updated.find((item) => item.document.sourceId === 'one')?.document
+        .voteAverage,
+      6
+    );
+    assert.equal(calls, 1);
+  } finally {
+    if (internal.idleTimer) clearTimeout(internal.idleTimer);
+    if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
+    settings.smartSearchRerank = previous;
+  }
+});
+
+it('discards cached and in-flight scores when the runtime is reconfigured', async () => {
+  const settings = getSettings().main;
+  const previous = settings.smartSearchRerank;
+  settings.smartSearchRerank = true;
+  const service = new SmartSearchService(() => true);
+  let calls = 0;
+  let finish: ((scores: number[]) => void) | undefined;
+  const internal = service as unknown as {
+    start: () => void;
+    reranker: {
+      phase: string;
+      stop: () => void;
+      rerank: () => Promise<number[]>;
+    };
+    rerank: (
+      query: string,
+      candidates: { document: SmartDocument; score: number }[]
+    ) => Promise<{ reranked?: boolean }[]>;
+    rerankerIdle?: NodeJS.Timeout;
+  };
+  internal.start = () => undefined;
+  internal.reranker = {
+    phase: 'ready',
+    stop() {},
+    async rerank() {
+      calls++;
+      if (calls === 2)
+        return await new Promise((resolve) => {
+          finish = resolve;
+        });
+      return [0.9];
+    },
+  };
+  try {
+    const candidates = [{ document, score: 0.5 }];
+    await internal.rerank('cached', candidates);
+    await internal.rerank('cached', candidates);
+    assert.equal(calls, 1);
+    const ongoing = internal.rerank('in flight', candidates);
+    await Promise.resolve();
+    assert.ok(finish);
+    service.reconfigure();
+    finish([0.9]);
+    assert.equal((await ongoing)[0].reranked, undefined);
+    await internal.rerank('cached', candidates);
+    await internal.rerank('in flight', candidates);
+    assert.equal(calls, 4);
+  } finally {
+    if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
+    settings.smartSearchRerank = previous;
+  }
+});
+
+it('never caches failed reranker calls', async () => {
+  const settings = getSettings().main;
+  const previous = settings.smartSearchRerank;
+  settings.smartSearchRerank = true;
+  const service = new SmartSearchService(() => true);
+  let calls = 0;
+  const internal = service as unknown as {
+    reranker: { phase: string; rerank: () => Promise<number[]> };
+    rerank: (
+      query: string,
+      candidates: { document: SmartDocument; score: number }[]
+    ) => Promise<{ reranked?: boolean }[]>;
+    rerankerIdle?: NodeJS.Timeout;
+  };
+  internal.reranker = {
+    phase: 'ready',
+    async rerank() {
+      calls++;
+      if (calls === 1) throw new Error('temporary failure');
+      return [0.9];
+    },
+  };
+  try {
+    const candidates = [{ document, score: 0.5 }];
+    assert.equal(
+      (await internal.rerank('query', candidates))[0].reranked,
+      undefined
+    );
+    assert.equal(
+      (await internal.rerank('query', candidates))[0].reranked,
+      true
+    );
+    assert.equal(calls, 2);
+  } finally {
+    if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
+    settings.smartSearchRerank = previous;
   }
 });
 
