@@ -5,7 +5,17 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
   echo 'Build this app on an Apple Silicon Mac.' >&2; exit 1
 fi
-for tool in node pnpm git cmake swiftc curl shasum ditto sips python3 codesign vtool; do
+install=false
+install_destination=""
+if [[ ${1:-} == --install ]]; then
+  install=true
+  shift
+  if [[ $# -gt 0 ]]; then install_destination=$1; shift; fi
+fi
+if [[ $# -gt 0 ]]; then
+  echo "Usage: $0 [--install [absolute-install-path.app]]" >&2; exit 1
+fi
+for tool in node pnpm git cmake swiftc curl shasum ditto sips python3 codesign vtool zip; do
   command -v "$tool" >/dev/null || { echo "Missing build tool: $tool" >&2; exit 1; }
 done
 export MACOSX_DEPLOYMENT_TARGET=13.5
@@ -17,6 +27,7 @@ work=$(mktemp -d "${TMPDIR:-/tmp}/seerr-native-build.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$output"
 
+"$root/scripts/test-macos-installer.sh"
 cd "$root"
 pnpm build
 
@@ -107,4 +118,24 @@ rm -rf "$output/Seerr.app"
 ditto "$app" "$output/Seerr.app"
 rm -f "$output/Seerr-macOS-arm64.zip"
 ditto -c -k --sequesterRsrc --keepParent "$output/Seerr.app" "$output/Seerr-macOS-arm64.zip"
+cp scripts/install-macos-app.sh "$work/Install Seerr.command"
+chmod +x "$work/Install Seerr.command"
+cat > "$work/Install Seerr.txt" <<'INSTRUCTIONS'
+This is a private, ad-hoc-signed build and is not notarized by Apple.
+Quit Seerr before replacing an existing copy.
+Double-click Install Seerr.command to verify and install it in ~/Applications.
+If macOS blocks the installer itself, open Terminal and run:
+  bash /path/to/Install\ Seerr.command
+You can drag the installer file into Terminal after typing "bash ".
+The installer clears quarantine on this app only after verifying its signature.
+Only install a build you trust. Your Seerr data and indexes are not modified.
+INSTRUCTIONS
+zip -q -j "$output/Seerr-macOS-arm64.zip" "$work/Install Seerr.command" "$work/Install Seerr.txt"
 echo "Built $output/Seerr-macOS-arm64.zip"
+if "$install"; then
+  if [[ -n "$install_destination" ]]; then
+    "$root/scripts/install-macos-app.sh" "$output/Seerr.app" "$install_destination"
+  else
+    "$root/scripts/install-macos-app.sh" "$output/Seerr.app"
+  fi
+fi
