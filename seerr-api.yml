@@ -280,6 +280,18 @@ components:
         smartSearch:
           type: boolean
           example: false
+        smartSearchRerank:
+          type: boolean
+          example: false
+        smartSearchRerankCandidates:
+          type: integer
+          minimum: 10
+          maximum: 80
+          example: 40
+        smartSearchRefreshInterval:
+          type: string
+          enum: [daily, weekly, manual]
+          example: daily
         smartSearchDevice:
           type: string
           example: auto

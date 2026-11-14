@@ -160,6 +160,9 @@ export interface MainSettings {
   versionCheck: boolean;
   localTitleSearch: boolean;
   smartSearch: boolean;
+  smartSearchRerank: boolean;
+  smartSearchRerankCandidates: number;
+  smartSearchRefreshInterval: 'daily' | 'weekly' | 'manual';
   smartSearchDevice: string;
 }
 
@@ -442,6 +445,9 @@ class Settings {
         versionCheck: true,
         localTitleSearch: false,
         smartSearch: false,
+        smartSearchRerank: false,
+        smartSearchRerankCandidates: 40,
+        smartSearchRefreshInterval: 'daily',
         smartSearchDevice: 'auto',
       },
       plex: {

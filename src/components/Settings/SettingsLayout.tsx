@@ -9,6 +9,7 @@ import { useIntl } from 'react-intl';
 
 const messages = defineMessages('components.Settings', {
   menuGeneralSettings: 'General',
+  menuSearchSettings: 'Search',
   menuUsers: 'Users',
   menuPlexSettings: 'Plex',
   menuJellyfinSettings: '{mediaServerName}',
@@ -33,6 +34,11 @@ const SettingsLayout = ({ children }: SettingsLayoutProps) => {
       text: intl.formatMessage(messages.menuGeneralSettings),
       route: '/settings/main',
       regex: /^\/settings(\/main)?$/,
+    },
+    {
+      text: intl.formatMessage(messages.menuSearchSettings),
+      route: '/settings/search',
+      regex: /^\/settings\/search/,
     },
     {
       text: intl.formatMessage(messages.menuUsers),

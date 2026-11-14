@@ -91,11 +91,36 @@ settingsRoutes.post('/main', async (req, res) => {
       ))
   )
     return res.status(400).json({ message: 'Invalid inference device' });
+  if (
+    req.body.smartSearchRerank !== undefined &&
+    typeof req.body.smartSearchRerank !== 'boolean'
+  )
+    return res.status(400).json({ message: 'Invalid reranker setting' });
+  if (
+    req.body.smartSearchRerankCandidates !== undefined &&
+    (!Number.isInteger(req.body.smartSearchRerankCandidates) ||
+      req.body.smartSearchRerankCandidates < 10 ||
+      req.body.smartSearchRerankCandidates > 80)
+  )
+    return res
+      .status(400)
+      .json({ message: 'Invalid reranker candidate limit' });
+  if (
+    req.body.smartSearchRefreshInterval !== undefined &&
+    !['daily', 'weekly', 'manual'].includes(req.body.smartSearchRefreshInterval)
+  )
+    return res.status(400).json({ message: 'Invalid search refresh interval' });
+  const previousRefreshInterval = settings.main.smartSearchRefreshInterval;
   const previousDevice = settings.main.smartSearchDevice;
+  const previousRerank = settings.main.smartSearchRerank;
   settings.main = merge(settings.main, req.body);
   await settings.save();
   searchIndex.start();
-  if (previousDevice !== settings.main.smartSearchDevice)
+  if (
+    previousDevice !== settings.main.smartSearchDevice ||
+    previousRerank !== settings.main.smartSearchRerank ||
+    previousRefreshInterval !== settings.main.smartSearchRefreshInterval
+  )
     smartSearch.reconfigure();
   else smartSearch.start();
 

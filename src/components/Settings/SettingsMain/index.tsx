@@ -17,9 +17,7 @@ import { isValidURL } from '@app/utils/urlValidationHelper';
 import { ArrowDownOnSquareIcon } from '@heroicons/react/24/outline';
 import { ArrowPathIcon } from '@heroicons/react/24/solid';
 import type { UserSettingsGeneralResponse } from '@server/interfaces/api/userSettingsInterfaces';
-import type { SearchIndexStatus } from '@server/lib/searchIndex/service';
 import type { MainSettings } from '@server/lib/settings';
-import type { SmartSearchService } from '@server/lib/smartSearch/service';
 import type { AvailableLocale } from '@server/types/languages';
 import axios from 'axios';
 import { Field, Form, Formik } from 'formik';
@@ -67,37 +65,6 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   hideRequested: 'Hide Requested Media',
   hideRequestedTip:
     'Hide media that has been requested from the discover pages but not search results',
-  localTitleSearch: 'Local typo-tolerant title search',
-  localTitleSearchTip:
-    'Download and refresh TMDB and IMDb title indexes in the background. IMDb permits a personal movie database for individual personal, non-commercial use, subject to its terms. Save settings to apply.',
-  localTitleSearchTerms: 'IMDb terms',
-  searchIndexImdb: 'IMDb titles',
-  searchIndexRatings: 'IMDb ratings',
-  searchIndexMovies: 'TMDB movies',
-  searchIndexTv: 'TMDB series',
-  searchIndexUpdating: 'Updating',
-  searchIndexWaiting: 'Waiting for first download',
-  searchIndexReady: 'Ready',
-  searchIndexFailed: 'Update failed; retry scheduled',
-  searchIndexNext: 'Next update: {date}',
-  searchIndexChecked: 'Last checked: {date}',
-  searchIndexRefresh: 'Refresh now',
-  searchIndexRefreshFailed: 'Could not start the search index refresh.',
-  searchIndexStatusFailed: 'Could not load the search index status.',
-  smartSearch: 'Local smart search',
-  smartSearchTip:
-    'Download a 119 MB embedding model and build a local TMDB discovery index in the background. The index uses additional disk space and CPU. Save settings to apply.',
-  smartSearchStatus: 'Status: {phase}; indexed titles: {count}',
-  smartSearchDevice: 'Smart search inference device',
-  smartSearchDeviceTip:
-    'Choose a detected GPU or CPU. Automatic uses a GPU when available and falls back to CPU.',
-  smartSearchDeviceAuto: 'Automatic',
-  smartSearchDeviceCpu: 'CPU',
-  smartSearchDeviceHost: 'Host inference service (for example, macOS Metal)',
-  smartSearchActiveDevice: 'Active inference device: {device}',
-  smartSearchDownload: 'Downloading model: {percent}%',
-  smartSearchProgress: 'Indexing {mediaType} from {year}, page {page}',
-  smartSearchRefreshFailed: 'Could not start smart search refresh.',
 
   cacheImages: 'Enable Image Caching',
   cacheImagesTip:
@@ -129,30 +96,6 @@ const SettingsMain = () => {
   const { data: userData } = useSWR<UserSettingsGeneralResponse>(
     currentUser ? `/api/v1/user/${currentUser.id}/settings/main` : null
   );
-  const {
-    data: searchIndexStatus,
-    error: searchIndexError,
-    mutate: refreshSearchIndexStatus,
-  } = useSWR<SearchIndexStatus>(
-    data?.localTitleSearch ? '/api/v1/settings/search-index' : null,
-    {
-      refreshInterval: (status) => (status?.refreshing ? 3000 : 30000),
-      revalidateOnFocus: false,
-    }
-  );
-  const { data: smartStatus, mutate: refreshSmartStatus } = useSWR<
-    ReturnType<SmartSearchService['status']>
-  >(data?.smartSearch ? '/api/v1/settings/smart-search' : null, {
-    refreshInterval: 3000,
-    revalidateOnFocus: false,
-  });
-  const sourceLabels = {
-    imdb: messages.searchIndexImdb,
-    'imdb-ratings': messages.searchIndexRatings,
-    'tmdb-movie': messages.searchIndexMovies,
-    'tmdb-tv': messages.searchIndexTv,
-  } as const;
-
   const MainSettingsSchema = Yup.object().shape({
     applicationTitle: Yup.string().required(
       intl.formatMessage(messages.validationApplicationTitle)
@@ -237,9 +180,6 @@ const SettingsMain = () => {
             blocklistedTagsLimit: data?.blocklistedTagsLimit || 50,
             partialRequestsEnabled: data?.partialRequestsEnabled,
             enableSpecialEpisodes: data?.enableSpecialEpisodes,
-            localTitleSearch: data?.localTitleSearch,
-            smartSearch: data?.smartSearch,
-            smartSearchDevice: data?.smartSearchDevice || 'auto',
             cacheImages: data?.cacheImages,
             youtubeUrl: data?.youtubeUrl,
             versionCheck: data?.versionCheck,
@@ -264,9 +204,6 @@ const SettingsMain = () => {
                 blocklistedTagsLimit: values.blocklistedTagsLimit,
                 partialRequestsEnabled: values.partialRequestsEnabled,
                 enableSpecialEpisodes: values.enableSpecialEpisodes,
-                localTitleSearch: values.localTitleSearch,
-                smartSearch: values.smartSearch,
-                smartSearchDevice: values.smartSearchDevice,
                 cacheImages: values.cacheImages,
                 youtubeUrl: values.youtubeUrl,
                 versionCheck: values?.versionCheck,
@@ -380,263 +317,6 @@ const SettingsMain = () => {
                       )}
                   </div>
                 </div>
-                <div className="form-row">
-                  <label htmlFor="localTitleSearch" className="checkbox-label">
-                    {intl.formatMessage(messages.localTitleSearch)}
-                    <span className="label-tip">
-                      {intl.formatMessage(messages.localTitleSearchTip)}{' '}
-                      <a
-                        href="https://help.imdb.com/article/imdb/general-information/can-i-use-imdb-data-in-my-software/G5JTRESSHJBBHTGX"
-                        target="_blank"
-                        rel="noreferrer"
-                        className="underline"
-                      >
-                        {intl.formatMessage(messages.localTitleSearchTerms)}
-                      </a>
-                    </span>
-                  </label>
-                  <div className="form-input-area">
-                    <Field
-                      type="checkbox"
-                      id="localTitleSearch"
-                      name="localTitleSearch"
-                      onChange={() =>
-                        setFieldValue(
-                          'localTitleSearch',
-                          !values.localTitleSearch
-                        )
-                      }
-                    />
-                  </div>
-                </div>
-                {data?.localTitleSearch && (
-                  <div className="form-row">
-                    <div className="form-input-area">
-                      {searchIndexError && (
-                        <p className="text-sm text-red-400">
-                          {intl.formatMessage(messages.searchIndexStatusFailed)}
-                        </p>
-                      )}
-                      {searchIndexStatus && (
-                        <>
-                          {Object.entries(sourceLabels).map(
-                            ([source, label]) => {
-                              const key = source as keyof typeof sourceLabels;
-                              const sourceStatus =
-                                searchIndexStatus.sources[key];
-                              const status =
-                                searchIndexStatus.currentSource === key
-                                  ? messages.searchIndexUpdating
-                                  : searchIndexStatus.failedSources.includes(
-                                        key
-                                      )
-                                    ? messages.searchIndexFailed
-                                    : sourceStatus.available
-                                      ? messages.searchIndexReady
-                                      : messages.searchIndexWaiting;
-                              return (
-                                <p
-                                  key={key}
-                                  className="mb-1 text-sm text-gray-300"
-                                >
-                                  {intl.formatMessage(label)}:{' '}
-                                  {intl.formatMessage(status)}
-                                  {sourceStatus.lastChecked && (
-                                    <>
-                                      {' '}
-                                      ·{' '}
-                                      {intl.formatMessage(
-                                        messages.searchIndexChecked,
-                                        {
-                                          date: intl.formatDate(
-                                            sourceStatus.lastChecked,
-                                            {
-                                              dateStyle: 'medium',
-                                              timeStyle: 'short',
-                                            }
-                                          ),
-                                        }
-                                      )}
-                                    </>
-                                  )}
-                                </p>
-                              );
-                            }
-                          )}
-                          {searchIndexStatus.nextRefreshAt && (
-                            <p className="mb-2 text-sm text-gray-400">
-                              {intl.formatMessage(messages.searchIndexNext, {
-                                date: intl.formatDate(
-                                  searchIndexStatus.nextRefreshAt,
-                                  { dateStyle: 'medium', timeStyle: 'short' }
-                                ),
-                              })}
-                            </p>
-                          )}
-                          <Button
-                            type="button"
-                            buttonSize="sm"
-                            disabled={searchIndexStatus.refreshing}
-                            onClick={async () => {
-                              try {
-                                await axios.post(
-                                  '/api/v1/settings/search-index/refresh'
-                                );
-                                await refreshSearchIndexStatus();
-                              } catch {
-                                addToast(
-                                  intl.formatMessage(
-                                    messages.searchIndexRefreshFailed
-                                  ),
-                                  { autoDismiss: true, appearance: 'error' }
-                                );
-                                await refreshSearchIndexStatus();
-                              }
-                            }}
-                          >
-                            {intl.formatMessage(messages.searchIndexRefresh)}
-                          </Button>
-                        </>
-                      )}
-                    </div>
-                  </div>
-                )}
-                <div className="form-row">
-                  <label htmlFor="smartSearch" className="checkbox-label">
-                    {intl.formatMessage(messages.smartSearch)}
-                    <span className="label-tip">
-                      {intl.formatMessage(messages.smartSearchTip)}
-                    </span>
-                  </label>
-                  <div className="form-input-area">
-                    <Field
-                      type="checkbox"
-                      id="smartSearch"
-                      name="smartSearch"
-                      onChange={() =>
-                        setFieldValue('smartSearch', !values.smartSearch)
-                      }
-                    />
-                  </div>
-                </div>
-                {values.smartSearch && (
-                  <div className="form-row">
-                    <label htmlFor="smartSearchDevice" className="text-label">
-                      {intl.formatMessage(messages.smartSearchDevice)}
-                      <span className="label-tip">
-                        {intl.formatMessage(messages.smartSearchDeviceTip)}
-                      </span>
-                    </label>
-                    <div className="form-input-area">
-                      <Field
-                        as="select"
-                        id="smartSearchDevice"
-                        name="smartSearchDevice"
-                      >
-                        <option value="auto">
-                          {intl.formatMessage(messages.smartSearchDeviceAuto)}
-                        </option>
-                        <option value="cpu">
-                          {intl.formatMessage(messages.smartSearchDeviceCpu)}
-                        </option>
-                        {(smartStatus?.externalAvailable ||
-                          values.smartSearchDevice === 'external') && (
-                          <option value="external">
-                            {intl.formatMessage(messages.smartSearchDeviceHost)}
-                          </option>
-                        )}
-                        {smartStatus?.devices.map((device) => (
-                          <option key={device.name} value={device.name}>
-                            {device.description} ({device.name})
-                          </option>
-                        ))}
-                        {values.smartSearchDevice !== 'auto' &&
-                          values.smartSearchDevice !== 'cpu' &&
-                          values.smartSearchDevice !== 'external' &&
-                          !smartStatus?.devices.some(
-                            (device) => device.name === values.smartSearchDevice
-                          ) && (
-                            <option value={values.smartSearchDevice}>
-                              {values.smartSearchDevice} (unavailable)
-                            </option>
-                          )}
-                      </Field>
-                    </div>
-                  </div>
-                )}
-                {data?.smartSearch && smartStatus && (
-                  <div className="form-row">
-                    <div className="form-input-area">
-                      <p className="mb-1 text-sm text-gray-300">
-                        {intl.formatMessage(messages.smartSearchStatus, {
-                          phase: smartStatus.phase,
-                          count: smartStatus.count,
-                        })}
-                      </p>
-                      {smartStatus.activeDevice && (
-                        <p className="mb-1 text-sm text-gray-300">
-                          {intl.formatMessage(
-                            messages.smartSearchActiveDevice,
-                            { device: smartStatus.activeDevice }
-                          )}
-                        </p>
-                      )}
-                      {smartStatus.deviceWarning && (
-                        <p className="mb-2 text-sm text-yellow-400">
-                          {smartStatus.deviceWarning}
-                        </p>
-                      )}
-                      {smartStatus.phase === 'downloading' && (
-                        <p className="mb-1 text-sm text-gray-300">
-                          {intl.formatMessage(messages.smartSearchDownload, {
-                            percent: Math.min(
-                              100,
-                              Math.round(
-                                (smartStatus.downloadBytes * 100) /
-                                  smartStatus.downloadTotal
-                              )
-                            ),
-                          })}
-                        </p>
-                      )}
-                      {smartStatus.cursor && (
-                        <p className="mb-1 text-sm text-gray-300">
-                          {intl.formatMessage(
-                            messages.smartSearchProgress,
-                            smartStatus.cursor
-                          )}
-                        </p>
-                      )}
-                      {smartStatus.error && (
-                        <p className="mb-2 text-sm text-red-400">
-                          {smartStatus.error}
-                        </p>
-                      )}
-                      <Button
-                        type="button"
-                        buttonSize="sm"
-                        disabled={smartStatus.indexing}
-                        onClick={async () => {
-                          try {
-                            await axios.post(
-                              '/api/v1/settings/smart-search/refresh'
-                            );
-                            await refreshSmartStatus();
-                          } catch {
-                            addToast(
-                              intl.formatMessage(
-                                messages.smartSearchRefreshFailed
-                              ),
-                              { autoDismiss: true, appearance: 'error' }
-                            );
-                          }
-                        }}
-                      >
-                        {intl.formatMessage(messages.searchIndexRefresh)}
-                      </Button>
-                    </div>
-                  </div>
-                )}
                 <div className="form-row">
                   <label htmlFor="cacheImages" className="checkbox-label">
                     <span className="mr-2">

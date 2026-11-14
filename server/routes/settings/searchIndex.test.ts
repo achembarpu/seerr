@@ -1,8 +1,11 @@
+import searchIndex from '@server/lib/searchIndex/service';
+import { getSettings } from '@server/lib/settings';
+import smartSearch from '@server/lib/smartSearch/service';
 import express from 'express';
 import * as OpenApiValidator from 'express-openapi-validator';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { describe, it } from 'node:test';
+import { describe, it, mock } from 'node:test';
 import request from 'supertest';
 import settingsRoutes from './index';
 
@@ -47,4 +50,47 @@ describe('smart search settings API', () => {
       .post('/api/v1/settings/smart-search/refresh')
       .expect(409);
   });
+});
+
+it('updates reranking without changing existing search settings and restarts the runtime', async () => {
+  const settings = getSettings();
+  const before = { ...settings.main };
+  const save = mock.method(settings, 'save', async () => undefined);
+  const titleStart = mock.method(searchIndex, 'start', () => undefined);
+  const restart = mock.method(smartSearch, 'reconfigure', () => undefined);
+  try {
+    const result = await request(app)
+      .post('/api/v1/settings/main')
+      .send({
+        smartSearchRerank: true,
+        smartSearchRerankCandidates: 80,
+        smartSearchRefreshInterval: 'weekly',
+      })
+      .expect(200);
+    assert.equal(result.body.smartSearchRerank, true);
+    assert.equal(result.body.smartSearchRerankCandidates, 80);
+    assert.equal(result.body.smartSearchRefreshInterval, 'weekly');
+    assert.equal(settings.main.smartSearch, before.smartSearch);
+    assert.equal(settings.main.localTitleSearch, before.localTitleSearch);
+    assert.equal(restart.mock.callCount(), 1);
+    assert.equal(save.mock.callCount(), 1);
+    await request(app)
+      .post('/api/v1/settings/main')
+      .send({ smartSearchRerank: 'yes' })
+      .expect(400);
+    await request(app)
+      .post('/api/v1/settings/main')
+      .send({ smartSearchRerankCandidates: 81 })
+      .expect(400);
+    await request(app)
+      .post('/api/v1/settings/main')
+      .send({ smartSearchRefreshInterval: 'hourly' })
+      .expect(400);
+    assert.equal(save.mock.callCount(), 1);
+  } finally {
+    Object.assign(settings.main, before);
+    save.mock.restore();
+    titleStart.mock.restore();
+    restart.mock.restore();
+  }
 });
