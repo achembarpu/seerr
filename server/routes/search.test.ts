@@ -72,12 +72,21 @@ describe('local title suggestions', () => {
     assert.equal(response.body.results.length, 1);
     assert.equal(response.body.results[0].id, 806067);
     assert.equal(response.body.results[0].mediaType, 'movie');
+    assert.equal(response.body.results[0].matchScore, 0.9);
+  });
+  it('accepts two-character titles in scripts that use short words', async () => {
+    const calls = indexMock.mock.callCount();
+    await request(app)
+      .get('/search/suggestions')
+      .query({ query: '기생' })
+      .expect(200);
+    assert.equal(indexMock.mock.callCount(), calls + 1);
   });
   it('does not call the index for short input', async () => {
     const calls = indexMock.mock.callCount();
     await request(app)
       .get('/search/suggestions')
-      .query({ query: 'ma' })
+      .query({ query: 'm' })
       .expect(200);
     assert.equal(indexMock.mock.callCount(), calls);
   });

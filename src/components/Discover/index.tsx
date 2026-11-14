@@ -15,6 +15,7 @@ import TvGenreSlider from '@app/components/Discover/TvGenreSlider';
 import { sliderTitles } from '@app/components/Discover/constants';
 import MediaSlider from '@app/components/MediaSlider';
 import { encodeURIExtraParams } from '@app/hooks/useDiscover';
+import useSettings from '@app/hooks/useSettings';
 import useToasts from '@app/hooks/useToasts';
 import { Permission, useUser } from '@app/hooks/useUser';
 import globalMessages from '@app/i18n/globalMessages';
@@ -50,10 +51,12 @@ const messages = defineMessages('components.Discover', {
   customizediscover: 'Customize Discover',
   stopediting: 'Stop Editing',
   createnewslider: 'Create New Slider',
+  smartRecommendations: 'Recommended from your requests',
 });
 
 const Discover = () => {
   const intl = useIntl();
+  const settings = useSettings();
   const { hasPermission } = useUser();
   const { addToast } = useToasts();
   const {
@@ -207,6 +210,14 @@ const Discover = () => {
             </Button>
           </Transition>
         </>
+      )}
+      {!isEditing && settings.currentSettings.smartSearch && (
+        <MediaSlider
+          sliderKey="smart-recommendations"
+          title={intl.formatMessage(messages.smartRecommendations)}
+          url="/api/v1/search/smart/recommendations"
+          hideWhenEmpty
+        />
       )}
       {(isEditing ? sliders : discoverData)?.map((slider, index) => {
         let sliderComponent: React.ReactNode;

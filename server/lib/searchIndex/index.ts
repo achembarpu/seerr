@@ -1,5 +1,7 @@
 import sqlite3 from 'sqlite3';
-import jaro from 'wink-jaro-distance';
+import { normalizeTitle, titleRank, titleSimilarity } from './ranking';
+
+export { normalizeTitle } from './ranking';
 
 export type IndexSource = 'imdb' | 'tmdb-movie' | 'tmdb-tv';
 export type IndexedMediaType = 'movie' | 'tv';
@@ -30,31 +32,6 @@ interface CandidateRow extends IndexedTitle {
 
 const SEARCH_CACHE_SIZE = 128;
 
-// Combining marks and joiners are part of words in scripts such as Tamil and
-// Malayalam. Keep them instead of treating them as punctuation.
-export const normalizeTitle = (value: string): string =>
-  value
-    .normalize('NFC')
-    .toLowerCase()
-    .replace(/[^\p{L}\p{M}\p{N}\u200c\u200d]+/gu, ' ')
-    .trim()
-    .replace(/\s+/g, ' ');
-
-const similarity = (query: string, name: string): number => {
-  if (!name) return 0;
-
-  let score = jaro(query, name).similarity;
-  if (name.includes(query)) score = Math.max(score, 0.9);
-  if (!query.includes(' ')) {
-    for (const word of name.split(' ')) {
-      if (word.length >= query.length * 0.6) {
-        score = Math.max(score, jaro(query, word).similarity);
-      }
-    }
-  }
-  return score;
-};
-
 const trigrams = (query: string): string[] => {
   const grams = new Set<string>();
   for (const word of query.split(' ')) {
@@ -64,6 +41,33 @@ const trigrams = (query: string): string[] => {
     }
   }
   return [...grams].slice(0, 24);
+};
+
+// Short unaccented queries need alternate trigrams because the existing FTS
+// index retains accents. Expand a bounded number of single-letter variants;
+// this works with the current on-disk index and requires no reimport.
+const accentTrigrams = (query: string, grams: string[]): string[] => {
+  if (!/^[a-z]{3,8}$/.test(query)) return grams;
+  const accents: Record<string, string> = {
+    a: 'áàâäãå',
+    c: 'ç',
+    e: 'éèêë',
+    i: 'íìîï',
+    n: 'ñ',
+    o: 'óòôöõ',
+    u: 'úùûü',
+    y: 'ýÿ',
+  };
+  const expanded = new Set(grams);
+  for (const gram of grams) {
+    for (let i = 0; i < gram.length; i++) {
+      for (const variant of accents[gram[i]] ?? '') {
+        expanded.add(gram.slice(0, i) + variant + gram.slice(i + 1));
+        if (expanded.size >= 96) return [...expanded];
+      }
+    }
+  }
+  return [...expanded];
 };
 
 /** A disposable, independently rebuildable search index. */
@@ -355,8 +359,14 @@ export class SearchIndex {
   async search(query: string, limit = 20): Promise<TitleMatch[]> {
     if (!this.reader) throw new Error('Search index is not initialized');
     const normalized = normalizeTitle(query);
-    const grams = trigrams(normalized);
-    if (!grams.length) return [];
+    const characters = Array.from(normalized);
+    const shortNonLatin =
+      characters.length >= 2 &&
+      characters.length <= 4 &&
+      !normalized.includes(' ') &&
+      /[^\p{ASCII}]/u.test(normalized);
+    const grams = accentTrigrams(normalized, trigrams(normalized));
+    if (!grams.length && !shortNonLatin) return [];
     const revision = this.revision;
     const key = `${revision}:${limit}:${normalized}`;
     const cached = this.searchCache.get(key);
@@ -368,7 +378,7 @@ export class SearchIndex {
 
     let pending = this.pendingSearches.get(key);
     if (!pending) {
-      pending = this.findMatches(normalized, grams, limit);
+      pending = this.findMatches(normalized, grams, limit, shortNonLatin);
       this.pendingSearches.set(key, pending);
     }
     try {
@@ -391,22 +401,57 @@ export class SearchIndex {
   private async findMatches(
     normalized: string,
     grams: string[],
-    limit: number
+    limit: number,
+    shortNonLatin: boolean
   ): Promise<TitleMatch[]> {
     const expression = grams
       .map((gram) => `"${gram.replace(/"/g, '""')}"`)
       .join(' OR ');
-    const candidates = await this.all<CandidateRow>(
-      `SELECT t.source, t.sourceId, t.mediaType, t.title, t.originalTitle, t.searchTitle, t.searchOriginalTitle, CASE WHEN t.source = 'imdb' THEN COALESCE(v.votes, 0) ELSE t.popularity END AS popularity
+    const select = `SELECT t.source, t.sourceId, t.mediaType, t.title, t.originalTitle, t.searchTitle, t.searchOriginalTitle, CASE WHEN t.source = 'imdb' THEN COALESCE(v.votes, 0) ELSE t.popularity END AS popularity
+      FROM titles t LEFT JOIN imdb_votes v ON t.source = 'imdb' AND t.sourceId = v.sourceId`;
+    const candidates = grams.length
+      ? await this.all<CandidateRow>(
+          `SELECT t.source, t.sourceId, t.mediaType, t.title, t.originalTitle, t.searchTitle, t.searchOriginalTitle, CASE WHEN t.source = 'imdb' THEN COALESCE(v.votes, 0) ELSE t.popularity END AS popularity
       FROM title_fts JOIN titles t ON t.id = title_fts.rowid
       LEFT JOIN imdb_votes v ON t.source = 'imdb' AND t.sourceId = v.sourceId
       WHERE title_fts MATCH ? ORDER BY rank LIMIT 5000`,
-      [expression],
-      this.reader
-    );
+          [expression],
+          this.reader
+        )
+      : [];
+    // A changed character can remove every trigram from a short title. Other
+    // titles can still match the query's trigrams, so supplement those matches
+    // with adjacent pairs rather than only falling back on an empty result.
+    if (shortNonLatin) {
+      const chars = Array.from(normalized);
+      const pairs = [
+        ...new Set(
+          chars.slice(0, -1).map((_, i) => chars.slice(i, i + 2).join(''))
+        ),
+      ];
+      const predicates = pairs.map(
+        () => '(t.searchTitle LIKE ? OR t.searchOriginalTitle LIKE ?)'
+      );
+      const nearby = await this.all<CandidateRow>(
+        `${select} WHERE ${predicates.join(' OR ')} LIMIT 5000`,
+        pairs.flatMap((pair) => [`%${pair}%`, `%${pair}%`]),
+        this.reader
+      );
+      const keys = new Set(
+        candidates.map(
+          (item) => `${item.source}:${item.mediaType}:${item.sourceId}`
+        )
+      );
+      candidates.push(
+        ...nearby.filter(
+          (item) =>
+            !keys.has(`${item.source}:${item.mediaType}:${item.sourceId}`)
+        )
+      );
+    }
     return candidates
       .map(({ searchTitle, searchOriginalTitle, ...candidate }) => {
-        const titleScore = similarity(normalized, searchTitle);
+        const titleScore = titleSimilarity(normalized, searchTitle);
         return {
           ...candidate,
           score:
@@ -414,16 +459,14 @@ export class SearchIndex {
               ? titleScore
               : Math.max(
                   titleScore,
-                  similarity(normalized, searchOriginalTitle)
+                  titleSimilarity(normalized, searchOriginalTitle)
                 ),
         };
       })
-      .filter((candidate) => candidate.score >= 0.78)
+      .filter((candidate) => candidate.score >= (shortNonLatin ? 0.75 : 0.78))
       .sort(
         (a, b) =>
-          b.score +
-            Math.min(0.06, Math.log10(b.popularity + 1) * 0.015) -
-            (a.score + Math.min(0.06, Math.log10(a.popularity + 1) * 0.015)) ||
+          titleRank(b.score, b.popularity) - titleRank(a.score, a.popularity) ||
           a.sourceId.localeCompare(b.sourceId)
       )
       .slice(0, limit);

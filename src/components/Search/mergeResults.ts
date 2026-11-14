@@ -1,0 +1,123 @@
+import {
+  normalizeTitle,
+  titleSimilarity,
+} from '@server/lib/searchIndex/ranking';
+import type {
+  MovieResult,
+  PersonResult,
+  TvResult,
+} from '@server/models/Search';
+import type { SearchFilters } from './SmartSearch';
+
+export type SearchMethod = 'title' | 'approximate' | 'semantic';
+export type SearchItem = (MovieResult | TvResult | PersonResult) & {
+  matchMethods?: SearchMethod[];
+  matchScore?: number;
+};
+
+const titleScore = (query: string, item: SearchItem): number => {
+  const names =
+    item.mediaType === 'movie'
+      ? [item.title, item.originalTitle]
+      : item.mediaType === 'tv'
+        ? [item.name, item.originalName]
+        : [item.name];
+  return Math.max(
+    0,
+    ...names.map((name) => titleSimilarity(query, normalizeTitle(name ?? '')))
+  );
+};
+
+export const matchesFilters = (
+  item: SearchItem,
+  filters: SearchFilters
+): boolean => {
+  if (filters.type && item.mediaType !== filters.type) return false;
+  if (item.mediaType === 'person')
+    return ![
+      filters.language,
+      filters.yearFrom,
+      filters.yearTo,
+      filters.rating,
+      filters.votes,
+      filters.genre,
+    ].some(Boolean);
+  const year = Number(
+    (item.mediaType === 'movie' ? item.releaseDate : item.firstAirDate)?.slice(
+      0,
+      4
+    )
+  );
+  return (
+    (!filters.language || item.originalLanguage === filters.language) &&
+    (!filters.genre || item.genreIds?.includes(Number(filters.genre))) &&
+    (!filters.yearFrom || (!!year && year >= Number(filters.yearFrom))) &&
+    (!filters.yearTo || (!!year && year <= Number(filters.yearTo))) &&
+    (!filters.rating || item.voteAverage >= Number(filters.rating)) &&
+    (!filters.votes || item.voteCount >= Number(filters.votes))
+  );
+};
+
+/** Combine sources by media type and TMDB ID, retaining every match reason. */
+export const mergeResults = (
+  query: string,
+  regular: SearchItem[],
+  approximate: SearchItem[],
+  semantic: SearchItem[],
+  filters: SearchFilters
+): SearchItem[] => {
+  const normalized = normalizeTitle(query);
+  const merged = new Map<
+    string,
+    { item: SearchItem; rank: number; order: number }
+  >();
+  let order = 0;
+  const decisiveTitle = [...regular, ...approximate].some(
+    (item) =>
+      matchesFilters(item, filters) &&
+      Math.max(titleScore(normalized, item), item.matchScore ?? 0) >= 0.9
+  );
+  let extraSemantic = 0;
+  for (const [method, items] of [
+    ['title', regular],
+    ['approximate', approximate],
+    ['semantic', semantic],
+  ] as const) {
+    items.forEach((item, position) => {
+      if (!matchesFilters(item, filters)) return;
+      const key = `${item.mediaType}:${item.id}`;
+      const score = Math.max(
+        titleScore(normalized, item),
+        method === 'approximate' ? (item.matchScore ?? 0) : 0
+      );
+      // Exact and strong title matches lead; preserve provider order for the
+      // remaining regular results and put description-only matches after them.
+      const rank =
+        score >= 0.9 ? 3 + score : method === 'semantic' ? 0 : 1 + score;
+      const existing = merged.get(key);
+      // A confident title match makes broad description matches less useful.
+      // Keep a few discoveries, while still preserving all duplicate evidence.
+      if (
+        method === 'semantic' &&
+        !existing &&
+        decisiveTitle &&
+        extraSemantic++ >= 5
+      )
+        return;
+      if (existing) {
+        if (!existing.item.matchMethods?.includes(method))
+          existing.item.matchMethods?.push(method);
+        existing.rank = Math.max(existing.rank, rank);
+      } else {
+        merged.set(key, {
+          item: { ...item, matchMethods: [method] },
+          rank: rank - position * 0.00001,
+          order: order++,
+        });
+      }
+    });
+  }
+  return [...merged.values()]
+    .sort((a, b) => b.rank - a.rank || a.order - b.order)
+    .map(({ item }) => item);
+};

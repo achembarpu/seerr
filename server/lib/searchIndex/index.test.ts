@@ -99,20 +99,30 @@ describe('local title search index', () => {
       movie('tt33988385', 'Karuppu', 'கருப்பு', 1000),
       movie('tt44090278', 'Baththa', 'பத்தா', 1000),
       movie('tt0133093', 'The Matrix', 'The Matrix', 10000),
+      movie('tt0110413', 'Léon', 'Léon', 10000),
+      movie('tt6751668', '기생충', '기생충', 10000),
+      movie('tt0000001', '기생총각', '기생총각', 1),
     ]);
     await index.finishImport('v1');
     for (const [query, expected] of [
       ['mandla', 'tt10687070'],
       ['thai kilavi', 'tt39255646'],
       ['maaveran', 'tt22543326'],
+      ['maveran', 'tt22543326'],
       ['karupu', 'tt33988385'],
       ['bathha', 'tt44090278'],
       ['trix', 'tt0133093'],
+      ['leon', 'tt0110413'],
       ['மாவீரன்', 'tt22543326'],
     ]) {
       const matches = await index.search(query);
       assert.equal(matches[0]?.sourceId, expected, `query: ${query}`);
     }
+    assert.ok(
+      (await index.search('기생총')).some(
+        (match) => match.sourceId === 'tt6751668'
+      )
+    );
     assert.equal(normalizeTitle('മാവീരൻ'), 'മാവീരൻ');
   });
 
@@ -205,7 +215,9 @@ describe('local title search index', () => {
       movie('2', 'Mandela', 'Mandela', 10000),
     ]);
     await index.finishImport('v1');
-    assert.equal((await index.search('mandla'))[0]?.sourceId, '2');
+    const matches = await index.search('mandla');
+    assert.equal(matches[0]?.sourceId, '1');
+    assert.ok(matches.some((match) => match.sourceId === '2'));
   });
 
   it('refreshes changed ratings and removes ratings absent from the new dataset', async () => {

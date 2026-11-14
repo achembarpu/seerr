@@ -1,6 +1,6 @@
 # Local smart discovery
 
-Status: the private fork implements an opt-in first version of local smart search, TMDB ingestion, similarity, structured filters and recommendations based on a user’s requests. Chat and other metadata sources remain future work. The packaged Linux runtime supports Vulkan; native macOS Metal and an optional Docker Desktop host helper are also available. The existing optional title index and ordinary TMDB search remain separate. Both title search and discovery are intended for a broad range of languages, scripts, regions and catalogs. Earlier Tamil and Malayalam examples triggered the typo-search investigation; they are not a special scope or representative semantic-search benchmark.
+Status: the private fork implements an opt-in first version of local smart search, TMDB ingestion, similarity, structured filters and recommendations based on a user’s requests. Chat and other metadata sources remain future work. The packaged Linux runtime supports Vulkan; native macOS Metal and an optional Docker Desktop host helper are also available. The title and description indexes remain separate on disk, while their matches and ordinary TMDB results appear in one search grid. Both title search and discovery are intended for a broad range of languages, scripts, regions and catalogs. Earlier Tamil and Malayalam examples triggered the typo-search investigation; they are not a special scope or representative semantic-search benchmark.
 
 ## The data-rights decision
 

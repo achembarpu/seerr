@@ -84,7 +84,9 @@ searchRoutes.get('/smart', async (req, res, next) => {
       query.slice(0, 500),
       smartFilters(req.query)
     );
-    const results = await smartCards(matches, req.user);
+    const results = (await smartCards(matches, req.user)).map(
+      (card, index) => ({ ...card, matchScore: matches[index].score })
+    );
     return res.status(200).json({ results, enabled: true, ready: true });
   } catch (error) {
     return next(error);
@@ -116,7 +118,9 @@ searchRoutes.get('/smart/recommendations', async (req, res, next) => {
       smartFilters(req.query)
     );
     const results = await smartCards(matches, req.user);
-    return res.status(200).json({ results });
+    return res
+      .status(200)
+      .json({ page: 1, totalPages: 1, totalResults: results.length, results });
   } catch (error) {
     return next(error);
   }
@@ -143,59 +147,72 @@ searchRoutes.get('/suggestions', async (req, res) => {
   const query =
     typeof req.query.query === 'string' ? req.query.query.trim() : '';
   if (
-    query.length < 3 ||
+    Array.from(query).length < 2 ||
     query.length > 120 ||
     findSearchProvider(query.toLowerCase())
   )
     return res.status(200).json({ results: [] });
   try {
-    const matches = await searchIndex.search(query);
+    const matches = await searchIndex.search(query, 40);
     const tmdb = new TheMovieDb();
     const language = (req.query.language as string) ?? req.locale;
-    const resolved = await Promise.allSettled(
-      matches.map(
-        async (match): Promise<TmdbMovieResult | TmdbTvResult | undefined> => {
-          if (match.source === 'imdb') {
-            const result = await tmdb.getByExternalId({
-              externalId: match.sourceId,
-              type: 'imdb',
-              language,
-            });
-            const item =
-              match.mediaType === 'movie'
-                ? result.movie_results[0]
-                : result.tv_results[0];
-            return item
-              ? ({ ...item, media_type: match.mediaType } as
-                  | TmdbMovieResult
-                  | TmdbTvResult)
-              : undefined;
-          }
-          return match.mediaType === 'movie'
-            ? mapMovieDetailsToResult(
-                await tmdb.getMovieSearchDetails({
-                  movieId: Number(match.sourceId),
-                  language,
-                })
-              )
-            : mapTvDetailsToResult(
-                await tmdb.getTvSearchDetails({
-                  tvId: Number(match.sourceId),
-                  language,
-                })
-              );
-        }
-      )
-    );
     const seen = new Set<string>();
     const results: (TmdbMovieResult | TmdbTvResult)[] = [];
-    for (const value of resolved) {
-      if (value.status !== 'fulfilled' || !value.value) continue;
-      const result = value.value;
-      const key = `${result.media_type}:${result.id}`;
-      if (!seen.has(key)) {
-        seen.add(key);
-        results.push(result);
+    const scores: number[] = [];
+    // Resolve in small batches and keep going past missing or duplicate IDs.
+    for (
+      let offset = 0;
+      offset < matches.length && results.length < 15;
+      offset += 10
+    ) {
+      const batch = matches.slice(offset, offset + 10);
+      const resolved = await Promise.allSettled(
+        batch.map(
+          async (
+            match
+          ): Promise<TmdbMovieResult | TmdbTvResult | undefined> => {
+            if (match.source === 'imdb') {
+              const result = await tmdb.getByExternalId({
+                externalId: match.sourceId,
+                type: 'imdb',
+                language,
+              });
+              const item =
+                match.mediaType === 'movie'
+                  ? result.movie_results[0]
+                  : result.tv_results[0];
+              return item
+                ? ({ ...item, media_type: match.mediaType } as
+                    | TmdbMovieResult
+                    | TmdbTvResult)
+                : undefined;
+            }
+            return match.mediaType === 'movie'
+              ? mapMovieDetailsToResult(
+                  await tmdb.getMovieSearchDetails({
+                    movieId: Number(match.sourceId),
+                    language,
+                  })
+                )
+              : mapTvDetailsToResult(
+                  await tmdb.getTvSearchDetails({
+                    tvId: Number(match.sourceId),
+                    language,
+                  })
+                );
+          }
+        )
+      );
+      for (let i = 0; i < resolved.length; i++) {
+        const value = resolved[i];
+        if (value.status !== 'fulfilled' || !value.value) continue;
+        const result = value.value;
+        const key = `${result.media_type}:${result.id}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          results.push(result);
+          scores.push(batch[i].score);
+        }
       }
     }
     const media = await Media.getRelatedMedia(
@@ -205,13 +222,20 @@ searchRoutes.get('/suggestions', async (req, res) => {
         mediaType: result.media_type,
       }))
     );
-    return res.status(200).json({ results: mapSearchResults(results, media) });
+    return res.status(200).json({
+      results: mapSearchResults(results, media).map((result, index) => ({
+        ...result,
+        matchScore: scores[index],
+      })),
+    });
   } catch (error) {
     logger.warn('Unable to retrieve local search suggestions', {
       label: 'Search',
       errorMessage: error instanceof Error ? error.message : String(error),
     });
-    return res.status(200).json({ results: [] });
+    return res
+      .status(503)
+      .json({ results: [], message: 'Local title search is unavailable.' });
   }
 });
 

@@ -189,9 +189,9 @@ export class SearchIndexService {
     }
   }
 
-  async search(query: string) {
+  async search(query: string, limit = 10) {
     if (!this.enabled() || !this.index) return [];
-    return this.index.search(query, 10);
+    return this.index.search(query, limit);
   }
 }
 
