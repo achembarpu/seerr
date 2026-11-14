@@ -709,6 +709,25 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     }
   }
 
+  /** IDs changed in a bounded TMDB change-list window. */
+  public async getMediaChanges({
+    mediaType,
+    startDate,
+    endDate,
+    page,
+  }: {
+    mediaType: 'movie' | 'tv';
+    startDate: string;
+    endDate: string;
+    page: number;
+  }): Promise<{ results: { id: number }[]; total_pages: number }> {
+    return this.get(
+      `/${mediaType}/changes`,
+      { params: { start_date: startDate, end_date: endDate, page } },
+      0
+    );
+  }
+
   public getDiscoverMovies = async ({
     sortBy = 'popularity.desc',
     page = 1,
