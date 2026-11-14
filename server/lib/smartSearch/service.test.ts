@@ -543,61 +543,6 @@ it('blends reranking with initial retrieval so strong multilingual hits remain v
   }
 });
 
-it('offers a relevant high-audience deep candidate to the reranker without re-embedding', async () => {
-  const engine = {
-    phase: 'ready' as const,
-    downloadBytes: 0,
-    downloadTotal: 1,
-    async start() {},
-    stop() {},
-    async embed() {
-      return [[1, 0]];
-    },
-  };
-  const source: MetadataSource = {
-    id: 'tmdb',
-    async fetchOne() {
-      return undefined;
-    },
-    async fetchPage() {
-      return { documents: [], totalPages: 0 };
-    },
-  };
-  const service = new SmartSearchService(() => true, engine, source);
-  const dense = Array.from({ length: 500 }, (_, index) => ({
-    document: {
-      ...document,
-      sourceId: String(index),
-      voteCount: index === 300 ? 10000 : 0,
-    },
-    score: 1 / (index + 1),
-  }));
-  let offered: string[] = [];
-  const internal = service as unknown as {
-    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
-    searchDense: () => Promise<typeof dense>;
-    rerank: (query: string, candidates: typeof dense) => Promise<typeof dense>;
-    idleTimer?: NodeJS.Timeout;
-  };
-  internal.open = async () => ({
-    async searchLexical() {
-      return [];
-    },
-  });
-  internal.searchDense = async () => dense;
-  internal.rerank = async (_query, candidates) => {
-    offered = candidates.slice(0, 40).map((item) => item.document.sourceId);
-    return candidates;
-  };
-  try {
-    await service.search('an ordinary descriptive query', {});
-    assert.ok(offered.includes('300'));
-    assert.ok(offered.includes('0'));
-  } finally {
-    if (internal.idleTimer) clearTimeout(internal.idleTimer);
-  }
-});
-
 it('uses ephemeral description similarity to avoid promoting unrelated remote recommendations', async () => {
   const settings = getSettings().main;
   const original = settings.smartSearchRerank;

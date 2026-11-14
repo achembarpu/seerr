@@ -779,24 +779,9 @@ export class SmartSearchService {
           ...extras.slice(0, Math.max(0, 30 - protectedItems.length)),
         ].map(key)
       );
-      // Let the reranker examine a few well-established titles from deeper in
-      // the dense pool. They are not guaranteed display slots: this only
-      // improves candidate recall when the first-stage model under-ranks them.
-      const deeperAudienceKeys = new Set(
-        denseMatches
-          .slice(20)
-          .filter((item) => !firstPageKeys.has(key(item)))
-          .sort((a, b) => b.document.voteCount - a.document.voteCount)
-          .slice(0, 5)
-          .map(key)
-      );
       const candidates = [
         ...fused.filter((item) => firstPageKeys.has(key(item))),
-        ...fused.filter((item) => deeperAudienceKeys.has(key(item))),
-        ...fused.filter(
-          (item) =>
-            !firstPageKeys.has(key(item)) && !deeperAudienceKeys.has(key(item))
-        ),
+        ...fused.filter((item) => !firstPageKeys.has(key(item))),
       ].slice(0, 100);
       const reranked = await this.rerank(query, candidates);
       // Audience evidence only nudges a relevance ranking; it is capped so
