@@ -52,7 +52,13 @@ export const documentText = (document: SmartDocument): string => {
 export const documentHash = (document: SmartDocument): string =>
   createHash('sha256').update(documentText(document)).digest('hex');
 
-type Row = { id: number; vector: Buffer; document: string; hash: string };
+type Row = {
+  id: number;
+  vector: Buffer;
+  document: string;
+  hash: string;
+  voteCount: number;
+};
 export class SmartStore {
   private db: sqlite3.Database;
   constructor(filename: string) {
@@ -220,28 +226,38 @@ export class SmartStore {
       params.push(filters.genre);
     }
     let after = 0;
-    const best: SmartMatch[] = [];
+    const best: (SmartMatch & { rank: number })[] = [];
     for (;;) {
       const rows = await this.all<Row>(
-        `SELECT id, vector, document FROM smart_documents WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 512`,
+        `SELECT id, vector, document, voteCount FROM smart_documents WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 512`,
         [after, ...params]
       );
       if (!rows.length) break;
       for (const row of rows) {
         const score = cosine(vector, row.vector);
-        if (best.length < limit || score > best[best.length - 1].score) {
+        // A small, capped audience-evidence bonus breaks close semantic ties
+        // without removing unrated or less well-known titles.
+        const rank =
+          score +
+          0.015 *
+            Math.min(
+              1,
+              Math.log1p(Math.max(0, row.voteCount)) / Math.log(1001)
+            );
+        if (best.length < limit || rank > best[best.length - 1].rank) {
           best.push({
             document: JSON.parse(row.document) as SmartDocument,
             score,
+            rank,
           });
-          best.sort((a, b) => b.score - a.score);
+          best.sort((a, b) => b.rank - a.rank);
           if (best.length > limit) best.pop();
         }
       }
       after = rows[rows.length - 1].id;
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    return best;
+    return best.map(({ document, score }) => ({ document, score }));
   }
   async close(): Promise<void> {
     await new Promise<void>((resolve, reject) =>

@@ -1,3 +1,4 @@
+import Alert from '@app/components/Common/Alert';
 import Header from '@app/components/Common/Header';
 import ListView from '@app/components/Common/ListView';
 import PageTitle from '@app/components/Common/PageTitle';
@@ -19,6 +20,8 @@ const messages = defineMessages('components.Search', {
   search: 'Search',
   searchresults: 'Search Results',
   suggestions: 'Possible title matches',
+  searchUnavailable:
+    'Regular search is unavailable. You can still use smart search above.',
   imdbAttribution:
     'Information courtesy of IMDb (https://www.imdb.com). Used with permission.',
 });
@@ -61,7 +64,7 @@ const Search = () => {
     (title) => !visible.has(`${title.mediaType}:${title.id}`)
   );
 
-  if (error) {
+  if (error && !settings.currentSettings.smartSearch) {
     return <ErrorPage statusCode={500} />;
   }
 
@@ -89,15 +92,21 @@ const Search = () => {
       <div className="mb-5 mt-1">
         <Header>{intl.formatMessage(messages.searchresults)}</Header>
       </div>
-      <ListView
-        items={titles}
-        isEmpty={isEmpty && suggestions.length === 0}
-        isLoading={
-          isLoadingInitialData || (isLoadingMore && (titles?.length ?? 0) > 0)
-        }
-        isReachingEnd={isReachingEnd}
-        onScrollBottom={fetchMore}
-      />
+      {error ? (
+        <Alert type="warning">
+          {intl.formatMessage(messages.searchUnavailable)}
+        </Alert>
+      ) : (
+        <ListView
+          items={titles}
+          isEmpty={isEmpty && suggestions.length === 0}
+          isLoading={
+            isLoadingInitialData || (isLoadingMore && (titles?.length ?? 0) > 0)
+          }
+          isReachingEnd={isReachingEnd}
+          onScrollBottom={fetchMore}
+        />
+      )}
     </>
   );
 };

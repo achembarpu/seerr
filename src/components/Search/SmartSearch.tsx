@@ -1,11 +1,16 @@
 import Button from '@app/components/Common/Button';
 import Header from '@app/components/Common/Header';
 import ListView from '@app/components/Common/ListView';
+import { SmallLoadingSpinner } from '@app/components/Common/LoadingSpinner';
+import SlideOver from '@app/components/Common/SlideOver';
+import LanguageSelector from '@app/components/LanguageSelector';
 import defineMessages from '@app/utils/defineMessages';
+import { FunnelIcon, XCircleIcon } from '@heroicons/react/24/solid';
 import type { MovieResult, TvResult } from '@server/models/Search';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
+import { serializeSmartSearchParams } from './smartSearchQuery';
 
 const messages = defineMessages('components.Search.SmartSearch', {
   open: 'Smart search',
@@ -16,9 +21,14 @@ const messages = defineMessages('components.Search.SmartSearch', {
   all: 'Movies and series',
   movie: 'Movies',
   tv: 'Series',
-  language: 'Original language code',
-  yearFrom: 'From year',
-  yearTo: 'To year',
+  language: 'Original Language',
+  filters: 'Filters',
+  activeFilters:
+    '{count, plural, one {# Active Filter} other {# Active Filters}}',
+  clearFilters: 'Clear Active Filters',
+  releaseYear: 'Release Year',
+  from: 'From',
+  to: 'To',
   rating: 'Minimum rating (0–10)',
   votes: 'Minimum votes',
   genre: 'Genre',
@@ -60,6 +70,7 @@ const genres = [
 const SmartSearch = ({ query }: { query: string }) => {
   const intl = useIntl();
   const [open, setOpen] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
   const [type, setType] = useState('');
   const [language, setLanguage] = useState('');
   const [yearFrom, setYearFrom] = useState('');
@@ -67,6 +78,15 @@ const SmartSearch = ({ query }: { query: string }) => {
   const [rating, setRating] = useState('');
   const [votes, setVotes] = useState('');
   const [genre, setGenre] = useState('');
+  const activeFilters = [
+    type,
+    language,
+    yearFrom,
+    yearTo,
+    rating,
+    votes,
+    genre,
+  ].filter(Boolean).length;
   const params = new URLSearchParams({ query });
   for (const [key, value] of Object.entries({
     mediaType: type,
@@ -78,7 +98,7 @@ const SmartSearch = ({ query }: { query: string }) => {
     genre,
   }))
     if (value) params.set(key, value);
-  const serializedParams = params.toString();
+  const serializedParams = serializeSmartSearchParams(params);
   const [debouncedParams, setDebouncedParams] = useState(serializedParams);
   useEffect(() => {
     const timer = setTimeout(() => setDebouncedParams(serializedParams), 500);
@@ -90,7 +110,7 @@ const SmartSearch = ({ query }: { query: string }) => {
     results: (MovieResult | TvResult)[];
   }>(
     open
-      ? `/api/v1/search/smart/recommendations?${recommendationParams}`
+      ? `/api/v1/search/smart/recommendations?${serializeSmartSearchParams(recommendationParams)}`
       : null,
     { revalidateOnFocus: false }
   );
@@ -108,96 +128,166 @@ const SmartSearch = ({ query }: { query: string }) => {
       </Button>
       {open && (
         <div className="mt-5">
-          <Header>{intl.formatMessage(messages.title)}</Header>
-          <p className="mb-3 mt-2 text-sm text-gray-400">
-            {intl.formatMessage(messages.tip)}
-          </p>
-          <div className="mb-4 grid grid-cols-2 gap-2 md:grid-cols-4">
-            <label className="text-sm">
-              {intl.formatMessage(messages.type)}
-              <select
-                className="form-input mt-1 w-full"
-                value={type}
-                onChange={(event) => setType(event.target.value)}
-              >
-                <option value="">{intl.formatMessage(messages.all)}</option>
-                <option value="movie">
-                  {intl.formatMessage(messages.movie)}
-                </option>
-                <option value="tv">{intl.formatMessage(messages.tv)}</option>
-              </select>
-            </label>
-            <label className="text-sm">
-              {intl.formatMessage(messages.genre)}
-              <select
-                className="form-input mt-1 w-full"
-                value={genre}
-                onChange={(event) => setGenre(event.target.value)}
-              >
-                <option value="">
-                  {intl.formatMessage(messages.anyGenre)}
-                </option>
-                {genres.map(([id, name]) => (
-                  <option key={id} value={id}>
-                    {name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="text-sm">
-              {intl.formatMessage(messages.language)}
-              <input
-                className="form-input mt-1 w-full"
-                value={language}
-                maxLength={20}
-                onChange={(event) => setLanguage(event.target.value)}
-              />
-            </label>
-            <label className="text-sm">
-              {intl.formatMessage(messages.yearFrom)}
-              <input
-                className="form-input mt-1 w-full"
-                type="number"
-                min="1870"
-                max="2200"
-                value={yearFrom}
-                onChange={(event) => setYearFrom(event.target.value)}
-              />
-            </label>
-            <label className="text-sm">
-              {intl.formatMessage(messages.yearTo)}
-              <input
-                className="form-input mt-1 w-full"
-                type="number"
-                min="1870"
-                max="2200"
-                value={yearTo}
-                onChange={(event) => setYearTo(event.target.value)}
-              />
-            </label>
-            <label className="text-sm">
-              {intl.formatMessage(messages.rating)}
-              <input
-                className="form-input mt-1 w-full"
-                type="number"
-                min="0"
-                max="10"
-                step="0.1"
-                value={rating}
-                onChange={(event) => setRating(event.target.value)}
-              />
-            </label>
-            <label className="text-sm">
-              {intl.formatMessage(messages.votes)}
-              <input
-                className="form-input mt-1 w-full"
-                type="number"
-                min="0"
-                value={votes}
-                onChange={(event) => setVotes(event.target.value)}
-              />
-            </label>
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <Header>{intl.formatMessage(messages.title)}</Header>
+              <p className="mt-2 text-sm text-gray-400">
+                {intl.formatMessage(messages.tip)}
+              </p>
+            </div>
+            <Button type="button" onClick={() => setShowFilters(true)}>
+              <FunnelIcon />
+              <span>
+                {intl.formatMessage(messages.activeFilters, {
+                  count: activeFilters,
+                })}
+              </span>
+            </Button>
           </div>
+          <SlideOver
+            show={showFilters}
+            title={intl.formatMessage(messages.filters)}
+            subText={intl.formatMessage(messages.activeFilters, {
+              count: activeFilters,
+            })}
+            onClose={() => setShowFilters(false)}
+          >
+            <div className="flex flex-col space-y-5">
+              <div>
+                <label
+                  htmlFor="smart-media-type"
+                  className="mb-2 block text-lg font-semibold"
+                >
+                  {intl.formatMessage(messages.type)}
+                </label>
+                <select
+                  id="smart-media-type"
+                  value={type}
+                  onChange={(event) => setType(event.target.value)}
+                >
+                  <option value="">{intl.formatMessage(messages.all)}</option>
+                  <option value="movie">
+                    {intl.formatMessage(messages.movie)}
+                  </option>
+                  <option value="tv">{intl.formatMessage(messages.tv)}</option>
+                </select>
+              </div>
+              <div>
+                <label
+                  htmlFor="smart-genre"
+                  className="mb-2 block text-lg font-semibold"
+                >
+                  {intl.formatMessage(messages.genre)}
+                </label>
+                <select
+                  id="smart-genre"
+                  value={genre}
+                  onChange={(event) => setGenre(event.target.value)}
+                >
+                  <option value="">
+                    {intl.formatMessage(messages.anyGenre)}
+                  </option>
+                  {genres.map(([id, name]) => (
+                    <option key={id} value={id}>
+                      {name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <div className="mb-2 text-lg font-semibold">
+                  {intl.formatMessage(messages.language)}
+                </div>
+                <LanguageSelector
+                  value={language}
+                  setFieldValue={(_field, value) =>
+                    setLanguage(value.split('|').filter(Boolean).at(-1) ?? '')
+                  }
+                />
+              </div>
+              <div>
+                <div className="mb-2 text-lg font-semibold">
+                  {intl.formatMessage(messages.releaseYear)}
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="text-sm text-gray-300">
+                    {intl.formatMessage(messages.from)}
+                    <input
+                      className="mt-2 block w-full rounded-md border border-gray-500 bg-gray-700 text-white sm:text-sm"
+                      type="number"
+                      min="1870"
+                      max="2200"
+                      value={yearFrom}
+                      onChange={(event) => setYearFrom(event.target.value)}
+                    />
+                  </label>
+                  <label className="text-sm text-gray-300">
+                    {intl.formatMessage(messages.to)}
+                    <input
+                      className="mt-2 block w-full rounded-md border border-gray-500 bg-gray-700 text-white sm:text-sm"
+                      type="number"
+                      min="1870"
+                      max="2200"
+                      value={yearTo}
+                      onChange={(event) => setYearTo(event.target.value)}
+                    />
+                  </label>
+                </div>
+              </div>
+              <div>
+                <label
+                  htmlFor="smart-rating"
+                  className="mb-2 block text-lg font-semibold"
+                >
+                  {intl.formatMessage(messages.rating)}
+                </label>
+                <input
+                  id="smart-rating"
+                  className="block w-full rounded-md border border-gray-500 bg-gray-700 text-white sm:text-sm"
+                  type="number"
+                  min="0"
+                  max="10"
+                  step="0.1"
+                  value={rating}
+                  onChange={(event) => setRating(event.target.value)}
+                />
+              </div>
+              <div>
+                <label
+                  htmlFor="smart-votes"
+                  className="mb-2 block text-lg font-semibold"
+                >
+                  {intl.formatMessage(messages.votes)}
+                </label>
+                <input
+                  id="smart-votes"
+                  className="block w-full rounded-md border border-gray-500 bg-gray-700 text-white sm:text-sm"
+                  type="number"
+                  min="0"
+                  value={votes}
+                  onChange={(event) => setVotes(event.target.value)}
+                />
+              </div>
+              {activeFilters > 0 && (
+                <Button
+                  type="button"
+                  onClick={() => {
+                    setType('');
+                    setGenre('');
+                    setLanguage('');
+                    setYearFrom('');
+                    setYearTo('');
+                    setRating('');
+                    setVotes('');
+                  }}
+                >
+                  <XCircleIcon />
+                  <span>{intl.formatMessage(messages.clearFilters)}</span>
+                </Button>
+              )}
+            </div>
+          </SlideOver>
+          {isLoading && !data && <SmallLoadingSpinner />}
           {data && !data.ready && (
             <p className="text-sm text-gray-400">
               {intl.formatMessage(messages.loading)}

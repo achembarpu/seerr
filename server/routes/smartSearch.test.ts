@@ -100,10 +100,18 @@ it('passes structured filters through the validated smart search endpoint', asyn
 it('serves a valid paginated response for similar-title sliders', async () => {
   const response = await request(app)
     .get('/api/v1/search/smart/similar')
-    .query({ id: 12, mediaType: 'movie', page: 1 })
+    .query({
+      id: 12,
+      mediaType: 'movie',
+      page: 1,
+      yearFrom: 2000,
+      minRating: 7,
+    })
     .expect(200);
   assert.equal(response.body.totalPages, 1);
   assert.deepEqual(response.body.results, []);
   assert.equal(similar.mock.calls[0].arguments[0], 'movie');
   assert.equal(similar.mock.calls[0].arguments[1], '12');
+  assert.equal(similar.mock.calls[0].arguments[2]?.yearFrom, 2000);
+  assert.equal(similar.mock.calls[0].arguments[2]?.minRating, 7);
 });

@@ -5722,6 +5722,24 @@ paths:
         - in: query
           name: page
           schema: { type: integer, minimum: 1 }
+        - in: query
+          name: originalLanguage
+          schema: { type: string, maxLength: 20 }
+        - in: query
+          name: yearFrom
+          schema: { type: integer, minimum: 1870, maximum: 2200 }
+        - in: query
+          name: yearTo
+          schema: { type: integer, minimum: 1870, maximum: 2200 }
+        - in: query
+          name: genre
+          schema: { type: integer, minimum: 0 }
+        - in: query
+          name: minRating
+          schema: { type: number, minimum: 0, maximum: 10 }
+        - in: query
+          name: minVotes
+          schema: { type: integer, minimum: 0 }
       responses:
         '200':
           description: Similar media

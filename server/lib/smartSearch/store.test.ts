@@ -78,6 +78,27 @@ describe('smart search index', () => {
       'other'
     );
   });
+  it('uses audience evidence only to break close semantic ties', async () => {
+    await store.upsert(
+      doc('10', { originalLanguage: 'de', voteCount: 0 }),
+      quantize([1, 0])
+    );
+    await store.upsert(
+      doc('11', { originalLanguage: 'de', voteCount: 1000 }),
+      quantize([1, 0.1])
+    );
+    await store.upsert(
+      doc('12', { originalLanguage: 'de', voteCount: 1000 }),
+      quantize([0.8, 0.6])
+    );
+    const matches = await store.search(quantize([1, 0]), { language: 'de' });
+    assert.deepEqual(
+      matches.map((match) => match.document.sourceId),
+      ['11', '10', '12']
+    );
+    assert.ok(matches[0].score < matches[1].score);
+  });
+
   it('does not re-embed for changes to ratings or cards', async () => {
     const original = doc('1');
     const update = doc('1', { voteAverage: 9, card: { id: 1, updated: true } });
