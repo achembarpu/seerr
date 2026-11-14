@@ -5,7 +5,6 @@ import CachedImage from '@app/components/Common/CachedImage';
 import StatusBadgeMini from '@app/components/Common/StatusBadgeMini';
 import Tooltip from '@app/components/Common/Tooltip';
 import RequestModal from '@app/components/RequestModal';
-import type { SearchMethod } from '@app/components/Search/mergeResults';
 import ErrorCard from '@app/components/TitleCard/ErrorCard';
 import Placeholder from '@app/components/TitleCard/Placeholder';
 import { useIsTouch } from '@app/hooks/useIsTouch';
@@ -19,9 +18,7 @@ import {
   ArrowDownTrayIcon,
   EyeIcon,
   EyeSlashIcon,
-  MagnifyingGlassIcon,
   MinusCircleIcon,
-  SparklesIcon,
   StarIcon,
 } from '@heroicons/react/24/outline';
 import { MediaStatus } from '@server/constants/media';
@@ -46,7 +43,6 @@ interface TitleCardProps {
   inProgress?: boolean;
   isAddedToWatchlist?: number | boolean;
   mutateParent?: () => void;
-  searchMatches?: SearchMethod[];
 }
 
 const messages = defineMessages('components.TitleCard', {
@@ -57,8 +53,6 @@ const messages = defineMessages('components.TitleCard', {
     '<strong>{title}</strong> Removed from watchlist  successfully!',
   watchlistCancel: 'watchlist for <strong>{title}</strong> canceled.',
   watchlistError: 'Something went wrong. Please try again.',
-  approximateMatch: 'Similar title match',
-  semanticMatch: 'Description match',
 });
 
 const TitleCard = ({
@@ -73,7 +67,6 @@ const TitleCard = ({
   inProgress = false,
   canExpand = false,
   mutateParent,
-  searchMatches,
 }: TitleCardProps) => {
   const isTouch = useIsTouch();
   const intl = useIntl();
@@ -394,7 +387,7 @@ const TitleCard = ({
           />
           <div className="absolute left-0 right-0 flex items-center justify-between p-2">
             <div
-              className={`z-40 self-start rounded-full border shadow-md ${
+              className={`pointer-events-none z-40 self-start rounded-full border shadow-md ${
                 mediaType === 'movie' || mediaType === 'collection'
                   ? 'border-blue-500 bg-blue-600/80'
                   : 'border-purple-600 bg-purple-600/80'
@@ -406,22 +399,6 @@ const TitleCard = ({
                   : mediaType === 'collection'
                     ? intl.formatMessage(globalMessages.collection)
                     : intl.formatMessage(globalMessages.tvshow)}
-                {searchMatches?.includes('approximate') && (
-                  <span
-                    title={intl.formatMessage(messages.approximateMatch)}
-                    aria-label={intl.formatMessage(messages.approximateMatch)}
-                  >
-                    <MagnifyingGlassIcon className="ml-1 h-3 w-3" />
-                  </span>
-                )}
-                {searchMatches?.includes('semantic') && (
-                  <span
-                    title={intl.formatMessage(messages.semanticMatch)}
-                    aria-label={intl.formatMessage(messages.semanticMatch)}
-                  >
-                    <SparklesIcon className="ml-1 h-3 w-3" />
-                  </span>
-                )}
               </div>
             </div>
             {showDetail && currentStatus !== MediaStatus.BLOCKLISTED && (

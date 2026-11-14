@@ -1,5 +1,4 @@
 import PersonCard from '@app/components/PersonCard';
-import type { SearchItem } from '@app/components/Search/mergeResults';
 import TitleCard from '@app/components/TitleCard';
 import TmdbTitleCard from '@app/components/TitleCard/TmdbTitleCard';
 import { Permission, useUser } from '@app/hooks/useUser';
@@ -93,7 +92,6 @@ const ListView = ({
                     userScore={title.voteAverage}
                     year={title.releaseDate}
                     mediaType={title.mediaType}
-                    searchMatches={(title as SearchItem).matchMethods}
                     inProgress={
                       (title.mediaInfo?.downloadStatus ?? []).length > 0
                     }
@@ -116,7 +114,6 @@ const ListView = ({
                     userScore={title.voteAverage}
                     year={title.firstAirDate}
                     mediaType={title.mediaType}
-                    searchMatches={(title as SearchItem).matchMethods}
                     inProgress={
                       (title.mediaInfo?.downloadStatus ?? []).length > 0
                     }

@@ -49,7 +49,7 @@ it('ranks the title match first and merges source evidence without conflating ty
   assert.equal(result[0].mediaType, 'movie');
   assert.deepEqual(result[0].matchMethods, ['approximate', 'semantic']);
   assert.equal(result.filter((r) => r.id === 1).length, 2);
-  assert.equal(result.at(-1)?.id, 3);
+  assert.ok(result.some((item) => item.id === 3));
 });
 
 it('applies the same filters across sources and excludes people for media-only filters', () => {
@@ -91,4 +91,25 @@ it('limits weak description-only discoveries for a confident title search', () =
     filters
   );
   assert.equal(descriptive.length, 12);
+});
+
+it('does not put every weak fuzzy title before relevant description matches', () => {
+  const results = mergeResults(
+    'barber murderers',
+    [],
+    [
+      movie(1, 'Bizarre Murders', { matchScore: 0.86 }),
+      movie(2, 'Barber', { matchScore: 0.79 }),
+    ],
+    [
+      movie(3, 'Sweeney Todd', { matchScore: 0.9 }),
+      movie(4, 'Other story', { matchScore: 0.8 }),
+    ],
+    filters
+  );
+  assert.equal(results[0].id, 3);
+  assert.ok(
+    results.findIndex((item) => item.id === 4) <
+      results.findIndex((item) => item.id === 2)
+  );
 });

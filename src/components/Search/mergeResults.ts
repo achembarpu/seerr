@@ -69,13 +69,13 @@ export const mergeResults = (
   const normalized = normalizeTitle(query);
   const merged = new Map<
     string,
-    { item: SearchItem; rank: number; order: number }
+    { item: SearchItem; rank: number; titleScore: number; order: number }
   >();
   let order = 0;
   const decisiveTitle = [...regular, ...approximate].some(
     (item) =>
       matchesFilters(item, filters) &&
-      Math.max(titleScore(normalized, item), item.matchScore ?? 0) >= 0.9
+      Math.max(titleScore(normalized, item), item.matchScore ?? 0) >= 0.94
   );
   let extraSemantic = 0;
   for (const [method, items] of [
@@ -90,13 +90,11 @@ export const mergeResults = (
         titleScore(normalized, item),
         method === 'approximate' ? (item.matchScore ?? 0) : 0
       );
-      // Exact and strong title matches lead; preserve provider order for the
-      // remaining regular results and put description-only matches after them.
-      const rank =
-        score >= 0.9 ? 3 + score : method === 'semantic' ? 0 : 1 + score;
+      // Source scores use different scales. Fuse positions instead of assuming
+      // that a weak fuzzy title is always better than a description match.
+      // Strong title evidence remains a separate signal for title lookups.
+      const contribution = (method === 'semantic' ? 1.5 : 1) / (position + 3);
       const existing = merged.get(key);
-      // A confident title match makes broad description matches less useful.
-      // Keep a few discoveries, while still preserving all duplicate evidence.
       if (
         method === 'semantic' &&
         !existing &&
@@ -105,19 +103,26 @@ export const mergeResults = (
       )
         return;
       if (existing) {
-        if (!existing.item.matchMethods?.includes(method))
+        if (!existing.item.matchMethods?.includes(method)) {
           existing.item.matchMethods?.push(method);
-        existing.rank = Math.max(existing.rank, rank);
+          existing.rank += contribution;
+        }
+        existing.titleScore = Math.max(existing.titleScore, score);
       } else {
         merged.set(key, {
           item: { ...item, matchMethods: [method] },
-          rank: rank - position * 0.00001,
+          rank: contribution,
+          titleScore: score,
           order: order++,
         });
       }
     });
   }
   return [...merged.values()]
-    .sort((a, b) => b.rank - a.rank || a.order - b.order)
+    .sort((a, b) => {
+      const aTitle = a.titleScore >= 0.94 ? 3 + a.titleScore : 0;
+      const bTitle = b.titleScore >= 0.94 ? 3 + b.titleScore : 0;
+      return bTitle - aTitle || b.rank - a.rank || a.order - b.order;
+    })
     .map(({ item }) => item);
 };
