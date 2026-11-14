@@ -60,7 +60,7 @@ cp "$llama" "$resources/runtime/llama-server"
 cp package.json next.config.mjs seerr-api.yml "$resources/app/"
 ditto dist "$resources/app/dist"
 ditto public "$resources/app/public"
-rsync -a --exclude cache .next/ "$resources/app/.next/"
+rsync -a --exclude cache --exclude '/dev/' .next/ "$resources/app/.next/"
 ditto "$work/dependencies/node_modules" "$resources/app/node_modules"
 
 iconset="$work/icons"
