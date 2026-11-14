@@ -88,6 +88,13 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   smartSearchTip:
     'Download a 119 MB embedding model and build a local TMDB discovery index in the background. The index uses additional disk space and CPU. Save settings to apply.',
   smartSearchStatus: 'Status: {phase}; indexed titles: {count}',
+  smartSearchDevice: 'Smart search inference device',
+  smartSearchDeviceTip:
+    'Choose a detected GPU or CPU. Automatic uses a GPU when available and falls back to CPU.',
+  smartSearchDeviceAuto: 'Automatic',
+  smartSearchDeviceCpu: 'CPU',
+  smartSearchDeviceHost: 'Host inference service (for example, macOS Metal)',
+  smartSearchActiveDevice: 'Active inference device: {device}',
   smartSearchDownload: 'Downloading model: {percent}%',
   smartSearchProgress: 'Indexing {mediaType} from {year}, page {page}',
   smartSearchRefreshFailed: 'Could not start smart search refresh.',
@@ -232,6 +239,7 @@ const SettingsMain = () => {
             enableSpecialEpisodes: data?.enableSpecialEpisodes,
             localTitleSearch: data?.localTitleSearch,
             smartSearch: data?.smartSearch,
+            smartSearchDevice: data?.smartSearchDevice || 'auto',
             cacheImages: data?.cacheImages,
             youtubeUrl: data?.youtubeUrl,
             versionCheck: data?.versionCheck,
@@ -258,6 +266,7 @@ const SettingsMain = () => {
                 enableSpecialEpisodes: values.enableSpecialEpisodes,
                 localTitleSearch: values.localTitleSearch,
                 smartSearch: values.smartSearch,
+                smartSearchDevice: values.smartSearchDevice,
                 cacheImages: values.cacheImages,
                 youtubeUrl: values.youtubeUrl,
                 versionCheck: values?.versionCheck,
@@ -510,6 +519,51 @@ const SettingsMain = () => {
                     />
                   </div>
                 </div>
+                {values.smartSearch && (
+                  <div className="form-row">
+                    <label htmlFor="smartSearchDevice" className="text-label">
+                      {intl.formatMessage(messages.smartSearchDevice)}
+                      <span className="label-tip">
+                        {intl.formatMessage(messages.smartSearchDeviceTip)}
+                      </span>
+                    </label>
+                    <div className="form-input-area">
+                      <Field
+                        as="select"
+                        id="smartSearchDevice"
+                        name="smartSearchDevice"
+                      >
+                        <option value="auto">
+                          {intl.formatMessage(messages.smartSearchDeviceAuto)}
+                        </option>
+                        <option value="cpu">
+                          {intl.formatMessage(messages.smartSearchDeviceCpu)}
+                        </option>
+                        {(smartStatus?.externalAvailable ||
+                          values.smartSearchDevice === 'external') && (
+                          <option value="external">
+                            {intl.formatMessage(messages.smartSearchDeviceHost)}
+                          </option>
+                        )}
+                        {smartStatus?.devices.map((device) => (
+                          <option key={device.name} value={device.name}>
+                            {device.description} ({device.name})
+                          </option>
+                        ))}
+                        {values.smartSearchDevice !== 'auto' &&
+                          values.smartSearchDevice !== 'cpu' &&
+                          values.smartSearchDevice !== 'external' &&
+                          !smartStatus?.devices.some(
+                            (device) => device.name === values.smartSearchDevice
+                          ) && (
+                            <option value={values.smartSearchDevice}>
+                              {values.smartSearchDevice} (unavailable)
+                            </option>
+                          )}
+                      </Field>
+                    </div>
+                  </div>
+                )}
                 {data?.smartSearch && smartStatus && (
                   <div className="form-row">
                     <div className="form-input-area">
@@ -519,6 +573,19 @@ const SettingsMain = () => {
                           count: smartStatus.count,
                         })}
                       </p>
+                      {smartStatus.activeDevice && (
+                        <p className="mb-1 text-sm text-gray-300">
+                          {intl.formatMessage(
+                            messages.smartSearchActiveDevice,
+                            { device: smartStatus.activeDevice }
+                          )}
+                        </p>
+                      )}
+                      {smartStatus.deviceWarning && (
+                        <p className="mb-2 text-sm text-yellow-400">
+                          {smartStatus.deviceWarning}
+                        </p>
+                      )}
                       {smartStatus.phase === 'downloading' && (
                         <p className="mb-1 text-sm text-gray-300">
                           {intl.formatMessage(messages.smartSearchDownload, {

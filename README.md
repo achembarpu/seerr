@@ -91,4 +91,28 @@ Open **Smart search** on the search page to search descriptions and filter by ty
 
 After the initial scan, the index checks TMDB change lists daily and only re-embeds changed descriptions. If a refresh is interrupted, Seerr resumes from its checkpoint. Change-list requests cover one day at a time, so refresh can resume after interruptions without requesting an oversized date range. Settings show progress and errors and provide a manual refresh. Disabling the feature stops indexing and the model process but retains the model and rebuildable index. The model process unloads after 15 minutes of inactivity.
 
-The Docker images build the local `llama-server` CPU runtime. For a development installation outside Docker, install a compatible llama.cpp `llama-server` on the PATH or set `SEERR_LLAMA_SERVER` to its executable; this branch was tested with llama.cpp commit `32bdc3a89e6528d3e419024c833c5dabf32c7541`. `SEERR_LLAMA_GPU_LAYERS` can be set when using a compatible GPU-enabled runtime; the packaged image defaults to CPU. Model weights and movie metadata are downloaded only after the feature is enabled. TMDB's applicable terms and access permissions remain the user's responsibility.
+The device selector in General Settings chooses automatic, CPU, or a detected GPU. Automatic tries the first detected GPU and falls back to CPU if startup or a test embedding fails. A specifically selected device reports an error if unavailable. The status shows the active device and any fallback. Changing the selection restarts indexing from its checkpoint. The Docker runtime includes Vulkan support for GPUs accessible to the Linux container. On Linux, expose a compatible render device (for example `--device /dev/dri`) and grant the `node` user access to its render group. NVIDIA also requires its container toolkit, Vulkan driver and graphics capability. GPU models, drivers, container permissions and host VM support vary; CPU fallback remains available. The Vulkan container has not been validated on every GPU or driver.
+
+### macOS native or Docker Desktop with Metal
+
+Seerr can run directly as a macOS Node application; it is still accessed in a browser. To compile the pinned Metal runtime, install Git, CMake and Xcode command-line tools, then run:
+
+```sh
+./scripts/smart-search-metal.sh --install
+pnpm install
+pnpm build
+SEERR_LLAMA_SERVER="$HOME/Library/Caches/Seerr/smart-search/llama-32bdc3a89e6528d3e419024c833c5dabf32c7541/bin/llama-server" pnpm start
+```
+
+Enable smart search and leave the device on Automatic or select the detected Metal GPU. The runtime is built for the host; the model is downloaded separately when the feature is enabled. See [development setup](CONTRIBUTING.md#development) for Node and pnpm requirements. This is a native server, not a packaged Mac app. It uses Metal GPU inference; Apple Neural Engine inference is not supported.
+
+Docker Desktop runs Linux containers and does not provide the macOS Metal API to the packaged Linux runtime. To use the Mac GPU while keeping Seerr in Docker, first build the runtime and run the optional host helper in a terminal:
+
+```sh
+export SEERR_EMBEDDING_API_KEY="$(openssl rand -hex 32)"
+./scripts/smart-search-metal.sh
+```
+
+The helper downloads and verifies the same pinned model and listens on host loopback at port 38767; keep it running. Pass `SEERR_EMBEDDING_URL=http://host.docker.internal:38767` and the **same** `SEERR_EMBEDDING_API_KEY` into the Seerr container, restart the container, then select **Host inference service** in General Settings. Keep the generated key private and persist it securely if the services restart separately. Seerr verifies the expected model alias and performs a test embedding before use. The helper and container have separate process lifecycles: stopping Seerr does not stop the host helper or unload its model. The helper uses HTTP over Docker Desktop's local host connection; do not expose the port or key to untrusted networks. `SEERR_METAL_RUNTIME_DIR`, `SEERR_METAL_PORT`, and `SEERR_METAL_BIND` override the helper's defaults if needed.
+
+Model weights and movie metadata are downloaded only after the feature or host helper is enabled. TMDB's applicable terms and access permissions remain the user's responsibility.

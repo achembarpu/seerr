@@ -83,10 +83,21 @@ settingsRoutes.get('/main', (req, res, next) => {
 settingsRoutes.post('/main', async (req, res) => {
   const settings = getSettings();
 
+  if (
+    req.body.smartSearchDevice !== undefined &&
+    (typeof req.body.smartSearchDevice !== 'string' ||
+      !/^(auto|cpu|[A-Za-z][A-Za-z0-9_-]{0,63})$/.test(
+        req.body.smartSearchDevice
+      ))
+  )
+    return res.status(400).json({ message: 'Invalid inference device' });
+  const previousDevice = settings.main.smartSearchDevice;
   settings.main = merge(settings.main, req.body);
   await settings.save();
   searchIndex.start();
-  smartSearch.start();
+  if (previousDevice !== settings.main.smartSearchDevice)
+    smartSearch.reconfigure();
+  else smartSearch.start();
 
   return res.status(200).json(settings.main);
 });

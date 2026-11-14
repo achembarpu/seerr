@@ -32,7 +32,15 @@ export class SmartSearchService {
     private readonly engine: Pick<
       EmbeddingEngine,
       'phase' | 'downloadBytes' | 'downloadTotal' | 'start' | 'stop' | 'embed'
-    > = new EmbeddingEngine(),
+    > &
+      Partial<
+        Pick<
+          EmbeddingEngine,
+          'devices' | 'activeDevice' | 'deviceWarning' | 'externalAvailable'
+        >
+      > = new EmbeddingEngine(
+      () => getSettings().main.smartSearchDevice || 'auto'
+    ),
     private readonly source: MetadataSource = new TmdbMetadataSource(),
     private readonly createStore: () => SmartStore = () =>
       new SmartStore(path.join(appDataPath(), 'smart-search.sqlite3'))
@@ -59,6 +67,10 @@ export class SmartSearchService {
       nextRefreshAt: this.nextRefreshAt,
       downloadBytes: this.engine.downloadBytes,
       downloadTotal: this.engine.downloadTotal,
+      devices: this.engine.devices ?? [],
+      externalAvailable: this.engine.externalAvailable ?? false,
+      activeDevice: this.engine.activeDevice,
+      deviceWarning: this.engine.deviceWarning,
     };
   }
 
@@ -82,6 +94,15 @@ export class SmartSearchService {
         });
       });
     }
+  }
+
+  reconfigure(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.controller?.abort();
+    this.runtimeController.abort();
+    this.engine.stop();
+    if (!this.controller) this.start();
   }
 
   refreshNow(): boolean {

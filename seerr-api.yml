@@ -280,6 +280,9 @@ components:
         smartSearch:
           type: boolean
           example: false
+        smartSearchDevice:
+          type: string
+          example: auto
     NetworkSettings:
       type: object
       properties:

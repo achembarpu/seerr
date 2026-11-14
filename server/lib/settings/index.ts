@@ -160,6 +160,7 @@ export interface MainSettings {
   versionCheck: boolean;
   localTitleSearch: boolean;
   smartSearch: boolean;
+  smartSearchDevice: string;
 }
 
 export interface ProxySettings {
@@ -441,6 +442,7 @@ class Settings {
         versionCheck: true,
         localTitleSearch: false,
         smartSearch: false,
+        smartSearchDevice: 'auto',
       },
       plex: {
         name: '',

@@ -32,6 +32,68 @@ const waitFor = async (condition: () => boolean) => {
 };
 
 describe('smart search lifecycle', () => {
+  it('restarts an in-progress index when the inference device changes', async () => {
+    const directory = await mkdtemp(
+      path.join(os.tmpdir(), 'smart-reconfigure-')
+    );
+    let enabled = true;
+    let starts = 0;
+    let stops = 0;
+    let pages = 0;
+    const engine = {
+      phase: 'idle' as 'idle' | 'ready',
+      downloadBytes: 0,
+      downloadTotal: 1,
+      async start() {
+        starts++;
+        this.phase = 'ready';
+      },
+      stop() {
+        stops++;
+        this.phase = 'idle';
+      },
+      async embed() {
+        return [];
+      },
+    };
+    const source: MetadataSource = {
+      id: 'tmdb',
+      async fetchOne() {
+        return document;
+      },
+      async fetchPage(_type, _from, _to, _page, signal) {
+        assert.ok(signal);
+        pages++;
+        if (pages > 1) throw new Error('stop test');
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else
+            signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        signal.throwIfAborted();
+        return { documents: [], totalPages: 0 };
+      },
+    };
+    const service = new SmartSearchService(
+      () => enabled,
+      engine,
+      source,
+      () => new SmartStore(path.join(directory, 'index.sqlite'))
+    );
+    try {
+      service.start();
+      await waitFor(() => pages === 1);
+      service.reconfigure();
+      await waitFor(() => pages > 1);
+      assert.equal(starts, 2);
+      assert.equal(stops, 1);
+    } finally {
+      enabled = false;
+      await service.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('starts only when enabled and resumes after a failed page', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-service-'));
     const filename = path.join(directory, 'index.sqlite');
