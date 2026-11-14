@@ -1,6 +1,6 @@
 # Local smart discovery
 
-Status: researched design, not an implemented feature. The existing optional title index and ordinary TMDB search remain separate. This proposal unifies natural-language discovery, similarity, filtering, personal recommendations and optional conversation behind one local retrieval service.
+Status: researched design, not an implemented feature. The existing optional title index and ordinary TMDB search remain separate. This proposal unifies natural-language discovery, similarity, filtering, personal recommendations and optional conversation behind one local retrieval service. Both title search and discovery are intended for a broad range of languages, scripts, regions and catalogs. Earlier Tamil and Malayalam examples triggered the typo-search investigation; they are not a special scope or representative semantic-search benchmark.
 
 ## The data-rights decision
 
@@ -54,7 +54,7 @@ Conversational discovery is an optional second model and download, not a capabil
 ## Release gates
 
 - Resolve TMDB's terms for the whole feature and any blended feeds; document Wikipedia attribution, source licenses and actual coverage.
-- Provide a usable snapshot/bootstrap strategy and test restart, deletion, refresh, failures, quotas and model upgrades. Measure coverage over representative local and catalog titles, especially Tamil, Malayalam, recent titles and TV.
-- Evaluate ordinary human-judged requests, negative filters, similarities, rating thresholds, multilingual queries and short descriptions. Compare keyword-only, Bekko, E5 and EmbeddingGemma; measure relevance and wrong-constraint rates, not just model leaderboard averages or quantized-vector overlap.
+- Provide a usable snapshot/bootstrap strategy and test restart, deletion, refresh, failures, quotas and model upgrades. Measure coverage over a representative mix of languages, scripts, countries, recent and older releases, popular and obscure titles, movies and TV.
+- Evaluate ordinary human-judged requests, negative filters, similarities, rating thresholds, queries across diverse languages and scripts, and short descriptions. Evaluate title typos separately across those languages and scripts. Compare keyword-only, Bekko, E5 and EmbeddingGemma; measure relevance and wrong-constraint rates, not just model leaderboard averages or quantized-vector overlap.
 - Test real Docker builds and inference on Alpine amd64 and arm64, CPU budgets and accelerators where supported, including full-container peak memory and query latency while indexing. Docker was unavailable in this research environment; no container or NAS benchmark has been performed.
 - Test conversation separately for unsupported claims, spoiler leakage, user isolation, prompt injection through descriptions, permission checks and safe handling of unknown metadata. Chat must remain optional.
