@@ -4,7 +4,13 @@ import PageTitle from '@app/components/Common/PageTitle';
 import useToasts from '@app/hooks/useToasts';
 import globalMessages from '@app/i18n/globalMessages';
 import defineMessages from '@app/utils/defineMessages';
-import { ArrowDownOnSquareIcon } from '@heroicons/react/24/outline';
+import {
+  AdjustmentsHorizontalIcon,
+  ArrowDownOnSquareIcon,
+  ArrowPathIcon,
+  MagnifyingGlassIcon,
+  SparklesIcon,
+} from '@heroicons/react/24/outline';
 import type { SearchIndexStatus } from '@server/lib/searchIndex/service';
 import type { MainSettings } from '@server/lib/settings';
 import type { SmartSearchService } from '@server/lib/smartSearch/service';
@@ -67,6 +73,24 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   smartSearchProgress: 'Indexing {mediaType} from {year}, page {page}',
   smartSearchRefreshFailed: 'Could not start smart search refresh.',
 
+  titleCardTitle: 'Title search',
+  titleCardDescription:
+    'Find movies and series by title, including misspellings. Uses locally indexed IMDb and TMDB titles.',
+  smartCardTitle: 'Smart search',
+  smartCardDescription:
+    'Find movies and series by their descriptions, and discover similar titles. Uses a locally downloaded embedding model.',
+  rerankCardTitle: 'Relevance reranking',
+  rerankRequiresSmart: 'Turn on smart search to use reranking.',
+  titleSources: 'Title index sources',
+  descriptionIndex: 'Description index',
+  indexedTitles: 'Indexed titles',
+  keywordIndex: 'Keyword index',
+  enabled: 'Enabled',
+  saveToStart: 'Save your changes to apply these settings.',
+  embeddingModelStatus: 'Embedding model: {phase}',
+  unsavedChanges: 'You have unsaved changes.',
+  embeddingDownload: 'Embedding model download',
+  rerankerDownload: 'Reranker model download',
   searchSettings: 'Search',
   searchSettingsTitle: 'Search Settings',
   searchSettingsDescription: 'Configure local search, indexing and inference.',
@@ -79,7 +103,7 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   indexWaiting: 'Waiting for indexed descriptions',
   indexCoverageTip:
     'Search is available while indexing continues. Coverage grows as titles are processed.',
-  lexicalProgress: 'Keyword index: {indexed} of {total} indexed descriptions',
+  lexicalProgress: '{indexed} of {total} descriptions',
   lexicalUpdating: 'Updating keyword index',
   popularProgress: 'Prioritizing popular {mediaType}, page {page}',
   popularPaused: 'Popular {mediaType} indexing paused at page {page}',
@@ -111,6 +135,39 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   refreshWeekly: 'Weekly',
   refreshManual: 'Manual only',
 });
+
+const ModelProgress = ({
+  label,
+  bytes,
+  total,
+}: {
+  label: string;
+  bytes: number;
+  total: number;
+}) => {
+  const percent = Math.min(100, Math.max(0, Math.round((bytes * 100) / total)));
+  return (
+    <div className="mt-3">
+      <div className="mb-1 flex items-center justify-between gap-3 text-xs text-gray-400">
+        <span>{label}</span>
+        <span>{percent}%</span>
+      </div>
+      <div
+        role="progressbar"
+        aria-label={label}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={percent}
+        className="h-1.5 overflow-hidden rounded-full bg-gray-700"
+      >
+        <div
+          className="h-full rounded-full bg-indigo-400"
+          style={{ width: `${percent}%` }}
+        />
+      </div>
+    </div>
+  );
+};
 
 const SettingsSearch = () => {
   const intl = useIntl();
@@ -202,457 +259,575 @@ const SettingsSearch = () => {
           }}
         >
           {({ values, setFieldValue, isSubmitting, dirty }) => (
-            <Form className="section" data-testid="settings-search-form">
-              <div className="form-row">
-                <label htmlFor="localTitleSearch" className="checkbox-label">
-                  {intl.formatMessage(messages.localTitleSearch)}
-                  <span className="label-tip">
-                    {intl.formatMessage(messages.localTitleSearchTip)}{' '}
-                    <a
-                      href="https://help.imdb.com/article/imdb/general-information/can-i-use-imdb-data-in-my-software/G5JTRESSHJBBHTGX"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="underline"
-                    >
-                      {intl.formatMessage(messages.localTitleSearchTerms)}
-                    </a>
-                  </span>
-                </label>
-                <div className="form-input-area">
-                  <Field
-                    type="checkbox"
-                    id="localTitleSearch"
-                    name="localTitleSearch"
-                    onChange={() =>
-                      setFieldValue(
-                        'localTitleSearch',
-                        !values.localTitleSearch
-                      )
-                    }
-                  />
-                </div>
-              </div>
-              {values.localTitleSearch && (
-                <div className="form-row">
-                  <label
-                    htmlFor="localTitleSearchRefreshInterval"
-                    className="text-label"
-                  >
-                    {intl.formatMessage(messages.titleRefreshInterval)}
-                    <span className="label-tip">
-                      {intl.formatMessage(messages.titleRefreshIntervalTip)}
-                    </span>
-                  </label>
-                  <div className="form-input-area">
-                    <Field
-                      as="select"
-                      id="localTitleSearchRefreshInterval"
-                      name="localTitleSearchRefreshInterval"
-                    >
-                      <option value="daily">
-                        {intl.formatMessage(messages.refreshDaily)}
-                      </option>
-                      <option value="weekly">
-                        {intl.formatMessage(messages.refreshWeekly)}
-                      </option>
-                      <option value="manual">
-                        {intl.formatMessage(messages.refreshManual)}
-                      </option>
-                    </Field>
-                  </div>
-                </div>
-              )}
-              {data?.localTitleSearch && (
-                <div className="form-row">
-                  <div className="form-input-area">
-                    {searchIndexError && (
-                      <p className="text-sm text-red-400">
-                        {intl.formatMessage(messages.searchIndexStatusFailed)}
+            <Form className="space-y-6" data-testid="settings-search-form">
+              <section className="overflow-hidden rounded-lg bg-gray-800 shadow ring-1 ring-gray-700">
+                <div className="flex items-start justify-between gap-4 p-5 sm:p-6">
+                  <div className="flex min-w-0 items-start gap-4">
+                    <div className="rounded-lg bg-indigo-500/10 p-2.5 text-indigo-400 ring-1 ring-inset ring-indigo-500/20">
+                      <MagnifyingGlassIcon className="h-5 w-5" />
+                    </div>
+                    <div>
+                      <h4 className="text-lg font-semibold text-gray-100">
+                        {intl.formatMessage(messages.titleCardTitle)}
+                      </h4>
+                      <p className="mt-1 max-w-2xl text-sm leading-5 text-gray-400">
+                        {intl.formatMessage(messages.titleCardDescription)}
                       </p>
-                    )}
-                    {searchIndexStatus && (
-                      <>
-                        {Object.entries(sourceLabels).map(([source, label]) => {
-                          const key = source as keyof typeof sourceLabels;
-                          const sourceStatus = searchIndexStatus.sources[key];
-                          const status =
-                            searchIndexStatus.currentSource === key
-                              ? messages.searchIndexUpdating
-                              : searchIndexStatus.failedSources.includes(key)
-                                ? data.localTitleSearchRefreshInterval ===
-                                  'manual'
-                                  ? messages.searchIndexFailedManual
-                                  : messages.searchIndexFailed
-                                : sourceStatus.available
-                                  ? messages.searchIndexReady
-                                  : messages.searchIndexWaiting;
-                          return (
-                            <p key={key} className="mb-1 text-sm text-gray-300">
-                              {intl.formatMessage(label)}:{' '}
-                              {intl.formatMessage(status)}
-                              {sourceStatus.lastChecked && (
-                                <>
-                                  {' '}
-                                  ·{' '}
-                                  {intl.formatMessage(
-                                    messages.searchIndexChecked,
-                                    {
-                                      date: intl.formatDate(
-                                        sourceStatus.lastChecked,
-                                        {
-                                          dateStyle: 'medium',
-                                          timeStyle: 'short',
-                                        }
-                                      ),
-                                    }
-                                  )}
-                                </>
-                              )}
-                            </p>
-                          );
-                        })}
-                        {searchIndexStatus.nextRefreshAt && (
-                          <p className="mb-2 text-sm text-gray-400">
-                            {intl.formatMessage(messages.searchIndexNext, {
-                              date: intl.formatDate(
-                                searchIndexStatus.nextRefreshAt,
-                                { dateStyle: 'medium', timeStyle: 'short' }
-                              ),
-                            })}
-                          </p>
-                        )}
-                        <Button
-                          type="button"
-                          buttonSize="sm"
-                          disabled={searchIndexStatus.refreshing}
-                          onClick={async () => {
-                            try {
-                              await axios.post(
-                                '/api/v1/settings/search-index/refresh'
-                              );
-                              await refreshSearchIndexStatus();
-                            } catch {
-                              addToast(
-                                intl.formatMessage(
-                                  messages.searchIndexRefreshFailed
-                                ),
-                                { autoDismiss: true, appearance: 'error' }
-                              );
-                              await refreshSearchIndexStatus();
-                            }
-                          }}
-                        >
-                          {intl.formatMessage(messages.searchIndexRefresh)}
-                        </Button>
-                      </>
-                    )}
+                      <a
+                        href="https://help.imdb.com/article/imdb/general-information/can-i-use-imdb-data-in-my-software/G5JTRESSHJBBHTGX"
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mt-1 inline-block text-sm text-indigo-300 hover:text-indigo-200 hover:underline"
+                      >
+                        {intl.formatMessage(messages.localTitleSearchTerms)}
+                      </a>
+                    </div>
                   </div>
-                </div>
-              )}
-              <div className="form-row">
-                <label htmlFor="smartSearch" className="checkbox-label">
-                  {intl.formatMessage(messages.smartSearch)}
-                  <span className="label-tip">
-                    {intl.formatMessage(messages.smartSearchTip)}
-                  </span>
-                </label>
-                <div className="form-input-area">
-                  <Field
-                    type="checkbox"
-                    id="smartSearch"
-                    name="smartSearch"
-                    onChange={() =>
-                      setFieldValue('smartSearch', !values.smartSearch)
-                    }
-                  />
-                </div>
-              </div>
-              {values.smartSearch && (
-                <div className="form-row">
-                  <label htmlFor="smartSearchDevice" className="text-label">
-                    {intl.formatMessage(messages.smartSearchDevice)}
-                    <span className="label-tip">
-                      {intl.formatMessage(messages.smartSearchDeviceTip)}
-                    </span>
-                  </label>
-                  <div className="form-input-area">
-                    <Field
-                      as="select"
-                      id="smartSearchDevice"
-                      name="smartSearchDevice"
-                    >
-                      <option value="auto">
-                        {intl.formatMessage(messages.smartSearchDeviceAuto)}
-                      </option>
-                      <option value="cpu">
-                        {intl.formatMessage(messages.smartSearchDeviceCpu)}
-                      </option>
-                      {(smartStatus?.externalAvailable ||
-                        values.smartSearchDevice === 'external') && (
-                        <option value="external">
-                          {intl.formatMessage(messages.smartSearchDeviceHost)}
-                        </option>
-                      )}
-                      {smartStatus?.devices.map((device) => (
-                        <option key={device.name} value={device.name}>
-                          {device.description} ({device.name})
-                        </option>
-                      ))}
-                      {values.smartSearchDevice !== 'auto' &&
-                        values.smartSearchDevice !== 'cpu' &&
-                        values.smartSearchDevice !== 'external' &&
-                        !smartStatus?.devices.some(
-                          (device) => device.name === values.smartSearchDevice
-                        ) && (
-                          <option value={values.smartSearchDevice}>
-                            {values.smartSearchDevice} (unavailable)
-                          </option>
-                        )}
-                    </Field>
-                  </div>
-                </div>
-              )}
-              {values.smartSearch && (
-                <div className="form-row">
-                  <label htmlFor="smartSearchRerank" className="checkbox-label">
-                    {intl.formatMessage(messages.rerank)}
-                    <span className="label-tip">
-                      {intl.formatMessage(messages.rerankTip)}
-                    </span>
-                  </label>
-                  <div className="form-input-area">
+                  <label
+                    htmlFor="localTitleSearch"
+                    className="flex shrink-0 items-center gap-2 text-sm text-gray-300"
+                  >
+                    <span>{intl.formatMessage(messages.enabled)}</span>
                     <Field
                       type="checkbox"
-                      id="smartSearchRerank"
-                      name="smartSearchRerank"
+                      id="localTitleSearch"
+                      name="localTitleSearch"
                     />
-                  </div>
-                </div>
-              )}
-              {values.smartSearch && values.smartSearchRerank && (
-                <div className="form-row">
-                  <label
-                    htmlFor="smartSearchRerankCandidates"
-                    className="text-label"
-                  >
-                    {intl.formatMessage(messages.rerankCandidates)}
-                    <span className="label-tip">
-                      {intl.formatMessage(messages.rerankCandidatesTip)}
-                    </span>
                   </label>
-                  <div className="form-input-area">
-                    <Field
-                      as="select"
-                      id="smartSearchRerankCandidates"
-                      name="smartSearchRerankCandidates"
-                      onChange={(event: ChangeEvent<HTMLSelectElement>) =>
-                        setFieldValue(
-                          'smartSearchRerankCandidates',
-                          Number(event.target.value)
-                        )
-                      }
-                    >
-                      <option value={20}>
-                        {intl.formatMessage(messages.rerank20)}
-                      </option>
-                      <option value={40}>
-                        {intl.formatMessage(messages.rerank40)}
-                      </option>
-                      <option value={80}>
-                        {intl.formatMessage(messages.rerank80)}
-                      </option>
-                      {![20, 40, 80].includes(
-                        values.smartSearchRerankCandidates
-                      ) && (
-                        <option value={values.smartSearchRerankCandidates}>
-                          {values.smartSearchRerankCandidates}
-                        </option>
-                      )}
-                    </Field>
-                  </div>
                 </div>
-              )}
-              {values.smartSearch && (
-                <div className="form-row">
+                {values.localTitleSearch && (
+                  <div className="space-y-5 border-t border-gray-700 p-5 sm:p-6">
+                    <div className="grid gap-2 sm:grid-cols-3 sm:items-start sm:gap-4">
+                      <label
+                        htmlFor="localTitleSearchRefreshInterval"
+                        className="text-label"
+                      >
+                        {intl.formatMessage(messages.titleRefreshInterval)}
+                        <span className="label-tip">
+                          {intl.formatMessage(messages.titleRefreshIntervalTip)}
+                        </span>
+                      </label>
+                      <div className="sm:col-span-2">
+                        <Field
+                          as="select"
+                          id="localTitleSearchRefreshInterval"
+                          name="localTitleSearchRefreshInterval"
+                          className="w-full sm:max-w-xs"
+                        >
+                          <option value="daily">
+                            {intl.formatMessage(messages.refreshDaily)}
+                          </option>
+                          <option value="weekly">
+                            {intl.formatMessage(messages.refreshWeekly)}
+                          </option>
+                          <option value="manual">
+                            {intl.formatMessage(messages.refreshManual)}
+                          </option>
+                        </Field>
+                      </div>
+                    </div>
+                    {!data.localTitleSearch && (
+                      <p className="text-sm text-gray-400">
+                        {intl.formatMessage(messages.saveToStart)}
+                      </p>
+                    )}
+                    {data.localTitleSearch && (
+                      <div className="rounded-md bg-gray-900/50 p-4 ring-1 ring-gray-700">
+                        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                          <h5 className="text-sm font-semibold text-gray-200">
+                            {intl.formatMessage(messages.titleSources)}
+                          </h5>
+                          {searchIndexStatus && (
+                            <Button
+                              type="button"
+                              buttonSize="sm"
+                              disabled={searchIndexStatus.refreshing}
+                              onClick={async () => {
+                                try {
+                                  await axios.post(
+                                    '/api/v1/settings/search-index/refresh'
+                                  );
+                                  await refreshSearchIndexStatus();
+                                } catch {
+                                  addToast(
+                                    intl.formatMessage(
+                                      messages.searchIndexRefreshFailed
+                                    ),
+                                    { autoDismiss: true, appearance: 'error' }
+                                  );
+                                  await refreshSearchIndexStatus();
+                                }
+                              }}
+                            >
+                              <ArrowPathIcon />
+                              <span>
+                                {intl.formatMessage(
+                                  messages.searchIndexRefresh
+                                )}
+                              </span>
+                            </Button>
+                          )}
+                        </div>
+                        {searchIndexError && (
+                          <p className="text-sm text-red-400">
+                            {intl.formatMessage(
+                              messages.searchIndexStatusFailed
+                            )}
+                          </p>
+                        )}
+                        {searchIndexStatus && (
+                          <>
+                            <div className="grid gap-2 sm:grid-cols-2">
+                              {Object.entries(sourceLabels).map(
+                                ([source, label]) => {
+                                  const key =
+                                    source as keyof typeof sourceLabels;
+                                  const sourceStatus =
+                                    searchIndexStatus.sources[key];
+                                  const updating =
+                                    searchIndexStatus.currentSource === key;
+                                  const failed =
+                                    searchIndexStatus.failedSources.includes(
+                                      key
+                                    );
+                                  const sourceLabel = updating
+                                    ? messages.searchIndexUpdating
+                                    : failed
+                                      ? data.localTitleSearchRefreshInterval ===
+                                        'manual'
+                                        ? messages.searchIndexFailedManual
+                                        : messages.searchIndexFailed
+                                      : sourceStatus.available
+                                        ? messages.searchIndexReady
+                                        : messages.searchIndexWaiting;
+                                  return (
+                                    <div
+                                      key={key}
+                                      className="rounded-md bg-gray-800/70 px-3 py-2.5"
+                                    >
+                                      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-sm">
+                                        <span className="font-medium text-gray-200">
+                                          {intl.formatMessage(label)}
+                                        </span>
+                                        <span
+                                          className={`inline-flex items-center gap-1.5 text-xs ${failed ? 'text-red-400' : updating ? 'text-indigo-300' : sourceStatus.available ? 'text-green-400' : 'text-gray-400'}`}
+                                        >
+                                          <span
+                                            aria-hidden="true"
+                                            className={`h-1.5 w-1.5 rounded-full ${failed ? 'bg-red-400' : updating ? 'bg-indigo-400' : sourceStatus.available ? 'bg-green-400' : 'bg-gray-500'}`}
+                                          />
+                                          {intl.formatMessage(sourceLabel)}
+                                        </span>
+                                      </div>
+                                      {sourceStatus.lastChecked && (
+                                        <p className="mt-1 text-xs text-gray-400">
+                                          {intl.formatMessage(
+                                            messages.searchIndexChecked,
+                                            {
+                                              date: intl.formatDate(
+                                                sourceStatus.lastChecked,
+                                                {
+                                                  dateStyle: 'medium',
+                                                  timeStyle: 'short',
+                                                }
+                                              ),
+                                            }
+                                          )}
+                                        </p>
+                                      )}
+                                    </div>
+                                  );
+                                }
+                              )}
+                            </div>
+                            {searchIndexStatus.nextRefreshAt && (
+                              <p className="mt-3 text-xs text-gray-400">
+                                {intl.formatMessage(messages.searchIndexNext, {
+                                  date: intl.formatDate(
+                                    searchIndexStatus.nextRefreshAt,
+                                    { dateStyle: 'medium', timeStyle: 'short' }
+                                  ),
+                                })}
+                              </p>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+
+              <section className="overflow-hidden rounded-lg bg-gray-800 shadow ring-1 ring-gray-700">
+                <div className="flex items-start justify-between gap-4 p-5 sm:p-6">
+                  <div className="flex min-w-0 items-start gap-4">
+                    <div className="rounded-lg bg-indigo-500/10 p-2.5 text-indigo-400 ring-1 ring-inset ring-indigo-500/20">
+                      <SparklesIcon className="h-5 w-5" />
+                    </div>
+                    <div>
+                      <h4 className="text-lg font-semibold text-gray-100">
+                        {intl.formatMessage(messages.smartCardTitle)}
+                      </h4>
+                      <p className="mt-1 max-w-2xl text-sm leading-5 text-gray-400">
+                        {intl.formatMessage(messages.smartCardDescription)}
+                      </p>
+                    </div>
+                  </div>
                   <label
-                    htmlFor="smartSearchRefreshInterval"
-                    className="text-label"
+                    htmlFor="smartSearch"
+                    className="flex shrink-0 items-center gap-2 text-sm text-gray-300"
                   >
-                    {intl.formatMessage(messages.smartRefreshInterval)}
-                    <span className="label-tip">
-                      {intl.formatMessage(messages.smartRefreshIntervalTip)}
-                    </span>
-                  </label>
-                  <div className="form-input-area">
+                    <span>{intl.formatMessage(messages.enabled)}</span>
                     <Field
-                      as="select"
-                      id="smartSearchRefreshInterval"
-                      name="smartSearchRefreshInterval"
-                    >
-                      <option value="daily">
-                        {intl.formatMessage(messages.refreshDaily)}
-                      </option>
-                      <option value="weekly">
-                        {intl.formatMessage(messages.refreshWeekly)}
-                      </option>
-                      <option value="manual">
-                        {intl.formatMessage(messages.refreshManual)}
-                      </option>
-                    </Field>
-                  </div>
+                      type="checkbox"
+                      id="smartSearch"
+                      name="smartSearch"
+                    />
+                  </label>
                 </div>
-              )}
-              {data?.smartSearch && smartStatusError && (
-                <p className="mb-3 text-sm text-red-400">
-                  {intl.formatMessage(messages.smartStatusError)}
-                </p>
-              )}
-              {data?.smartSearch && smartStatus && (
-                <div className="form-row">
-                  <div className="form-input-area">
-                    <p className="mb-1 text-sm text-gray-300">
-                      {intl.formatMessage(messages.smartSearchStatus, {
-                        phase: smartStatus.phase,
-                        count: smartStatus.count,
-                      })}
-                    </p>
-                    <p className="mb-1 text-sm text-gray-300">
-                      {intl.formatMessage(
-                        smartStatus.indexing
-                          ? messages.indexUpdating
-                          : smartStatus.count > 0
-                            ? messages.indexAvailable
-                            : messages.indexWaiting
-                      )}
-                    </p>
-                    {smartStatus.activeDevice && (
-                      <p className="mb-1 text-sm text-gray-300">
-                        {intl.formatMessage(messages.smartSearchActiveDevice, {
-                          device: smartStatus.activeDevice,
-                        })}
-                      </p>
-                    )}
-                    {smartStatus.deviceWarning && (
-                      <p className="mb-2 text-sm text-yellow-400">
-                        {smartStatus.deviceWarning}
-                      </p>
-                    )}
-                    {smartStatus.phase === 'downloading' &&
-                      smartStatus.downloadTotal > 0 && (
-                        <p className="mb-1 text-sm text-gray-300">
-                          {intl.formatMessage(messages.smartSearchDownload, {
-                            percent: Math.min(
-                              100,
-                              Math.round(
-                                (smartStatus.downloadBytes * 100) /
-                                  smartStatus.downloadTotal
-                              )
-                            ),
-                          })}
+                {values.smartSearch && (
+                  <div className="space-y-5 border-t border-gray-700 p-5 sm:p-6">
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <div>
+                        <label htmlFor="smartSearchDevice">
+                          {intl.formatMessage(messages.smartSearchDevice)}
+                        </label>
+                        <Field
+                          as="select"
+                          id="smartSearchDevice"
+                          name="smartSearchDevice"
+                          className="w-full"
+                        >
+                          <option value="auto">
+                            {intl.formatMessage(messages.smartSearchDeviceAuto)}
+                          </option>
+                          <option value="cpu">
+                            {intl.formatMessage(messages.smartSearchDeviceCpu)}
+                          </option>
+                          {(smartStatus?.externalAvailable ||
+                            values.smartSearchDevice === 'external') && (
+                            <option value="external">
+                              {intl.formatMessage(
+                                messages.smartSearchDeviceHost
+                              )}
+                            </option>
+                          )}
+                          {smartStatus?.devices.map((device) => (
+                            <option key={device.name} value={device.name}>
+                              {device.description} ({device.name})
+                            </option>
+                          ))}
+                          {values.smartSearchDevice !== 'auto' &&
+                            values.smartSearchDevice !== 'cpu' &&
+                            values.smartSearchDevice !== 'external' &&
+                            !smartStatus?.devices.some(
+                              (device) =>
+                                device.name === values.smartSearchDevice
+                            ) && (
+                              <option value={values.smartSearchDevice}>
+                                {values.smartSearchDevice} (unavailable)
+                              </option>
+                            )}
+                        </Field>
+                        <p className="mt-1.5 text-xs leading-5 text-gray-400">
+                          {intl.formatMessage(messages.smartSearchDeviceTip)}
                         </p>
-                      )}
-                    {progress?.popular && (
-                      <p className="mb-1 text-sm text-gray-300">
-                        {intl.formatMessage(
-                          progress.popular.paused
-                            ? progress.popular.totalPages
-                              ? messages.popularPausedTotal
-                              : messages.popularPaused
-                            : progress.popular.totalPages
-                              ? messages.popularProgressTotal
-                              : messages.popularProgress,
-                          {
-                            total: progress.popular.totalPages,
-                            mediaType: intl.formatMessage(
-                              progress.popular.type === 'movie'
-                                ? messages.popularMovies
-                                : messages.popularSeries
-                            ),
-                            page: progress.popular.page,
-                          }
-                        )}
-                      </p>
-                    )}
-                    {progress?.chronological && (
-                      <p className="mb-1 text-sm text-gray-300">
-                        {intl.formatMessage(
-                          progress.chronological.paused
-                            ? messages.scanPausedDetailed
-                            : messages.scanProgressDetailed,
-                          {
-                            mediaType: intl.formatMessage(
-                              progress.chronological.mediaType === 'movie'
-                                ? messages.popularMovies
-                                : messages.popularSeries
-                            ),
-                            period: progress.chronological.period,
-                            page: progress.chronological.page,
-                          }
-                        )}
-                      </p>
-                    )}
-                    {smartStatus.indexing && (
-                      <p className="mb-1 text-sm text-gray-400">
-                        {intl.formatMessage(messages.indexCoverageTip)}
-                      </p>
-                    )}
-                    {smartStatus.nextRefreshAt && (
-                      <p className="mb-1 text-sm text-gray-400">
-                        {intl.formatMessage(messages.searchIndexNext, {
-                          date: intl.formatDate(smartStatus.nextRefreshAt, {
-                            dateStyle: 'medium',
-                            timeStyle: 'short',
-                          }),
-                        })}
-                      </p>
-                    )}
-                    {smartStatus.lexical && (
-                      <p className="mb-1 text-sm text-gray-300">
-                        {intl.formatMessage(messages.lexicalProgress, {
-                          indexed: intl.formatNumber(
-                            smartStatus.lexical.indexed
-                          ),
-                          total: intl.formatNumber(smartStatus.lexical.total),
-                        })}
-                      </p>
-                    )}
-                    {smartStatus.lexical?.indexing && (
-                      <p className="mb-1 text-sm text-gray-400">
-                        {intl.formatMessage(messages.lexicalUpdating)}
-                      </p>
-                    )}
-                    {smartStatus.lexical?.error && (
-                      <p className="mb-1 text-sm text-red-400">
-                        {smartStatus.lexical.error}
-                      </p>
-                    )}
-                    {smartStatus.reranker?.enabled && (
-                      <div className="mb-2 text-sm text-gray-300">
-                        <p>
-                          {intl.formatMessage(messages.rerankStatus, {
-                            phase: smartStatus.reranker.phase,
-                          })}
+                      </div>
+                      <div>
+                        <label htmlFor="smartSearchRefreshInterval">
+                          {intl.formatMessage(messages.smartRefreshInterval)}
+                        </label>
+                        <Field
+                          as="select"
+                          id="smartSearchRefreshInterval"
+                          name="smartSearchRefreshInterval"
+                          className="w-full"
+                        >
+                          <option value="daily">
+                            {intl.formatMessage(messages.refreshDaily)}
+                          </option>
+                          <option value="weekly">
+                            {intl.formatMessage(messages.refreshWeekly)}
+                          </option>
+                          <option value="manual">
+                            {intl.formatMessage(messages.refreshManual)}
+                          </option>
+                        </Field>
+                        <p className="mt-1.5 text-xs leading-5 text-gray-400">
+                          {intl.formatMessage(messages.smartRefreshIntervalTip)}
                         </p>
-                        {smartStatus.reranker.phase === 'downloading' &&
-                          smartStatus.reranker.downloadTotal > 0 && (
+                      </div>
+                    </div>
+                    {!data.smartSearch && (
+                      <p className="text-sm text-gray-400">
+                        {intl.formatMessage(messages.saveToStart)}
+                      </p>
+                    )}
+                    {data.smartSearch && smartStatusError && (
+                      <p className="text-sm text-red-400">
+                        {intl.formatMessage(messages.smartStatusError)}
+                      </p>
+                    )}
+                    {data.smartSearch && smartStatus && (
+                      <div className="rounded-md bg-gray-900/50 p-4 ring-1 ring-gray-700">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <h5 className="text-sm font-semibold text-gray-200">
+                              {intl.formatMessage(messages.descriptionIndex)}
+                            </h5>
+                            <p className="mt-1 text-sm text-gray-400">
+                              {intl.formatMessage(
+                                smartStatus.indexing
+                                  ? messages.indexUpdating
+                                  : smartStatus.count > 0
+                                    ? messages.indexAvailable
+                                    : messages.indexWaiting
+                              )}
+                            </p>
+                          </div>
+                          <Button
+                            type="button"
+                            buttonSize="sm"
+                            disabled={smartStatus.indexing}
+                            onClick={async () => {
+                              try {
+                                await axios.post(
+                                  '/api/v1/settings/smart-search/refresh'
+                                );
+                                await refreshSmartStatus();
+                              } catch {
+                                addToast(
+                                  intl.formatMessage(
+                                    messages.smartSearchRefreshFailed
+                                  ),
+                                  { autoDismiss: true, appearance: 'error' }
+                                );
+                              }
+                            }}
+                          >
+                            <ArrowPathIcon />
+                            <span>
+                              {intl.formatMessage(messages.searchIndexRefresh)}
+                            </span>
+                          </Button>
+                        </div>
+                        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                          <div className="rounded-md bg-gray-800/70 px-3 py-2.5">
+                            <p className="text-xs font-medium text-gray-400">
+                              {intl.formatMessage(messages.indexedTitles)}
+                            </p>
+                            <p className="mt-0.5 text-lg font-semibold text-gray-100">
+                              {intl.formatNumber(smartStatus.count)}
+                            </p>
+                          </div>
+                          {smartStatus.lexical && (
+                            <div className="rounded-md bg-gray-800/70 px-3 py-2.5">
+                              <p className="text-xs font-medium text-gray-400">
+                                {intl.formatMessage(messages.keywordIndex)}
+                              </p>
+                              <p className="mt-0.5 text-sm font-medium text-gray-200">
+                                {intl.formatMessage(messages.lexicalProgress, {
+                                  indexed: intl.formatNumber(
+                                    smartStatus.lexical.indexed
+                                  ),
+                                  total: intl.formatNumber(
+                                    smartStatus.lexical.total
+                                  ),
+                                })}
+                              </p>
+                              {smartStatus.lexical.indexing && (
+                                <p className="mt-1 text-xs text-gray-400">
+                                  {intl.formatMessage(messages.lexicalUpdating)}
+                                </p>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        <div className="mt-3 space-y-1 text-sm text-gray-400">
+                          <p>
+                            {intl.formatMessage(messages.embeddingModelStatus, {
+                              phase: smartStatus.phase,
+                            })}
+                          </p>
+                          {smartStatus.activeDevice && (
                             <p>
                               {intl.formatMessage(
-                                messages.smartSearchDownload,
+                                messages.smartSearchActiveDevice,
+                                { device: smartStatus.activeDevice }
+                              )}
+                            </p>
+                          )}
+                          {progress?.popular && (
+                            <p>
+                              {intl.formatMessage(
+                                progress.popular.paused
+                                  ? progress.popular.totalPages
+                                    ? messages.popularPausedTotal
+                                    : messages.popularPaused
+                                  : progress.popular.totalPages
+                                    ? messages.popularProgressTotal
+                                    : messages.popularProgress,
                                 {
-                                  percent: Math.min(
-                                    100,
-                                    Math.round(
-                                      (smartStatus.reranker.downloadBytes *
-                                        100) /
-                                        smartStatus.reranker.downloadTotal
-                                    )
+                                  total: progress.popular.totalPages,
+                                  mediaType: intl.formatMessage(
+                                    progress.popular.type === 'movie'
+                                      ? messages.popularMovies
+                                      : messages.popularSeries
                                   ),
+                                  page: progress.popular.page,
                                 }
                               )}
                             </p>
                           )}
+                          {progress?.chronological && (
+                            <p>
+                              {intl.formatMessage(
+                                progress.chronological.paused
+                                  ? messages.scanPausedDetailed
+                                  : messages.scanProgressDetailed,
+                                {
+                                  mediaType: intl.formatMessage(
+                                    progress.chronological.mediaType === 'movie'
+                                      ? messages.popularMovies
+                                      : messages.popularSeries
+                                  ),
+                                  period: progress.chronological.period,
+                                  page: progress.chronological.page,
+                                }
+                              )}
+                            </p>
+                          )}
+                          {smartStatus.indexing && (
+                            <p>
+                              {intl.formatMessage(messages.indexCoverageTip)}
+                            </p>
+                          )}
+                          {smartStatus.nextRefreshAt && (
+                            <p>
+                              {intl.formatMessage(messages.searchIndexNext, {
+                                date: intl.formatDate(
+                                  smartStatus.nextRefreshAt,
+                                  { dateStyle: 'medium', timeStyle: 'short' }
+                                ),
+                              })}
+                            </p>
+                          )}
+                          {smartStatus.deviceWarning && (
+                            <p className="text-yellow-400">
+                              {smartStatus.deviceWarning}
+                            </p>
+                          )}
+                          {smartStatus.lexical?.error && (
+                            <p className="text-red-400">
+                              {smartStatus.lexical.error}
+                            </p>
+                          )}
+                          {smartStatus.error && (
+                            <p className="text-red-400">{smartStatus.error}</p>
+                          )}
+                        </div>
+                        {smartStatus.phase === 'downloading' &&
+                          smartStatus.downloadTotal > 0 && (
+                            <ModelProgress
+                              label={intl.formatMessage(
+                                messages.embeddingDownload
+                              )}
+                              bytes={smartStatus.downloadBytes}
+                              total={smartStatus.downloadTotal}
+                            />
+                          )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </section>
+
+              <section className="overflow-hidden rounded-lg bg-gray-800 shadow ring-1 ring-gray-700">
+                <div className="flex items-start justify-between gap-4 p-5 sm:p-6">
+                  <div className="flex min-w-0 items-start gap-4">
+                    <div className="rounded-lg bg-indigo-500/10 p-2.5 text-indigo-400 ring-1 ring-inset ring-indigo-500/20">
+                      <AdjustmentsHorizontalIcon className="h-5 w-5" />
+                    </div>
+                    <div>
+                      <h4 className="text-lg font-semibold text-gray-100">
+                        {intl.formatMessage(messages.rerankCardTitle)}
+                      </h4>
+                      <p className="mt-1 max-w-2xl text-sm leading-5 text-gray-400">
+                        {intl.formatMessage(messages.rerankTip)}
+                      </p>
+                      {!values.smartSearch && (
+                        <p className="mt-2 text-sm text-gray-400">
+                          {intl.formatMessage(messages.rerankRequiresSmart)}
+                        </p>
+                      )}
+                    </div>
+                  </div>
+                  <label
+                    htmlFor="smartSearchRerank"
+                    className="flex shrink-0 items-center gap-2 text-sm text-gray-300"
+                  >
+                    <span>{intl.formatMessage(messages.enabled)}</span>
+                    <Field
+                      type="checkbox"
+                      id="smartSearchRerank"
+                      name="smartSearchRerank"
+                      disabled={!values.smartSearch}
+                    />
+                  </label>
+                </div>
+                {values.smartSearch && values.smartSearchRerank && (
+                  <div className="space-y-5 border-t border-gray-700 p-5 sm:p-6">
+                    <div className="grid gap-2 sm:grid-cols-3 sm:items-start sm:gap-4">
+                      <label
+                        htmlFor="smartSearchRerankCandidates"
+                        className="text-label"
+                      >
+                        {intl.formatMessage(messages.rerankCandidates)}
+                        <span className="label-tip">
+                          {intl.formatMessage(messages.rerankCandidatesTip)}
+                        </span>
+                      </label>
+                      <div className="sm:col-span-2">
+                        <Field
+                          as="select"
+                          id="smartSearchRerankCandidates"
+                          name="smartSearchRerankCandidates"
+                          className="w-full sm:max-w-xs"
+                          onChange={(event: ChangeEvent<HTMLSelectElement>) =>
+                            setFieldValue(
+                              'smartSearchRerankCandidates',
+                              Number(event.target.value)
+                            )
+                          }
+                        >
+                          <option value={20}>
+                            {intl.formatMessage(messages.rerank20)}
+                          </option>
+                          <option value={40}>
+                            {intl.formatMessage(messages.rerank40)}
+                          </option>
+                          <option value={80}>
+                            {intl.formatMessage(messages.rerank80)}
+                          </option>
+                          {![20, 40, 80].includes(
+                            values.smartSearchRerankCandidates
+                          ) && (
+                            <option value={values.smartSearchRerankCandidates}>
+                              {values.smartSearchRerankCandidates}
+                            </option>
+                          )}
+                        </Field>
+                      </div>
+                    </div>
+                    {smartStatus?.reranker?.enabled && (
+                      <div className="rounded-md bg-gray-900/50 p-4 text-sm text-gray-300 ring-1 ring-gray-700">
+                        <p className="font-medium text-gray-200">
+                          {intl.formatMessage(messages.rerankStatus, {
+                            phase: smartStatus.reranker.phase,
+                          })}
+                        </p>
                         {smartStatus.reranker.activeDevice && (
-                          <p>
+                          <p className="mt-1 text-gray-400">
                             {intl.formatMessage(
                               messages.smartSearchActiveDevice,
                               { device: smartStatus.reranker.activeDevice }
@@ -660,60 +835,46 @@ const SettingsSearch = () => {
                           </p>
                         )}
                         {smartStatus.reranker.error && (
-                          <p className="text-red-400">
+                          <p className="mt-1 text-red-400">
                             {smartStatus.reranker.error}
                           </p>
                         )}
+                        {smartStatus.reranker.phase === 'downloading' &&
+                          smartStatus.reranker.downloadTotal > 0 && (
+                            <ModelProgress
+                              label={intl.formatMessage(
+                                messages.rerankerDownload
+                              )}
+                              bytes={smartStatus.reranker.downloadBytes}
+                              total={smartStatus.reranker.downloadTotal}
+                            />
+                          )}
                       </div>
                     )}
-                    {smartStatus.error && (
-                      <p className="mb-2 text-sm text-red-400">
-                        {smartStatus.error}
-                      </p>
-                    )}
-                    <Button
-                      type="button"
-                      buttonSize="sm"
-                      disabled={smartStatus.indexing}
-                      onClick={async () => {
-                        try {
-                          await axios.post(
-                            '/api/v1/settings/smart-search/refresh'
-                          );
-                          await refreshSmartStatus();
-                        } catch {
-                          addToast(
-                            intl.formatMessage(
-                              messages.smartSearchRefreshFailed
-                            ),
-                            { autoDismiss: true, appearance: 'error' }
-                          );
-                        }
-                      }}
-                    >
-                      {intl.formatMessage(messages.searchIndexRefresh)}
-                    </Button>
                   </div>
-                </div>
-              )}
+                )}
+              </section>
 
-              <div className="actions">
-                <div className="flex justify-end">
-                  <Button
-                    buttonType="primary"
-                    type="submit"
-                    disabled={isSubmitting || !dirty}
-                  >
-                    <ArrowDownOnSquareIcon />
-                    <span>
-                      {intl.formatMessage(
-                        isSubmitting
-                          ? globalMessages.saving
-                          : globalMessages.save
-                      )}
-                    </span>
-                  </Button>
-                </div>
+              <div className="actions flex flex-wrap items-center justify-between gap-3">
+                {dirty ? (
+                  <p className="text-sm text-gray-400">
+                    {intl.formatMessage(messages.unsavedChanges)}
+                  </p>
+                ) : (
+                  <span />
+                )}
+                <Button
+                  buttonType="primary"
+                  type="submit"
+                  disabled={isSubmitting || !dirty}
+                >
+                  <ArrowDownOnSquareIcon />
+                  <span>
+                    {intl.formatMessage(
+                      isSubmitting ? globalMessages.saving : globalMessages.save
+                    )}
+                  </span>
+                </Button>
               </div>
             </Form>
           )}
