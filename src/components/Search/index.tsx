@@ -5,6 +5,7 @@ import PageTitle from '@app/components/Common/PageTitle';
 import useDiscover from '@app/hooks/useDiscover';
 import useSettings from '@app/hooks/useSettings';
 import defineMessages from '@app/utils/defineMessages';
+import { ArrowPathIcon } from '@heroicons/react/24/outline';
 import type {
   MovieResult,
   PersonResult,
@@ -23,6 +24,7 @@ const messages = defineMessages('components.Search', {
   searchresults: 'Search Results',
   searchUnavailable: 'Some search results are temporarily unavailable.',
   smartLoading: 'Description search is still starting or indexing.',
+  smartSearching: 'Searching descriptions. Results may change.',
   imdbAttribution:
     'Information courtesy of IMDb (https://www.imdb.com). Used with permission.',
 });
@@ -72,19 +74,22 @@ const Search = () => {
     genre: filters.genre,
   }))
     if (value) params.set(key, value);
+  const smartSearchKey =
+    settings.currentSettings.smartSearch &&
+    debouncedQuery.trim() &&
+    debouncedQuery === query &&
+    filters.type !== 'person'
+      ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
+      : null;
   const {
     data: smart,
     error: smartError,
     isLoading: smartLoading,
-  } = useSWR<{ ready: boolean; results: SearchItem[] }>(
-    settings.currentSettings.smartSearch &&
-      debouncedQuery.trim() &&
-      debouncedQuery === query &&
-      filters.type !== 'person'
-      ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
-      : null,
-    { revalidateOnFocus: false }
-  );
+    isValidating: smartValidating,
+  } = useSWR<{ ready: boolean; results: SearchItem[] }>(smartSearchKey, {
+    revalidateOnFocus: false,
+  });
+  const smartSearching = !!smartSearchKey && smartValidating;
   const items = mergeResults(
     query,
     titles,
@@ -100,8 +105,21 @@ const Search = () => {
   return (
     <>
       <PageTitle title={intl.formatMessage(messages.search)} />
-      <div className="mb-5 mt-1">
+      <div className="mb-5 mt-1 flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
         <Header>{intl.formatMessage(messages.searchresults)}</Header>
+        {smartSearching && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="mb-4 inline-flex items-center gap-2 rounded-full bg-indigo-500/10 px-3 py-1 text-sm text-indigo-200 ring-1 ring-inset ring-indigo-500/20 md:mb-0"
+          >
+            <ArrowPathIcon
+              className="h-4 w-4 animate-spin motion-reduce:animate-none"
+              aria-hidden="true"
+            />
+            <span>{intl.formatMessage(messages.smartSearching)}</span>
+          </div>
+        )}
       </div>
       <SmartSearch filters={filters} setFilters={setFilters} />
       {(error || suggestionError || smartError) && (
