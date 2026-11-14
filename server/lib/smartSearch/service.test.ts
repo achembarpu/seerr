@@ -5,7 +5,7 @@ import { describe, it } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import os from 'os';
 import path from 'path';
-import { SmartSearchService } from './service';
+import { SmartSearchService, ratingEvidence, relatedPrior } from './service';
 import { SmartStore } from './store';
 import type { MetadataSource, SmartDocument } from './types';
 import { quantize } from './vectors';
@@ -31,6 +31,41 @@ const waitFor = async (condition: () => boolean) => {
   }
   throw new Error('Timed out waiting for indexing');
 };
+
+it('does not infer a different format when either title has no genres', () => {
+  const unknown = { ...document, genreIds: [], voteCount: 0 };
+  const liveAction = { ...document, genreIds: [18], voteCount: 0 };
+  const documentary = { ...document, genreIds: [99], voteCount: 0 };
+  assert.equal(
+    relatedPrior(unknown, liveAction),
+    relatedPrior(unknown, documentary)
+  );
+  assert.equal(relatedPrior(liveAction, unknown), 0);
+  assert.ok(
+    relatedPrior(liveAction, documentary) < relatedPrior(liveAction, unknown)
+  );
+});
+
+it('treats missing ratings as neutral and shrinks ratings with few votes', () => {
+  assert.equal(
+    ratingEvidence({ ...document, voteAverage: 0, voteCount: 0 }),
+    0
+  );
+  const veryFew = ratingEvidence({
+    ...document,
+    voteAverage: 10,
+    voteCount: 1,
+  });
+  const established = ratingEvidence({
+    ...document,
+    voteAverage: 8,
+    voteCount: 1000,
+  });
+  assert.ok(veryFew > 0 && veryFew < established);
+  assert.ok(
+    ratingEvidence({ ...document, voteAverage: 4, voteCount: 1000 }) < 0
+  );
+});
 
 describe('smart search lifecycle', () => {
   it('restarts an in-progress index when the inference device changes', async () => {
@@ -540,6 +575,468 @@ it('blends reranking with initial retrieval so strong multilingual hits remain v
     if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
     settings.smartSearchRerank = originalRerank;
     settings.smartSearchRerankCandidates = originalLimit;
+  }
+});
+
+it('offers a deeper relevant candidate for reranking without rebuilding embeddings', async () => {
+  let embeddingCalls = 0;
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      embeddingCalls++;
+      return [[1, 0]];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const dense = Array.from({ length: 70 }, (_, index) => ({
+    document: {
+      ...document,
+      title: `Candidate ${index}`,
+      sourceId: String(index),
+      voteCount: index === 50 ? 8000 : 0,
+    },
+    score: 0.6 - index * 0.001,
+  }));
+  let offered: string[] = [];
+  const internal = service as unknown as {
+    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    searchDense: () => Promise<typeof dense>;
+    rerank: (query: string, candidates: typeof dense) => Promise<typeof dense>;
+    idleTimer?: NodeJS.Timeout;
+  };
+  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.searchDense = async () => dense;
+  internal.rerank = async (_query, candidates) => {
+    offered = candidates.slice(0, 40).map((item) => item.document.sourceId);
+    return candidates;
+  };
+  try {
+    await service.search('a plot description', {});
+    assert.ok(offered.includes('0'));
+    assert.ok(offered.includes('50'));
+    assert.equal(embeddingCalls, 1);
+  } finally {
+    if (internal.idleTimer) clearTimeout(internal.idleTimer);
+  }
+});
+
+it('does not boost a popular but irrelevant result as much as a relevant one', async () => {
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      return [[1, 0]];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const dense = [
+    {
+      document: {
+        ...document,
+        sourceId: 'unrelated',
+        voteCount: 5000,
+        voteAverage: 10,
+      },
+      score: 0.5,
+    },
+    {
+      document: { ...document, sourceId: 'relevant', voteCount: 5000 },
+      score: 0.5,
+    },
+  ];
+  const internal = service as unknown as {
+    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    searchDense: () => Promise<typeof dense>;
+    rerank: () => Promise<
+      ((typeof dense)[number] & { relevanceScore: number })[]
+    >;
+    idleTimer?: NodeJS.Timeout;
+  };
+  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.searchDense = async () => dense;
+  internal.rerank = async () =>
+    dense.map((item, index) => ({
+      ...item,
+      score: 0.05,
+      reranked: true,
+      relevanceScore: index === 1 ? 0.95 : 0.05,
+    }));
+  try {
+    const result = await service.search('a plot description', {});
+    assert.equal(result[0].document.sourceId, 'relevant');
+  } finally {
+    if (internal.idleTimer) clearTimeout(internal.idleTimer);
+  }
+});
+
+it('keeps a highly relevant obscure result ahead of an unrelated popular result', async () => {
+  const settings = getSettings().main;
+  const original = settings.smartSearchRerank;
+  settings.smartSearchRerank = true;
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      return [[1, 0]];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const dense = [
+    {
+      document: {
+        ...document,
+        sourceId: 'relevant',
+        title: 'Relevant',
+        voteCount: 0,
+      },
+      score: 0.8,
+    },
+    {
+      document: {
+        ...document,
+        sourceId: 'unrelated',
+        title: 'Unrelated',
+        voteCount: 10000,
+      },
+      score: 0.7,
+    },
+  ];
+  const internal = service as unknown as {
+    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    searchDense: () => Promise<typeof dense>;
+    reranker: { phase: string; rerank: () => Promise<number[]> };
+    idleTimer?: NodeJS.Timeout;
+    rerankerIdle?: NodeJS.Timeout;
+  };
+  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.searchDense = async () => dense;
+  internal.reranker = {
+    phase: 'ready',
+    async rerank() {
+      return [0.95, 0.01];
+    },
+  };
+  try {
+    const results = await service.search('a plot description', {});
+    assert.equal(results[0].document.sourceId, 'relevant');
+    assert.equal(results[0].reranked, true);
+  } finally {
+    settings.smartSearchRerank = original;
+    if (internal.idleTimer) clearTimeout(internal.idleTimer);
+    if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
+  }
+});
+
+it('keeps deeper audience candidates out when reranking is disabled or fails', async () => {
+  const settings = getSettings().main;
+  const original = settings.smartSearchRerank;
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      return [[1, 0]];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const dense = Array.from({ length: 70 }, (_, index) => ({
+    document: {
+      ...document,
+      sourceId: String(index),
+      voteCount: index === 50 ? 10000 : 0,
+    },
+    score: index === 0 ? 0.8 : 0.6 - index * 0.001,
+  }));
+  const internal = service as unknown as {
+    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    searchDense: () => Promise<typeof dense>;
+    reranker: { phase: string; rerank: () => Promise<number[]> };
+    idleTimer?: NodeJS.Timeout;
+    rerankerIdle?: NodeJS.Timeout;
+  };
+  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.searchDense = async () => dense;
+  internal.reranker = {
+    phase: 'ready',
+    async rerank() {
+      throw new Error('unavailable');
+    },
+  };
+  try {
+    for (const enabled of [false, true]) {
+      settings.smartSearchRerank = enabled;
+      const results = await service.search('a plot description', {});
+      assert.equal(results[0].document.sourceId, '0');
+      assert.equal(results.length, 30);
+      assert.ok(!results.some((item) => item.document.sourceId === '50'));
+    }
+  } finally {
+    settings.smartSearchRerank = original;
+    if (internal.idleTimer) clearTimeout(internal.idleTimer);
+    if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
+  }
+});
+
+it('uses ratings only to resolve close library-recommendation matches', async () => {
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      return [];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const internal = service as unknown as {
+    store: { find: () => Promise<{ document: SmartDocument; vector: Buffer }> };
+    searchDense: () => Promise<{ document: SmartDocument; score: number }[]>;
+  };
+  internal.store = {
+    async find() {
+      return {
+        document: { ...document, sourceId: 'seed' },
+        vector: quantize([1, 0]),
+      };
+    },
+  };
+  internal.searchDense = async () => [
+    {
+      document: {
+        ...document,
+        sourceId: 'lower',
+        voteAverage: 5,
+        voteCount: 1000,
+      },
+      score: 0.8,
+    },
+    {
+      document: {
+        ...document,
+        sourceId: 'higher',
+        voteAverage: 9,
+        voteCount: 1000,
+      },
+      score: 0.79,
+    },
+    ...Array.from({ length: 18 }, (_, index) => ({
+      document: {
+        ...document,
+        sourceId: `other-${index}`,
+        voteAverage: 0,
+        voteCount: 0,
+      },
+      score: 0.6 - index * 0.01,
+    })),
+    {
+      document: {
+        ...document,
+        sourceId: 'weak',
+        voteAverage: 10,
+        voteCount: 10000,
+      },
+      score: 0.2,
+    },
+  ];
+  const result = await service.recommendations(
+    [{ type: 'movie', id: 'seed' }],
+    {}
+  );
+  assert.equal(result[0].document.sourceId, 'higher');
+  assert.ok(result.findIndex((item) => item.document.sourceId === 'weak') > 1);
+});
+
+it('uses an established rating to break close similar-title ties', async () => {
+  const settings = getSettings().main;
+  const original = settings.smartSearchRerank;
+  settings.smartSearchRerank = false;
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      return [];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const internal = service as unknown as {
+    store: {
+      find: () => Promise<{ document: SmartDocument; vector: Buffer }>;
+      search: () => Promise<{ document: SmartDocument; score: number }[]>;
+    };
+  };
+  internal.store = {
+    async find() {
+      return {
+        document: { ...document, sourceId: 'seed' },
+        vector: quantize([1, 0]),
+      };
+    },
+    async search() {
+      return [
+        {
+          document: {
+            ...document,
+            sourceId: 'lower',
+            voteAverage: 5,
+            voteCount: 1000,
+          },
+          score: 0.5,
+        },
+        {
+          document: {
+            ...document,
+            sourceId: 'higher',
+            voteAverage: 9,
+            voteCount: 1000,
+          },
+          score: 0.5,
+        },
+      ];
+    },
+  };
+  try {
+    const result = await service.similar('movie', 'seed', {});
+    assert.equal(result[0].document.sourceId, 'higher');
+  } finally {
+    settings.smartSearchRerank = original;
+  }
+});
+
+it('keeps a stronger obscure similar title ahead of a weaker popular one', async () => {
+  const settings = getSettings().main;
+  const original = settings.smartSearchRerank;
+  settings.smartSearchRerank = false;
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      return [];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const internal = service as unknown as {
+    store: {
+      find: () => Promise<{ document: SmartDocument; vector: Buffer }>;
+      search: () => Promise<{ document: SmartDocument; score: number }[]>;
+    };
+  };
+  internal.store = {
+    async find() {
+      return {
+        document: { ...document, sourceId: 'seed' },
+        vector: quantize([1, 0]),
+      };
+    },
+    async search() {
+      return [
+        {
+          document: {
+            ...document,
+            sourceId: 'relevant',
+            voteAverage: 0,
+            voteCount: 0,
+          },
+          score: 0.56,
+        },
+        {
+          document: {
+            ...document,
+            sourceId: 'weak',
+            voteAverage: 9,
+            voteCount: 10000,
+          },
+          score: 0.5,
+        },
+      ];
+    },
+  };
+  try {
+    const result = await service.similar('movie', 'seed', {});
+    assert.equal(result[0].document.sourceId, 'relevant');
+  } finally {
+    settings.smartSearchRerank = original;
   }
 });
 

@@ -7,6 +7,7 @@ export interface SmartMatch {
   document: SmartDocument;
   score: number;
   reranked?: boolean;
+  relevanceScore?: number;
   methods?: (
     | 'semantic'
     | 'lexical'

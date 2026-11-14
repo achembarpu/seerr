@@ -92,6 +92,54 @@ export function fuseSmartCandidates(
     .map(({ item, rank }) => ({ ...item, score: rank }));
 }
 
+const relevanceStrength = (score: number) =>
+  Math.min(1, Math.max(0, (score - 0.3) / 0.7));
+
+/** Prefer a similar format and established titles when plot similarity is close. */
+export function relatedPrior(
+  seed: SmartDocument,
+  candidate: SmartDocument,
+  similarity = 1
+) {
+  const sourceGenres = new Set(seed.genreIds);
+  const targetGenres = new Set(candidate.genreIds);
+  const bothKnown = sourceGenres.size > 0 && targetGenres.size > 0;
+  const overlap = [...sourceGenres].filter((genre) =>
+    targetGenres.has(genre)
+  ).length;
+  const genreSimilarity = bothKnown
+    ? (2 * overlap) / (sourceGenres.size + targetGenres.size)
+    : 0;
+  const audience = Math.min(
+    1,
+    Math.log1p(Math.max(0, candidate.voteCount)) / Math.log(10001)
+  );
+  const documentaryMismatch =
+    bothKnown && sourceGenres.has(99) !== targetGenres.has(99);
+  const animationMismatch =
+    bothKnown && sourceGenres.has(16) !== targetGenres.has(16);
+  return (
+    0.05 * genreSimilarity +
+    0.08 * audience * relevanceStrength(similarity) -
+    (documentaryMismatch ? 0.15 : 0) -
+    (animationMismatch ? 0.04 : 0)
+  );
+}
+
+/** Shrink noisy ratings toward the catalog average; missing ratings are neutral. */
+export function ratingEvidence(candidate: SmartDocument): number {
+  const { voteAverage, voteCount } = candidate;
+  if (
+    !Number.isFinite(voteAverage) ||
+    !Number.isFinite(voteCount) ||
+    voteAverage <= 0 ||
+    voteCount <= 0
+  )
+    return 0;
+  const confidence = voteCount / (voteCount + 250);
+  return Math.max(-1, Math.min(1, (voteAverage - 6.7) / 3.3)) * confidence;
+}
+
 export class SmartSearchService {
   constructor(
     private readonly enabled: () => boolean = () =>
@@ -263,7 +311,11 @@ export class SmartSearchService {
       this.rerankerError = undefined;
       this.rerankerRetryAt = 0;
       const baseline = prefix.map(
-        (item): SmartMatch => ({ ...item, reranked: true })
+        (item, index): SmartMatch => ({
+          ...item,
+          reranked: true,
+          relevanceScore: scores[index],
+        })
       );
       const ranked = baseline
         .map((item, i) => ({ ...item, score: scores[i] }))
@@ -779,11 +831,41 @@ export class SmartSearchService {
           ...extras.slice(0, Math.max(0, 30 - protectedItems.length)),
         ].map(key)
       );
+      const audienceKeys = new Set(
+        denseMatches
+          .filter((item) => !firstPageKeys.has(key(item)))
+          .map((item) => ({
+            item,
+            rank:
+              item.score +
+              0.1 *
+                Math.min(
+                  1,
+                  Math.log1p(Math.max(0, item.document.voteCount)) /
+                    Math.log(10001)
+                ),
+          }))
+          .sort((a, b) => b.rank - a.rank)
+          .slice(0, 10)
+          .map(({ item }) => key(item))
+      );
       const candidates = [
         ...fused.filter((item) => firstPageKeys.has(key(item))),
-        ...fused.filter((item) => !firstPageKeys.has(key(item))),
+        ...fused.filter((item) => audienceKeys.has(key(item))),
+        ...fused.filter(
+          (item) =>
+            !firstPageKeys.has(key(item)) && !audienceKeys.has(key(item))
+        ),
       ].slice(0, 100);
       const reranked = await this.rerank(query, candidates);
+      if (!reranked.some((item) => item.reranked)) {
+        // The deeper audience-selected candidates are safe to promote only
+        // after the reranker has assessed them. Keep the original retrieval
+        // order when the model is disabled, busy, starting, or failed.
+        return candidates
+          .filter((item) => firstPageKeys.has(key(item)))
+          .slice(0, 30);
+      }
       // Audience evidence only nudges a relevance ranking; it is capped so
       // unrated and less-known work remains eligible. These scores are ranks,
       // not calibrated probabilities.
@@ -793,26 +875,20 @@ export class SmartSearchService {
           order,
           rank:
             item.score +
-            0.012 *
+            0.03 *
+              relevanceStrength(item.relevanceScore ?? 0) *
               Math.min(
                 1,
                 Math.log1p(Math.max(0, item.document.voteCount)) /
                   Math.log(5001)
-              ),
+              ) +
+            0.004 *
+              ratingEvidence(item.document) *
+              relevanceStrength(item.relevanceScore ?? 0),
         }))
         .sort((a, b) => b.rank - a.rank || a.order - b.order)
         .map(({ item, rank }) => ({ ...item, score: rank }));
-      const mandatory = ranked.filter((item) => protectedKeys.has(key(item)));
-      const supplemental = ranked.filter(
-        (item) => !protectedKeys.has(key(item))
-      );
-      const selected = new Set(
-        [
-          ...mandatory,
-          ...supplemental.slice(0, Math.max(0, 30 - mandatory.length)),
-        ].map(key)
-      );
-      return ranked.filter((item) => selected.has(key(item))).slice(0, 30);
+      return ranked.slice(0, 30);
     } finally {
       this.unloadWhenIdle();
     }
@@ -867,12 +943,18 @@ export class SmartSearchService {
         : undefined;
     const local =
       seed && this.store
-        ? await this.searchDense(seed.vector, applied, 80).catch(() => [])
+        ? await this.searchDense(seed.vector, applied, 250).catch(() => [])
         : [];
     const remote = (await remotePromise)
       .filter((doc) => matchesFilters(doc, applied))
       .slice(0, 24);
-    let related = remote;
+    let related: { doc: SmartDocument; score: number }[] = remote.map(
+      (doc, index) => ({ doc, score: 1 - index / 100 })
+    );
+    const relatedScore = (doc: SmartDocument, similarity: number) =>
+      similarity +
+      (seed ? relatedPrior(seed.document, doc, similarity) : 0) +
+      0.02 * ratingEvidence(doc) * relevanceStrength(similarity);
     if (seed && remote.length && this.engine.phase === 'ready') {
       try {
         // Score a small remote candidate pool in the same vector space as the
@@ -885,25 +967,30 @@ export class SmartSearchService {
           related = remote
             .map((doc, index) => ({
               doc,
-              score: cosine(seed.vector, quantize(embeddings[index])),
+              score: relatedScore(
+                doc,
+                cosine(seed.vector, quantize(embeddings[index]))
+              ),
             }))
-            .sort((a, b) => b.score - a.score)
-            .map(({ doc }) => doc);
+            .sort((a, b) => b.score - a.score);
       } catch {
         /* Local and TMDB ordering remain available if inference is busy. */
       }
     }
-    const localMatches = local.map((item) => ({
-      ...item,
-      methods: ['semantic'] as SmartMatch['methods'],
-    }));
-    const remoteMatches = related.map((document) => ({
+    const localMatches = local
+      .map((item) => ({ item, rank: relatedScore(item.document, item.score) }))
+      .sort((a, b) => b.rank - a.rank)
+      .map(({ item }) => ({
+        ...item,
+        methods: ['semantic'] as SmartMatch['methods'],
+      }));
+    const remoteMatches = related.map(({ doc: document }) => ({
       document,
       score: 0,
       methods: ['tmdb-similar'] as SmartMatch['methods'],
     }));
     const candidates = fuseSmartCandidates(
-      [localMatches, localMatches, remoteMatches],
+      [localMatches, remoteMatches],
       80
     ).filter(
       (item) =>
@@ -956,11 +1043,23 @@ export class SmartSearchService {
           }))
       );
     }
-    return fuseSmartCandidates(pools, 60)
-      .filter(
-        (item) =>
-          !exclude.has(`${item.document.mediaType}:${item.document.sourceId}`)
-      )
+    const candidates = fuseSmartCandidates(pools, 60).filter(
+      (item) =>
+        !exclude.has(`${item.document.mediaType}:${item.document.sourceId}`)
+    );
+    const bestScore = candidates[0]?.score ?? 0;
+    return candidates
+      .map((item, order) => ({
+        item,
+        order,
+        rank:
+          item.score +
+          0.002 *
+            ratingEvidence(item.document) *
+            relevanceStrength(bestScore ? item.score / bestScore : 0),
+      }))
+      .sort((a, b) => b.rank - a.rank || a.order - b.order)
+      .map(({ item }) => item)
       .slice(0, 30);
   }
 
