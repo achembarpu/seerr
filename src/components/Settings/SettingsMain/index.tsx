@@ -19,6 +19,7 @@ import { ArrowPathIcon } from '@heroicons/react/24/solid';
 import type { UserSettingsGeneralResponse } from '@server/interfaces/api/userSettingsInterfaces';
 import type { SearchIndexStatus } from '@server/lib/searchIndex/service';
 import type { MainSettings } from '@server/lib/settings';
+import type { SmartSearchService } from '@server/lib/smartSearch/service';
 import type { AvailableLocale } from '@server/types/languages';
 import axios from 'axios';
 import { Field, Form, Formik } from 'formik';
@@ -83,6 +84,14 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   searchIndexRefresh: 'Refresh now',
   searchIndexRefreshFailed: 'Could not start the search index refresh.',
   searchIndexStatusFailed: 'Could not load the search index status.',
+  smartSearch: 'Local smart search',
+  smartSearchTip:
+    'Download a 119 MB embedding model and build a local TMDB discovery index in the background. The index uses additional disk space and CPU. Save settings to apply.',
+  smartSearchStatus: 'Status: {phase}; indexed titles: {count}',
+  smartSearchDownload: 'Downloading model: {percent}%',
+  smartSearchProgress: 'Indexing {mediaType} from {year}, page {page}',
+  smartSearchRefreshFailed: 'Could not start smart search refresh.',
+
   cacheImages: 'Enable Image Caching',
   cacheImagesTip:
     'Cache externally sourced images (requires a significant amount of disk space)',
@@ -124,6 +133,12 @@ const SettingsMain = () => {
       revalidateOnFocus: false,
     }
   );
+  const { data: smartStatus, mutate: refreshSmartStatus } = useSWR<
+    ReturnType<SmartSearchService['status']>
+  >(data?.smartSearch ? '/api/v1/settings/smart-search' : null, {
+    refreshInterval: 3000,
+    revalidateOnFocus: false,
+  });
   const sourceLabels = {
     imdb: messages.searchIndexImdb,
     'imdb-ratings': messages.searchIndexRatings,
@@ -216,6 +231,7 @@ const SettingsMain = () => {
             partialRequestsEnabled: data?.partialRequestsEnabled,
             enableSpecialEpisodes: data?.enableSpecialEpisodes,
             localTitleSearch: data?.localTitleSearch,
+            smartSearch: data?.smartSearch,
             cacheImages: data?.cacheImages,
             youtubeUrl: data?.youtubeUrl,
             versionCheck: data?.versionCheck,
@@ -241,6 +257,7 @@ const SettingsMain = () => {
                 partialRequestsEnabled: values.partialRequestsEnabled,
                 enableSpecialEpisodes: values.enableSpecialEpisodes,
                 localTitleSearch: values.localTitleSearch,
+                smartSearch: values.smartSearch,
                 cacheImages: values.cacheImages,
                 youtubeUrl: values.youtubeUrl,
                 versionCheck: values?.versionCheck,
@@ -472,6 +489,84 @@ const SettingsMain = () => {
                           </Button>
                         </>
                       )}
+                    </div>
+                  </div>
+                )}
+                <div className="form-row">
+                  <label htmlFor="smartSearch" className="checkbox-label">
+                    {intl.formatMessage(messages.smartSearch)}
+                    <span className="label-tip">
+                      {intl.formatMessage(messages.smartSearchTip)}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      type="checkbox"
+                      id="smartSearch"
+                      name="smartSearch"
+                      onChange={() =>
+                        setFieldValue('smartSearch', !values.smartSearch)
+                      }
+                    />
+                  </div>
+                </div>
+                {data?.smartSearch && smartStatus && (
+                  <div className="form-row">
+                    <div className="form-input-area">
+                      <p className="mb-1 text-sm text-gray-300">
+                        {intl.formatMessage(messages.smartSearchStatus, {
+                          phase: smartStatus.phase,
+                          count: smartStatus.count,
+                        })}
+                      </p>
+                      {smartStatus.phase === 'downloading' && (
+                        <p className="mb-1 text-sm text-gray-300">
+                          {intl.formatMessage(messages.smartSearchDownload, {
+                            percent: Math.min(
+                              100,
+                              Math.round(
+                                (smartStatus.downloadBytes * 100) /
+                                  smartStatus.downloadTotal
+                              )
+                            ),
+                          })}
+                        </p>
+                      )}
+                      {smartStatus.cursor && (
+                        <p className="mb-1 text-sm text-gray-300">
+                          {intl.formatMessage(
+                            messages.smartSearchProgress,
+                            smartStatus.cursor
+                          )}
+                        </p>
+                      )}
+                      {smartStatus.error && (
+                        <p className="mb-2 text-sm text-red-400">
+                          {smartStatus.error}
+                        </p>
+                      )}
+                      <Button
+                        type="button"
+                        buttonSize="sm"
+                        disabled={smartStatus.indexing}
+                        onClick={async () => {
+                          try {
+                            await axios.post(
+                              '/api/v1/settings/smart-search/refresh'
+                            );
+                            await refreshSmartStatus();
+                          } catch {
+                            addToast(
+                              intl.formatMessage(
+                                messages.smartSearchRefreshFailed
+                              ),
+                              { autoDismiss: true, appearance: 'error' }
+                            );
+                          }
+                        }}
+                      >
+                        {intl.formatMessage(messages.searchIndexRefresh)}
+                      </Button>
                     </div>
                   </div>
                 )}

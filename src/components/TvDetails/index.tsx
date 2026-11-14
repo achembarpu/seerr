@@ -87,6 +87,7 @@ const messages = defineMessages('components.TvDetails', {
   cast: 'Cast',
   recommendations: 'Recommendations',
   similar: 'Similar Series',
+  smartSimilar: 'Similar by description',
   watchtrailer: 'Watch Trailer',
   overviewunavailable: 'Overview unavailable.',
   originaltitle: 'Original Title',
@@ -1389,6 +1390,15 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
             ))}
           />
         </>
+      )}
+      {settings.currentSettings.smartSearch && (
+        <MediaSlider
+          sliderKey="smart-similar"
+          title={intl.formatMessage(messages.smartSimilar)}
+          url="/api/v1/search/smart/similar"
+          extraParams={`mediaType=tv&id=${router.query.tvId}`}
+          hideWhenEmpty
+        />
       )}
       <MediaSlider
         sliderKey="recommendations"

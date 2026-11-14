@@ -159,6 +159,7 @@ export interface MainSettings {
   youtubeUrl: string;
   versionCheck: boolean;
   localTitleSearch: boolean;
+  smartSearch: boolean;
 }
 
 export interface ProxySettings {
@@ -220,6 +221,7 @@ interface FullPublicSettings extends PublicSettings {
   youtubeUrl: string;
   versionCheck: boolean;
   plexClientIdentifier: string;
+  smartSearch: boolean;
 }
 
 export interface NotificationAgentConfig {
@@ -438,6 +440,7 @@ class Settings {
         youtubeUrl: '',
         versionCheck: true,
         localTitleSearch: false,
+        smartSearch: false,
       },
       plex: {
         name: '',
@@ -746,6 +749,7 @@ class Settings {
       newPlexLogin: this.data.main.newPlexLogin,
       youtubeUrl: this.data.main.youtubeUrl,
       versionCheck: this.data.main.versionCheck,
+      smartSearch: this.data.main.smartSearch,
       plexClientIdentifier: this.data.clientId,
     };
   }

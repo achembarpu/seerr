@@ -36,13 +36,22 @@ RUN --mount=type=cache,id=pnpm,target=/pnpm/store CYPRESS_INSTALL_BINARY=0 pnpm 
 
 RUN pnpm build
 
+# Build the local embedding runtime; model weights are downloaded on opt-in.
+FROM alpine:3.23 AS smart-search-runtime
+RUN apk add --no-cache git cmake make g++ linux-headers
+RUN git clone --filter=blob:none --no-checkout https://github.com/ggml-org/llama.cpp.git /llama && \
+  cd /llama && git checkout 32bdc3a89e6528d3e419024c833c5dabf32c7541 && \
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+    -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF && \
+  cmake --build build --target llama-server -j 2 && strip build/bin/llama-server
+
 FROM node:22.23.5-alpine3.23@sha256:6868d4695b947ee120bffaa463fecd68cde370d7bfec92955e7c8ac576b4f475
 ARG SOURCE_DATE_EPOCH
 ARG COMMIT_TAG
 ENV NODE_ENV=production
 ENV COMMIT_TAG=${COMMIT_TAG}
 
-RUN apk add --no-cache tzdata
+RUN apk add --no-cache tzdata libstdc++
 
 USER node:node
 
@@ -70,6 +79,7 @@ COPY --chown=node:node --from=prod-deps \
   /app/node_modules ./node_modules
 COPY --chown=node:node --from=build --exclude=cache --exclude=**/*.map /app/.next ./.next
 COPY --chown=node:node --from=build /app/dist ./dist
+COPY --from=smart-search-runtime /llama/build/bin/llama-server /usr/local/bin/llama-server
 
 RUN touch config/DOCKER && \
   echo "{\"commitTag\": \"${COMMIT_TAG}\"}" > committag.json

@@ -2,6 +2,7 @@ import Header from '@app/components/Common/Header';
 import ListView from '@app/components/Common/ListView';
 import PageTitle from '@app/components/Common/PageTitle';
 import useDiscover from '@app/hooks/useDiscover';
+import useSettings from '@app/hooks/useSettings';
 import ErrorPage from '@app/pages/_error';
 import defineMessages from '@app/utils/defineMessages';
 import type {
@@ -12,6 +13,7 @@ import type {
 import { useRouter } from 'next/router';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
+import SmartSearch from './SmartSearch';
 
 const messages = defineMessages('components.Search', {
   search: 'Search',
@@ -24,6 +26,7 @@ const messages = defineMessages('components.Search', {
 const Search = () => {
   const intl = useIntl();
   const router = useRouter();
+  const settings = useSettings();
 
   const {
     isLoadingInitialData,
@@ -65,6 +68,7 @@ const Search = () => {
   return (
     <>
       <PageTitle title={intl.formatMessage(messages.search)} />
+      {settings.currentSettings.smartSearch && <SmartSearch query={query} />}
       {suggestions.length > 0 && (
         <>
           <div className="mb-5 mt-1">

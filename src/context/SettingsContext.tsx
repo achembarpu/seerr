@@ -33,6 +33,7 @@ const defaultSettings = {
   newPlexLogin: true,
   youtubeUrl: '',
   versionCheck: true,
+  smartSearch: false,
   plexClientIdentifier: '',
 };
 

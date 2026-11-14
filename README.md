@@ -82,3 +82,13 @@ You can help improve Seerr too! Check out our [Contribution Guide](./CONTRIBUTIN
 
 [![Become a Backer](https://opencollective.com/seerr/backers.svg)](https://opencollective.com/seerr/#backers)
 [![Become a Sponsor](https://opencollective.com/seerr/sponsors.svg)](https://opencollective.com/seerr/#sponsors)
+
+## Local smart search
+
+Administrators can enable Local smart search in General Settings. Seerr downloads a pinned 119 MB multilingual embedding model, verifies its SHA-256 hash, then builds a separate local index of TMDB movie and series descriptions. The initial scan works from recent years backwards and can take a long time, use substantial CPU and network traffic, and require significant disk space. Search becomes available as titles are indexed. Titles without a release/first-air date or usable description are not included. English descriptions are preferred, with original-language descriptions used when English is unavailable.
+
+Open **Smart search** on the search page to search descriptions and filter by type, genre, original-language code, year, TMDB rating, and vote count. Recommendations use only the signed-in user's recent requests. Movie and series pages also show matches similar by description. These suggestions are based on indexed metadata, so coverage and relevance vary; normal search remains available.
+
+After the initial scan, the index checks TMDB change lists daily and only re-embeds changed descriptions. If a refresh is interrupted, Seerr resumes from its checkpoint. Change-list requests cover one day at a time, so refresh can resume after interruptions without requesting an oversized date range. Settings show progress and errors and provide a manual refresh. Disabling the feature stops indexing and the model process but retains the model and rebuildable index. The model process unloads after 15 minutes of inactivity.
+
+The Docker images build the local `llama-server` CPU runtime. For a development installation outside Docker, install a compatible llama.cpp `llama-server` on the PATH or set `SEERR_LLAMA_SERVER` to its executable; this branch was tested with llama.cpp commit `32bdc3a89e6528d3e419024c833c5dabf32c7541`. `SEERR_LLAMA_GPU_LAYERS` can be set when using a compatible GPU-enabled runtime; the packaged image defaults to CPU. Model weights and movie metadata are downloaded only after the feature is enabled. TMDB's applicable terms and access permissions remain the user's responsibility.

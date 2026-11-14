@@ -37,6 +37,8 @@ export class EmbeddingEngine {
   private process?: ChildProcess;
   private starting?: Promise<void>;
   private baseUrl = '';
+  // Do not pass local inference traffic through the configured outbound proxy.
+  private readonly local = axios.create({ proxy: false });
   private readonly key = randomBytes(24).toString('hex');
   downloadBytes = 0;
   downloadTotal = 118639520;
@@ -127,11 +129,15 @@ export class EmbeddingEngine {
       { stdio: 'ignore' }
     );
     this.process = child;
+    const stopChild = () => child.kill();
+    process.once('exit', stopChild);
     let failure: Error | undefined;
     child.once('error', (error) => {
+      process.removeListener('exit', stopChild);
       failure = error;
     });
     child.once('exit', (code) => {
+      process.removeListener('exit', stopChild);
       if (this.process === child) {
         this.process = undefined;
         this.phase = 'idle';
@@ -143,7 +149,7 @@ export class EmbeddingEngine {
         signal.throwIfAborted();
         if (failure) throw failure;
         try {
-          await axios.get(`${this.baseUrl}/health`, {
+          await this.local.get(`${this.baseUrl}/health`, {
             timeout: 1000,
             headers: { Authorization: `Bearer ${this.key}` },
             proxy: false,
@@ -165,7 +171,7 @@ export class EmbeddingEngine {
 
   async embed(texts: string[]): Promise<number[][]> {
     if (this.phase !== 'ready') throw new Error('Embedding model is not ready');
-    const response = await axios.post<{
+    const response = await this.local.post<{
       data: { embedding: number[]; index: number }[];
     }>(
       `${this.baseUrl}/v1/embeddings`,

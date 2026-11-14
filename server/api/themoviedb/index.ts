@@ -709,21 +709,89 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     }
   }
 
+  /** Avoid evicting interactive TMDB cache entries during a catalog scan. */
+  public async getSmartDiscover({
+    mediaType,
+    from,
+    to,
+    page,
+    signal,
+  }: {
+    mediaType: 'movie' | 'tv';
+    from: string;
+    to: string;
+    page: number;
+    signal?: AbortSignal;
+  }): Promise<TmdbSearchMovieResponse | TmdbSearchTvResponse> {
+    const dateField =
+      mediaType === 'movie' ? 'primary_release_date' : 'first_air_date';
+    const response = await this.axios.get<
+      TmdbSearchMovieResponse | TmdbSearchTvResponse
+    >(`/discover/${mediaType}`, {
+      signal,
+      timeout: 30000,
+      params: {
+        page,
+        language: 'en-US',
+        sort_by: 'popularity.desc',
+        include_adult: false,
+        include_video: false,
+        [`${dateField}.gte`]: from,
+        [`${dateField}.lte`]: to,
+      },
+    });
+    return response.data;
+  }
+
+  public async getSmartMovieDetails(
+    id: number,
+    language: string,
+    signal?: AbortSignal
+  ): Promise<TmdbMovieSearchDetails> {
+    return (
+      await this.axios.get<TmdbMovieSearchDetails>(`/movie/${id}`, {
+        signal,
+        timeout: 30000,
+        params: { language },
+      })
+    ).data;
+  }
+
+  public async getSmartTvDetails(
+    id: number,
+    language: string,
+    signal?: AbortSignal
+  ): Promise<TmdbTvSearchDetails> {
+    return (
+      await this.axios.get<TmdbTvSearchDetails>(`/tv/${id}`, {
+        signal,
+        timeout: 30000,
+        params: { language },
+      })
+    ).data;
+  }
+
   /** IDs changed in a bounded TMDB change-list window. */
   public async getMediaChanges({
     mediaType,
     startDate,
     endDate,
     page,
+    signal,
   }: {
     mediaType: 'movie' | 'tv';
     startDate: string;
     endDate: string;
     page: number;
+    signal?: AbortSignal;
   }): Promise<{ results: { id: number }[]; total_pages: number }> {
     return this.get(
       `/${mediaType}/changes`,
-      { params: { start_date: startDate, end_date: endDate, page } },
+      {
+        signal,
+        timeout: 30000,
+        params: { start_date: startDate, end_date: endDate, page },
+      },
       0
     );
   }

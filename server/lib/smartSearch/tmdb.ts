@@ -5,7 +5,9 @@ import type {
 } from '@server/api/themoviedb/interfaces';
 import {
   mapMovieDetailsToResult,
+  mapMovieResult,
   mapTvDetailsToResult,
+  mapTvResult,
 } from '@server/models/Search';
 import type { MetadataSource, SmartDocument, SmartMediaType } from './types';
 
@@ -37,49 +39,46 @@ export class TmdbMetadataSource implements MetadataSource {
       voteAverage: item.vote_average ?? 0,
       voteCount: item.vote_count ?? 0,
       popularity: item.popularity ?? 0,
-      card: { ...item, media_type: mediaType },
+      card: (mediaType === 'movie'
+        ? mapMovieResult(item as TmdbMovieResult)
+        : mapTvResult(item as TmdbTvResult)) as unknown as Record<
+        string,
+        unknown
+      >,
     };
+  }
+
+  private async load(
+    mediaType: SmartMediaType,
+    id: number,
+    language: string,
+    signal?: AbortSignal
+  ): Promise<TmdbMovieResult | TmdbTvResult> {
+    return mediaType === 'movie'
+      ? mapMovieDetailsToResult(
+          await this.tmdb.getSmartMovieDetails(id, language, signal)
+        )
+      : mapTvDetailsToResult(
+          await this.tmdb.getSmartTvDetails(id, language, signal)
+        );
   }
 
   async fetchOne(
     mediaType: SmartMediaType,
-    id: string
+    id: string,
+    signal?: AbortSignal
   ): Promise<SmartDocument | undefined> {
     const number = Number(id);
-    const item =
-      mediaType === 'movie'
-        ? mapMovieDetailsToResult(
-            await this.tmdb.getMovieSearchDetails({
-              movieId: number,
-              language: 'en-US',
-            })
-          )
-        : mapTvDetailsToResult(
-            await this.tmdb.getTvSearchDetails({
-              tvId: number,
-              language: 'en-US',
-            })
-          );
+    const item = await this.load(mediaType, number, 'en-US', signal);
     if (
       !item.overview?.trim() &&
       item.original_language &&
       item.original_language !== 'en'
     ) {
-      const translated =
-        mediaType === 'movie'
-          ? mapMovieDetailsToResult(
-              await this.tmdb.getMovieSearchDetails({
-                movieId: number,
-                language: item.original_language,
-              })
-            )
-          : mapTvDetailsToResult(
-              await this.tmdb.getTvSearchDetails({
-                tvId: number,
-                language: item.original_language,
-              })
-            );
-      return this.document(translated, mediaType);
+      return this.document(
+        await this.load(mediaType, number, item.original_language, signal),
+        mediaType
+      );
     }
     return this.document(item, mediaType);
   }
@@ -88,13 +87,15 @@ export class TmdbMetadataSource implements MetadataSource {
     mediaType: SmartMediaType,
     from: string,
     to: string,
-    page: number
+    page: number,
+    signal?: AbortSignal
   ): Promise<{ ids: string[]; totalPages: number }> {
     const response = await this.tmdb.getMediaChanges({
       mediaType,
       startDate: from,
       endDate: to,
       page,
+      signal,
     });
     return {
       ids: response.results.map((item) => String(item.id)),
@@ -106,27 +107,19 @@ export class TmdbMetadataSource implements MetadataSource {
     mediaType: SmartMediaType,
     dateFrom: string,
     dateTo: string,
-    page: number
+    page: number,
+    signal?: AbortSignal
   ): Promise<{ documents: SmartDocument[]; totalPages: number }> {
-    const response =
-      mediaType === 'movie'
-        ? await this.tmdb.getDiscoverMovies({
-            page,
-            language: 'en-US',
-            originalLanguage: 'all',
-            primaryReleaseDateGte: dateFrom,
-            primaryReleaseDateLte: dateTo,
-            includeVideo: false,
-          })
-        : await this.tmdb.getDiscoverTv({
-            page,
-            language: 'en-US',
-            originalLanguage: 'all',
-            firstAirDateGte: dateFrom,
-            firstAirDateLte: dateTo,
-          });
+    const response = await this.tmdb.getSmartDiscover({
+      mediaType,
+      from: dateFrom,
+      to: dateTo,
+      page,
+      signal,
+    });
     const documents: SmartDocument[] = [];
     for (const item of response.results) {
+      if ('adult' in item && item.adult) continue;
       let document = this.document(item, mediaType);
       if (
         !document &&
@@ -134,7 +127,21 @@ export class TmdbMetadataSource implements MetadataSource {
         item.original_language &&
         item.original_language !== 'en'
       ) {
-        document = await this.fetchOne(mediaType, String(item.id));
+        try {
+          document = this.document(
+            await this.load(mediaType, item.id, item.original_language, signal),
+            mediaType
+          );
+        } catch (error) {
+          if (
+            typeof error !== 'object' ||
+            error === null ||
+            !('response' in error) ||
+            (error as { response?: { status?: number } }).response?.status !==
+              404
+          )
+            throw error;
+        }
       }
       if (document) documents.push(document);
     }

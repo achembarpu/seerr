@@ -43,6 +43,8 @@ export const documentText = (document: SmartDocument): string => {
     .join(', ');
   return Array.from(
     `${labels ? `Genres: ${labels}. ` : ''}${document.overview}`
+      .replace(/\s+/gu, ' ')
+      .trim()
   )
     .slice(0, 450)
     .join('');
@@ -145,22 +147,6 @@ export class SmartStore {
       ON CONFLICT(source, sourceId, mediaType) DO UPDATE SET language=excluded.language, year=excluded.year, voteAverage=excluded.voteAverage, voteCount=excluded.voteCount, genres=excluded.genres, hash=excluded.hash, vector=excluded.vector, document=excluded.document
       WHERE smart_documents.hash != excluded.hash OR smart_documents.document != excluded.document`,
       params
-    );
-  }
-  async updateMetadata(document: SmartDocument): Promise<void> {
-    await this.run(
-      'UPDATE smart_documents SET language=?, year=?, voteAverage=?, voteCount=?, genres=?, document=? WHERE source=? AND sourceId=? AND mediaType=?',
-      [
-        document.originalLanguage,
-        document.year,
-        document.voteAverage,
-        document.voteCount,
-        JSON.stringify(document.genreIds),
-        JSON.stringify(document),
-        document.source,
-        document.sourceId,
-        document.mediaType,
-      ]
     );
   }
   async remove(

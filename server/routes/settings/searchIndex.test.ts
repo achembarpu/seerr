@@ -35,3 +35,16 @@ describe('search index settings API', () => {
       .expect(409);
   });
 });
+
+describe('smart search settings API', () => {
+  it('reports disabled status and refuses refresh through the OpenAPI validator', async () => {
+    const response = await request(app)
+      .get('/api/v1/settings/smart-search')
+      .expect(200);
+    assert.equal(response.body.enabled, false);
+    assert.equal(response.body.phase, 'idle');
+    await request(app)
+      .post('/api/v1/settings/smart-search/refresh')
+      .expect(409);
+  });
+});

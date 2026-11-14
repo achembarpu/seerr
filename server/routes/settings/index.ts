@@ -24,6 +24,7 @@ import { plexFullScanner } from '@server/lib/scanners/plex';
 import searchIndex from '@server/lib/searchIndex/service';
 import type { JobId, Library, MainSettings } from '@server/lib/settings';
 import { getSettings } from '@server/lib/settings';
+import smartSearch from '@server/lib/smartSearch/service';
 import logger from '@server/logger';
 import { isAuthenticated } from '@server/middleware/auth';
 import discoverSettingRoutes from '@server/routes/settings/discover';
@@ -85,6 +86,7 @@ settingsRoutes.post('/main', async (req, res) => {
   settings.main = merge(settings.main, req.body);
   await settings.save();
   searchIndex.start();
+  smartSearch.start();
 
   return res.status(200).json(settings.main);
 });
@@ -100,6 +102,18 @@ settingsRoutes.post('/search-index/refresh', (_req, res) => {
       .json({ message: 'Search index is disabled or already refreshing.' });
   }
   return res.status(202).json(searchIndex.status());
+});
+
+settingsRoutes.get('/smart-search', (_req, res) => {
+  res.status(200).json(smartSearch.status());
+});
+
+settingsRoutes.post('/smart-search/refresh', (_req, res) => {
+  if (!smartSearch.refreshNow())
+    return res
+      .status(409)
+      .json({ message: 'Smart search is disabled or already indexing.' });
+  return res.status(202).json(smartSearch.status());
 });
 
 settingsRoutes.get('/network', (req, res) => {

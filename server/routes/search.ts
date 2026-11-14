@@ -4,10 +4,20 @@ import type {
   TmdbSearchMultiResponse,
   TmdbTvResult,
 } from '@server/api/themoviedb/interfaces';
+import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
+import { MediaRequest } from '@server/entity/MediaRequest';
+import type { User } from '@server/entity/User';
 import { findSearchProvider } from '@server/lib/search';
 import searchIndex from '@server/lib/searchIndex/service';
+import smartSearch from '@server/lib/smartSearch/service';
+import type { SmartMatch } from '@server/lib/smartSearch/store';
+import type {
+  SmartFilters,
+  SmartMediaType,
+} from '@server/lib/smartSearch/types';
 import logger from '@server/logger';
+import type { MovieResult, TvResult } from '@server/models/Search';
 import {
   mapMovieDetailsToResult,
   mapSearchResults,
@@ -16,6 +26,118 @@ import {
 import { Router } from 'express';
 
 const searchRoutes = Router();
+
+const smartFilters = (query: Record<string, unknown>): SmartFilters => {
+  const numeric = (name: string): number | undefined => {
+    const value = query[name];
+    if (typeof value !== 'string' && typeof value !== 'number')
+      return undefined;
+    if (typeof value === 'string' && !value.trim()) return undefined;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  };
+  return {
+    mediaType:
+      query.mediaType === 'movie' || query.mediaType === 'tv'
+        ? query.mediaType
+        : undefined,
+    language:
+      typeof query.originalLanguage === 'string' && query.originalLanguage
+        ? query.originalLanguage
+        : undefined,
+    yearFrom: numeric('yearFrom'),
+    yearTo: numeric('yearTo'),
+    genre: numeric('genre'),
+    minRating: numeric('minRating'),
+    minVotes: numeric('minVotes'),
+  };
+};
+
+const smartCards = async (matches: SmartMatch[], user: User | undefined) => {
+  const cards = matches.map(
+    (match) => match.document.card as unknown as MovieResult | TvResult
+  );
+  const related = await Media.getRelatedMedia(
+    user,
+    cards.map((card) => ({ tmdbId: card.id, mediaType: card.mediaType }))
+  );
+  return cards.map((card) => ({
+    ...card,
+    mediaInfo: related.find(
+      (media) => media.tmdbId === card.id && media.mediaType === card.mediaType
+    ),
+  }));
+};
+
+searchRoutes.get('/smart', async (req, res, next) => {
+  try {
+    const query =
+      typeof req.query.query === 'string' ? req.query.query.trim() : '';
+    const status = smartSearch.status();
+    if (!query || !status.enabled || !status.count)
+      return res.status(200).json({
+        results: [],
+        enabled: status.enabled,
+        ready: status.count > 0,
+      });
+    const matches = await smartSearch.search(
+      query.slice(0, 500),
+      smartFilters(req.query)
+    );
+    const results = await smartCards(matches, req.user);
+    return res.status(200).json({ results, enabled: true, ready: true });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+searchRoutes.get('/smart/recommendations', async (req, res, next) => {
+  try {
+    if (!req.user)
+      return res.status(401).json({ message: 'User missing from request.' });
+    const requests = await getRepository(MediaRequest).find({
+      where: { requestedBy: { id: req.user.id } },
+      order: { createdAt: 'DESC' },
+      take: 10,
+    });
+    const seeds = requests
+      .filter(
+        (request) =>
+          request.media?.tmdbId &&
+          (request.media.mediaType === 'movie' ||
+            request.media.mediaType === 'tv')
+      )
+      .map((request) => ({
+        type: request.media.mediaType as SmartMediaType,
+        id: String(request.media.tmdbId),
+      }));
+    const matches = await smartSearch.recommendations(
+      seeds,
+      smartFilters(req.query)
+    );
+    const results = await smartCards(matches, req.user);
+    return res.status(200).json({ results });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+searchRoutes.get('/smart/similar', async (req, res, next) => {
+  try {
+    const type = req.query.mediaType as SmartMediaType;
+    const matches = await smartSearch.similar(
+      type,
+      String(req.query.id),
+      smartFilters(req.query)
+    );
+    const results = await smartCards(matches, req.user);
+    return res
+      .status(200)
+      .json({ page: 1, totalPages: 1, totalResults: results.length, results });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 searchRoutes.get('/suggestions', async (req, res) => {
   const query =

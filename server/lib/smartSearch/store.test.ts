@@ -86,7 +86,7 @@ describe('smart search index', () => {
       documentHash(original),
       documentHash(doc('1', { overview: 'A crime mystery' }))
     );
-    await store.updateMetadata(update);
+    await store.upsertBatch([{ document: update, vector: quantize([1, 0]) }]);
     assert.equal(
       (await store.find('tmdb', 'movie', '1'))?.document.voteAverage,
       9

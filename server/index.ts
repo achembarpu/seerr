@@ -20,6 +20,7 @@ import WebPushAgent from '@server/lib/notifications/agents/webpush';
 import checkOverseerrMerge from '@server/lib/overseerrMerge';
 import searchIndex from '@server/lib/searchIndex/service';
 import { getSettings } from '@server/lib/settings';
+import smartSearch from '@server/lib/smartSearch/service';
 import logger from '@server/logger';
 import clearCookies from '@server/middleware/clearcookies';
 import routes from '@server/routes';
@@ -157,6 +158,7 @@ app
     if (totalUsers > 0) {
       startJobs();
       searchIndex.start();
+      smartSearch.start();
     } else {
       logger.info(
         `Skipping starting the scheduled jobs as we have no Plex/Jellyfin/Emby servers setup yet`,
