@@ -1,5 +1,11 @@
 import { useEffect, useLayoutEffect, useRef } from 'react';
-import { shouldAnimateReorder, type ReorderSnapshot } from './reorderAnimation';
+import {
+  retargetReorderOrigin,
+  shouldAnimateReorder,
+  trackReorderAnimation,
+  type ReorderPosition,
+  type ReorderSnapshot,
+} from './reorderAnimation';
 
 interface Options {
   context: string;
@@ -10,7 +16,6 @@ interface Options {
   paginating: boolean;
 }
 
-type Position = { x: number; y: number };
 const useClientLayoutEffect =
   typeof window === 'undefined' ? useEffect : useLayoutEffect;
 
@@ -25,18 +30,19 @@ export const useSearchReorderAnimation = ({
 }: Options) => {
   const gridRef = useRef<HTMLUListElement>(null);
   const previous = useRef<ReorderSnapshot | undefined>(undefined);
-  const positions = useRef(new Map<string, Position>());
-  const animations = useRef<Animation[]>([]);
+  const positions = useRef(new Map<string, ReorderPosition>());
+  const animations = useRef(new Map<string, Animation>());
   const lastScroll = useRef(0);
 
   useEffect(() => {
+    const activeAnimations = animations.current;
     const onScroll = () => {
       lastScroll.current = performance.now();
     };
     window.addEventListener('scroll', onScroll, { passive: true });
     return () => {
       window.removeEventListener('scroll', onScroll);
-      animations.current.forEach((animation) => animation.cancel());
+      activeAnimations.forEach((animation) => animation.cancel());
     };
   }, []);
 
@@ -46,22 +52,6 @@ export const useSearchReorderAnimation = ({
     const nodes = Array.from(
       grid.querySelectorAll<HTMLElement>(':scope > [data-result-key]')
     );
-    // Cancel previous FLIP transforms before measuring the new layout.
-    animations.current.forEach((animation) => animation.cancel());
-    animations.current = [];
-    const gridRect = grid.getBoundingClientRect();
-    const currentPositions = new Map<string, Position>();
-    const visible = new Set<string>();
-    nodes.forEach((node) => {
-      const key = node.dataset.resultKey;
-      if (!key) return;
-      const rect = node.getBoundingClientRect();
-      currentPositions.set(key, {
-        x: rect.left - gridRect.left,
-        y: rect.top - gridRect.top,
-      });
-      if (rect.bottom >= 0 && rect.top <= window.innerHeight) visible.add(key);
-    });
     const snapshot = {
       context,
       order,
@@ -77,6 +67,60 @@ export const useSearchReorderAnimation = ({
       window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     const scrolling =
       lastScroll.current > 0 && performance.now() - lastScroll.current < 250;
+    // Revalidation that leaves the geometry unchanged should not interrupt a
+    // movement already in progress.
+    if (
+      animations.current.size &&
+      previous.current &&
+      !scrolling &&
+      !paginating &&
+      !reducedMotion &&
+      previous.current.context === context &&
+      previous.current.order === order &&
+      previous.current.regularResults === regularResults &&
+      previous.current.gridWidth === snapshot.gridWidth &&
+      previous.current.viewportWidth === snapshot.viewportWidth &&
+      previous.current.viewportHeight === snapshot.viewportHeight
+    ) {
+      previous.current = snapshot;
+      return;
+    }
+    // Preserve the old animation's visual transform before canceling. React
+    // has moved the node to its new slot, so its visual/layout delta is the
+    // transform that was applied to its previous slot.
+    const visualPositions = new Map<string, ReorderPosition>();
+    if (animations.current.size) {
+      nodes.forEach((node) => {
+        const key = node.dataset.resultKey;
+        if (!key || !animations.current.has(key)) return;
+        const rect = node.getBoundingClientRect();
+        visualPositions.set(key, { x: rect.left, y: rect.top });
+      });
+    }
+    animations.current.forEach((animation) => animation.cancel());
+    animations.current.clear();
+    const gridRect = grid.getBoundingClientRect();
+    const currentPositions = new Map<string, ReorderPosition>();
+    const visualOrigins = new Map<string, ReorderPosition>();
+    const visible = new Set<string>();
+    nodes.forEach((node) => {
+      const key = node.dataset.resultKey;
+      if (!key) return;
+      const rect = node.getBoundingClientRect();
+      currentPositions.set(key, {
+        x: rect.left - gridRect.left,
+        y: rect.top - gridRect.top,
+      });
+      const visual = visualPositions.get(key);
+      const prior = positions.current.get(key);
+      if (visual && prior) {
+        visualOrigins.set(
+          key,
+          retargetReorderOrigin(prior, visual, { x: rect.left, y: rect.top })
+        );
+      }
+      if (rect.bottom >= 0 && rect.top <= window.innerHeight) visible.add(key);
+    });
     if (
       shouldAnimateReorder(
         previous.current,
@@ -88,7 +132,8 @@ export const useSearchReorderAnimation = ({
     ) {
       nodes.forEach((node) => {
         const key = node.dataset.resultKey;
-        const before = key && positions.current.get(key);
+        const before =
+          key && (visualOrigins.get(key) ?? positions.current.get(key));
         const after = key && currentPositions.get(key);
         if (
           !key ||
@@ -102,7 +147,9 @@ export const useSearchReorderAnimation = ({
         const y = before.y - after.y;
         // Very large jumps are easier to follow without a card flying across the page.
         if (Math.abs(x) + Math.abs(y) < 1 || Math.hypot(x, y) > 800) return;
-        animations.current.push(
+        trackReorderAnimation(
+          animations.current,
+          key,
           node.animate(
             [
               { transform: `translate(${x}px, ${y}px)` },
