@@ -1,6 +1,9 @@
 import { SearchIndex } from '@server/lib/searchIndex';
 import { SearchIndexService } from '@server/lib/searchIndex/service';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 
@@ -16,7 +19,8 @@ describe('local search index lifecycle', () => {
   it('reports failures, schedules a retry, and allows a manual refresh', async () => {
     let enabled = true;
     let failMovie = true;
-    const index = new SearchIndex(':memory:');
+    const directory = await mkdtemp(path.join(tmpdir(), 'seerr-service-test-'));
+    const index = new SearchIndex(path.join(directory, 'index.sqlite3'));
     const calls: string[] = [];
     const service = new SearchIndexService(
       () => enabled,
@@ -55,6 +59,7 @@ describe('local search index lifecycle', () => {
       enabled = false;
       service.start();
       await index.close();
+      await rm(directory, { recursive: true, force: true });
     }
   });
 
@@ -62,7 +67,8 @@ describe('local search index lifecycle', () => {
     let enabled = true;
     let attempts = 0;
     let started = false;
-    const index = new SearchIndex(':memory:');
+    const directory = await mkdtemp(path.join(tmpdir(), 'seerr-service-test-'));
+    const index = new SearchIndex(path.join(directory, 'index.sqlite3'));
     const service = new SearchIndexService(
       () => enabled,
       () => index,
@@ -92,6 +98,7 @@ describe('local search index lifecycle', () => {
       enabled = false;
       service.start();
       await index.close();
+      await rm(directory, { recursive: true, force: true });
     }
   });
 });

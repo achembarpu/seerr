@@ -79,11 +79,16 @@ it('continues to search the committed index while an update is being published',
 
 describe('local title search index', () => {
   let index: SearchIndex;
+  let directory: string;
   beforeEach(async () => {
-    index = new SearchIndex(':memory:');
+    directory = await mkdtemp(path.join(tmpdir(), 'seerr-search-test-'));
+    index = new SearchIndex(path.join(directory, 'index.sqlite3'));
     await index.initialize();
   });
-  afterEach(async () => index.close());
+  afterEach(async () => {
+    await index.close();
+    await rm(directory, { recursive: true, force: true });
+  });
 
   it('finds misspelled and substring names across scripts', async () => {
     await index.beginImport('imdb');
@@ -152,6 +157,24 @@ describe('local title search index', () => {
     await index.writeBatch([movie('tt10687070', 'Mandela')]);
     await index.finishImport('imdb1');
     assert.equal((await index.search('matrix'))[0]?.sourceId, '603');
+  });
+
+  it('imports titles and ratings across batch boundaries', async () => {
+    const titles = Array.from({ length: 1001 }, (_, i) =>
+      movie(`tt${i + 1}`, `Film Number ${i + 1}`)
+    );
+    await index.beginImport('imdb');
+    await index.writeBatch(titles);
+    await index.finishImport('titles');
+    await index.beginRatingsImport();
+    await index.writeRatingsBatch(
+      titles.map((title, i) => ({ sourceId: title.sourceId, votes: i + 1 }))
+    );
+    await index.finishRatingsImport('ratings');
+    const last = (await index.search('film number 1001')).find(
+      (result) => result.sourceId === 'tt1001'
+    );
+    assert.equal(last?.popularity, 1001);
   });
 
   it('refuses to publish an empty import', async () => {

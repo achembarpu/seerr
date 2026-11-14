@@ -82,3 +82,43 @@ describe('local title suggestions', () => {
     assert.equal(indexMock.mock.callCount(), calls);
   });
 });
+
+it('passes normal search and pagination directly to TMDB, including people', async () => {
+  const tmdb = TheMovieDb.prototype as unknown as {
+    get: (...args: unknown[]) => Promise<unknown>;
+  };
+  const get = mock.method(tmdb, 'get', async () => ({
+    page: 3,
+    total_pages: 5,
+    total_results: 50,
+    results: [
+      {
+        id: 42,
+        media_type: 'person',
+        name: 'An Actor',
+        popularity: 1,
+        adult: false,
+        known_for: [],
+      },
+    ],
+  }));
+  try {
+    const response = await request(app)
+      .get('/search')
+      .query({ query: 'example', page: '3', language: 'ta' })
+      .expect(200);
+    assert.equal(response.body.page, 3);
+    assert.equal(response.body.results[0].mediaType, 'person');
+    assert.equal(get.mock.callCount(), 1);
+    assert.deepEqual(get.mock.calls[0].arguments[1], {
+      params: {
+        query: 'example',
+        page: 3,
+        include_adult: false,
+        language: 'ta',
+      },
+    });
+  } finally {
+    get.mock.restore();
+  }
+});

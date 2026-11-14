@@ -6,6 +6,9 @@ import {
   parseTmdbTitles,
 } from '@server/lib/searchIndex/importer';
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { Readable } from 'node:stream';
 import { describe, it } from 'node:test';
 import { gzipSync } from 'node:zlib';
@@ -78,7 +81,8 @@ describe('search index imports', () => {
   });
 
   it('keeps the existing index when a compressed import is truncated', async () => {
-    const index = new SearchIndex(':memory:');
+    const directory = await mkdtemp(path.join(tmpdir(), 'seerr-import-test-'));
+    const index = new SearchIndex(path.join(directory, 'index.sqlite3'));
     await index.initialize();
     try {
       const text =
@@ -101,11 +105,13 @@ describe('search index imports', () => {
       assert.equal((await index.search('maaveran'))[0]?.sourceId, 'tt22543326');
     } finally {
       await index.close();
+      await rm(directory, { recursive: true, force: true });
     }
   });
 
   it('keeps the previous index when an import is cancelled before publication', async () => {
-    const index = new SearchIndex(':memory:');
+    const directory = await mkdtemp(path.join(tmpdir(), 'seerr-import-test-'));
+    const index = new SearchIndex(path.join(directory, 'index.sqlite3'));
     await index.initialize();
     try {
       const oldTitle = {
@@ -132,6 +138,7 @@ describe('search index imports', () => {
       assert.deepEqual(await index.search('new film'), []);
     } finally {
       await index.close();
+      await rm(directory, { recursive: true, force: true });
     }
   });
 });

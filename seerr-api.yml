@@ -5562,11 +5562,7 @@ paths:
   /search:
     get:
       summary: Search for movies, TV shows, or people
-      description: >-
-        Returns movies, TV shows, and people from TMDB. When a regular search
-        returns no results, Seerr may retry with title prefixes and rank close
-        matches first. This fallback is best effort and does not provide a
-        complete substring or typo-tolerant index of the TMDB catalogue.
+      description: Returns movies, TV shows, or people from TMDB.
       tags:
         - search
       parameters:

@@ -5,7 +5,6 @@ import type {
   TmdbTvResult,
 } from '@server/api/themoviedb/interfaces';
 import Media from '@server/entity/Media';
-import { searchMedia } from '@server/lib/mediaSearch';
 import { findSearchProvider } from '@server/lib/search';
 import searchIndex from '@server/lib/searchIndex/service';
 import logger from '@server/logger';
@@ -112,8 +111,7 @@ searchRoutes.get('/', async (req, res, next) => {
     } else {
       const tmdb = new TheMovieDb();
 
-      results = await searchMedia({
-        search: tmdb.searchMulti,
+      results = await tmdb.searchMulti({
         query: queryString,
         page: Number(req.query.page) || 1,
         language: (req.query.language as string) ?? req.locale,

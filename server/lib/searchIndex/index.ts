@@ -71,12 +71,14 @@ export class SearchIndex {
   private database: sqlite3.Database;
   private reader?: sqlite3.Database;
   private importing?: IndexSource;
-  private publication?: Promise<void>;
   private revision = 0;
   private readonly searchCache = new Map<string, TitleMatch[]>();
   private readonly pendingSearches = new Map<string, Promise<TitleMatch[]>>();
 
   constructor(private readonly filename: string) {
+    if (!filename || filename === ':memory:') {
+      throw new Error('Search index requires a file-backed database');
+    }
     this.database = new sqlite3.Database(filename);
   }
 
@@ -155,17 +157,14 @@ export class SearchIndex {
       searchOriginalTitle TEXT NOT NULL,
       popularity REAL NOT NULL
     ) WITHOUT ROWID`);
-    // A separate connection can read the last committed WAL snapshot while a
-    // large import is published. In-memory databases are connection-local.
-    if (this.filename && this.filename !== ':memory:' && !this.reader) {
-      this.reader = await new Promise<sqlite3.Database>((resolve, reject) => {
-        const reader: sqlite3.Database = new sqlite3.Database(
-          this.filename,
-          sqlite3.OPEN_READONLY,
-          (error) => (error ? reject(error) : resolve(reader))
-        );
-      });
-    }
+    // Read the last committed WAL snapshot while an import is published.
+    this.reader = await new Promise<sqlite3.Database>((resolve, reject) => {
+      const reader: sqlite3.Database = new sqlite3.Database(
+        this.filename,
+        sqlite3.OPEN_READONLY,
+        (error) => (error ? reject(error) : resolve(reader))
+      );
+    });
   }
 
   async beginImport(source: IndexSource): Promise<void> {
@@ -183,9 +182,8 @@ export class SearchIndex {
   async writeBatch(titles: IndexedTitle[]): Promise<void> {
     if (!this.importing) throw new Error('No search index import is running');
     if (!titles.length) return;
-    // Keep well below SQLite's parameter limit on older supported builds.
-    for (let offset = 0; offset < titles.length; offset += 100) {
-      const batch = titles.slice(offset, offset + 100);
+    for (let offset = 0; offset < titles.length; offset += 500) {
+      const batch = titles.slice(offset, offset + 500);
       const values = batch.map(() => '(?,?,?,?,?,?,?)').join(',');
       const params = batch.flatMap((item) => {
         const title = normalizeTitle(item.title);
@@ -227,10 +225,6 @@ export class SearchIndex {
         'Refusing to replace the search index with an incomplete import'
       );
     }
-    let releasePublication: () => void = () => undefined;
-    this.publication = new Promise<void>((resolve) => {
-      releasePublication = resolve;
-    });
     try {
       await this.run('BEGIN IMMEDIATE');
       await this.run(
@@ -263,9 +257,6 @@ export class SearchIndex {
     } catch (error) {
       await this.run('ROLLBACK').catch(() => undefined);
       throw error;
-    } finally {
-      this.publication = undefined;
-      releasePublication();
     }
   }
 
@@ -286,8 +277,8 @@ export class SearchIndex {
   }
 
   async writeRatingsBatch(ratings: ImdbRating[]): Promise<void> {
-    for (let offset = 0; offset < ratings.length; offset += 300) {
-      const batch = ratings.slice(offset, offset + 300);
+    for (let offset = 0; offset < ratings.length; offset += 1000) {
+      const batch = ratings.slice(offset, offset + 1000);
       await this.run(
         `INSERT OR REPLACE INTO incoming_votes VALUES ${batch.map(() => '(?,?)').join(',')}`,
         batch.flatMap(({ sourceId, votes }) => [sourceId, votes])
@@ -308,10 +299,6 @@ export class SearchIndex {
       throw new Error(
         'Refusing to replace IMDb ratings with an incomplete import'
       );
-    let release: () => void = () => undefined;
-    this.publication = new Promise<void>((resolve) => {
-      release = resolve;
-    });
     try {
       await this.run('BEGIN IMMEDIATE');
       await this.run(`INSERT INTO imdb_votes(sourceId, votes)
@@ -332,9 +319,6 @@ export class SearchIndex {
     } catch (error) {
       await this.run('ROLLBACK').catch(() => undefined);
       throw error;
-    } finally {
-      this.publication = undefined;
-      release();
     }
   }
 
@@ -369,7 +353,7 @@ export class SearchIndex {
   }
 
   async search(query: string, limit = 20): Promise<TitleMatch[]> {
-    if (!this.reader) await this.publication;
+    if (!this.reader) throw new Error('Search index is not initialized');
     const normalized = normalizeTitle(query);
     const grams = trigrams(normalized);
     if (!grams.length) return [];
