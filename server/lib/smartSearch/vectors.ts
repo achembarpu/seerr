@@ -26,3 +26,26 @@ export const cosine = (left: Uint8Array, right: Uint8Array): number => {
   }
   return a && b ? dot / Math.sqrt(a * b) : 0;
 };
+
+/** Prepare the fixed query once while scoring many signed quantized vectors. */
+export const prepareCosine = (left: Uint8Array) => {
+  const query = new Int8Array(left.buffer, left.byteOffset, left.byteLength);
+  let queryNorm = 0;
+  for (let i = 0; i < query.length; i++) queryNorm += query[i] * query[i];
+  return (right: Uint8Array): number => {
+    if (query.length !== right.length || !query.length || !queryNorm) return 0;
+    const candidate = new Int8Array(
+      right.buffer,
+      right.byteOffset,
+      right.byteLength
+    );
+    let dot = 0;
+    let candidateNorm = 0;
+    for (let i = 0; i < query.length; i++) {
+      const value = candidate[i];
+      dot += query[i] * value;
+      candidateNorm += value * value;
+    }
+    return candidateNorm ? dot / Math.sqrt(queryNorm * candidateNorm) : 0;
+  };
+};

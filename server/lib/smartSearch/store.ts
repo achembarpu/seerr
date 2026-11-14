@@ -1,7 +1,7 @@
 import { createHash } from 'crypto';
 import sqlite3 from 'sqlite3';
 import type { SmartDocument, SmartFilters, SmartMediaType } from './types';
-import { cosine } from './vectors';
+import { prepareCosine } from './vectors';
 
 export interface SmartMatch {
   document: SmartDocument;
@@ -77,20 +77,26 @@ export class SmartStore {
   private lexicalCount = 0;
   private lexicalTotal = 0;
   private lexicalError?: string;
-  constructor(filename: string) {
+  private readonly activeSearches = new Set<Promise<void>>();
+  constructor(private readonly filename: string) {
     this.db = new sqlite3.Database(filename);
   }
   private run(
     sql: string,
-    params: (string | number | Buffer | null)[] = []
+    params: (string | number | Buffer | null)[] = [],
+    db = this.db
   ): Promise<void> {
     return new Promise((resolve, reject) =>
-      this.db.run(sql, params, (error) => (error ? reject(error) : resolve()))
+      db.run(sql, params, (error) => (error ? reject(error) : resolve()))
     );
   }
-  private all<T>(sql: string, params: (string | number)[] = []): Promise<T[]> {
+  private all<T>(
+    sql: string,
+    params: (string | number)[] = [],
+    db = this.db
+  ): Promise<T[]> {
     return new Promise((resolve, reject) =>
-      this.db.all<T>(sql, params, (error, rows) =>
+      db.all<T>(sql, params, (error, rows) =>
         error ? reject(error) : resolve(rows)
       )
     );
@@ -408,75 +414,146 @@ export class SmartStore {
     filters: SmartFilters = {},
     limit = 30
   ): Promise<SmartMatch[]> {
-    const conditions = ['id > ?'];
-    const params: (string | number)[] = [];
-    if (filters.mediaType) {
-      conditions.push('mediaType = ?');
-      params.push(filters.mediaType);
-    }
-    if (filters.language) {
-      conditions.push('language = ?');
-      params.push(filters.language);
-    }
-    if (filters.yearFrom !== undefined) {
-      conditions.push('year >= ?');
-      params.push(filters.yearFrom);
-    }
-    if (filters.yearTo !== undefined) {
-      conditions.push('year <= ?');
-      params.push(filters.yearTo);
-    }
-    if (filters.minRating !== undefined) {
-      conditions.push('voteAverage >= ?');
-      params.push(filters.minRating);
-    }
-    if (filters.minVotes !== undefined) {
-      conditions.push('voteCount >= ?');
-      params.push(filters.minVotes);
-    }
-    if (filters.genre !== undefined) {
-      conditions.push(
-        'EXISTS (SELECT 1 FROM json_each(genres) WHERE value = ?)'
-      );
-      params.push(filters.genre);
-    }
-    let after = 0;
-    const best: (SmartMatch & { rank: number })[] = [];
-    for (;;) {
-      const rows = await this.all<Row>(
-        `SELECT id, vector, document, voteCount FROM smart_documents NOT INDEXED WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 512`,
-        [after, ...params]
-      );
-      if (!rows.length) break;
-      for (const row of rows) {
-        const score = cosine(vector, row.vector);
-        // A small, capped audience-evidence bonus breaks close semantic ties
-        // without removing unrated or less well-known titles.
-        const rank =
-          score +
-          0.015 *
-            Math.min(
-              1,
-              Math.log1p(Math.max(0, row.voteCount)) / Math.log(1001)
+    if (this.closing) throw new Error('Search index is closing');
+    if (limit <= 0) return [];
+    // The writer continues indexing on the main connection. A separate,
+    // read-only transaction keeps the vector and final document in the same
+    // snapshot even when a title is updated or removed during the scan.
+    // In-memory and temporary databases cannot be reopened by filename. Keep
+    // their original single-connection scan and capture documents as we go.
+    const transient =
+      this.filename === ':memory:' ||
+      this.filename === '' ||
+      this.filename.startsWith('file::memory:') ||
+      /[?&]mode=memory(?:&|$)/u.test(this.filename);
+    let finish: () => void = () => undefined;
+    const active = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    this.activeSearches.add(active);
+    let snapshot: sqlite3.Database | undefined;
+    try {
+      snapshot = transient
+        ? this.db
+        : await new Promise<sqlite3.Database>((resolve, reject) => {
+            const connection: sqlite3.Database = new sqlite3.Database(
+              this.filename,
+              sqlite3.OPEN_READONLY,
+              (error) => (error ? reject(error) : resolve(connection))
             );
-        if (best.length < limit || rank > best[best.length - 1].rank) {
-          best.push({
-            document: JSON.parse(row.document) as SmartDocument,
-            score,
-            rank,
           });
-          best.sort((a, b) => b.rank - a.rank);
-          if (best.length > limit) best.pop();
-        }
+      if (!transient) await this.run('BEGIN', [], snapshot);
+      const conditions = ['id > ?'];
+      const params: (string | number)[] = [];
+      if (filters.mediaType) {
+        conditions.push('mediaType = ?');
+        params.push(filters.mediaType);
       }
-      after = rows[rows.length - 1].id;
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (filters.language) {
+        conditions.push('language = ?');
+        params.push(filters.language);
+      }
+      if (filters.yearFrom !== undefined) {
+        conditions.push('year >= ?');
+        params.push(filters.yearFrom);
+      }
+      if (filters.yearTo !== undefined) {
+        conditions.push('year <= ?');
+        params.push(filters.yearTo);
+      }
+      if (filters.minRating !== undefined) {
+        conditions.push('voteAverage >= ?');
+        params.push(filters.minRating);
+      }
+      if (filters.minVotes !== undefined) {
+        conditions.push('voteCount >= ?');
+        params.push(filters.minVotes);
+      }
+      if (filters.genre !== undefined) {
+        conditions.push(
+          'EXISTS (SELECT 1 FROM json_each(genres) WHERE value = ?)'
+        );
+        params.push(filters.genre);
+      }
+      let after = 0;
+      const scoreVector = prepareCosine(vector);
+      const best: {
+        id: number;
+        score: number;
+        rank: number;
+        document?: string;
+      }[] = [];
+      for (;;) {
+        const rows = await this.all<
+          Pick<Row, 'id' | 'vector' | 'voteCount'> & { document?: string }
+        >(
+          `SELECT id, vector, voteCount${transient ? ', document' : ''} FROM smart_documents NOT INDEXED WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 512`,
+          [after, ...params],
+          snapshot
+        );
+        if (!rows.length) break;
+        for (const row of rows) {
+          const score = scoreVector(row.vector);
+          // A small, capped audience-evidence bonus breaks close semantic ties
+          // without removing unrated or less well-known titles.
+          const rank =
+            score +
+            0.015 *
+              Math.min(
+                1,
+                Math.log1p(Math.max(0, row.voteCount)) / Math.log(1001)
+              );
+          if (best.length < limit || rank > best[best.length - 1].rank) {
+            best.push({
+              id: row.id,
+              score,
+              rank,
+              document: row.document,
+            });
+            best.sort((a, b) => b.rank - a.rank);
+            if (best.length > limit) best.pop();
+          }
+        }
+        after = rows[rows.length - 1].id;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+      // Fetch descriptions only for the final shortlist; reading each large JSON
+      // document during the vector scan adds substantial SQLite and Node work.
+      if (transient)
+        return best.map(({ document, score }) => ({
+          document: JSON.parse(document!) as SmartDocument,
+          score,
+        }));
+      const documents = new Map<number, SmartDocument>();
+      for (let start = 0; start < best.length; start += 500) {
+        const ids = best.slice(start, start + 500).map((item) => item.id);
+        const rows = await this.all<Pick<Row, 'id' | 'document'>>(
+          `SELECT id, document FROM smart_documents WHERE id IN (${ids.map(() => '?').join(',')})`,
+          ids,
+          snapshot
+        );
+        rows.forEach((row) => documents.set(row.id, JSON.parse(row.document)));
+      }
+      return best.flatMap(({ id, score }) => {
+        const document = documents.get(id);
+        return document ? [{ document, score }] : [];
+      });
+    } finally {
+      try {
+        if (!transient && snapshot)
+          await new Promise<void>((resolve, reject) =>
+            snapshot!.close((error) => (error ? reject(error) : resolve()))
+          );
+      } finally {
+        this.activeSearches.delete(active);
+        finish();
+      }
     }
-    return best.map(({ document, score }) => ({ document, score }));
   }
   async close(): Promise<void> {
     this.closing = true;
     await this.lexicalTask;
+    await Promise.all(this.activeSearches);
     await new Promise<void>((resolve, reject) =>
       this.db.close((error) => (error ? reject(error) : resolve()))
     );
