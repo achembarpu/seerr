@@ -52,6 +52,20 @@ import swaggerUi from 'swagger-ui-express';
 
 const API_SPEC_PATH = path.join(__dirname, '../seerr-api.yml');
 
+// Stop the local inference child when the server is terminated, including when
+// the native macOS launcher quits. Bound shutdown so a stalled request cannot
+// keep the app open indefinitely.
+let shuttingDown = false;
+const shutdown = () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  const deadline = setTimeout(() => process.exit(1), 5000);
+  deadline.unref();
+  void smartSearch.close().finally(() => process.exit(0));
+};
+process.once('SIGTERM', shutdown);
+process.once('SIGINT', shutdown);
+
 logger.info(`Starting Seerr version ${getAppVersion()}`);
 const dev = process.env.NODE_ENV !== 'production';
 const app = next({ dev });

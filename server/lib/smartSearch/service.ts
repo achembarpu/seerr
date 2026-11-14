@@ -45,6 +45,7 @@ export class SmartSearchService {
     private readonly createStore: () => SmartStore = () =>
       new SmartStore(path.join(appDataPath(), 'smart-search.sqlite3'))
   ) {}
+  private closing = false;
   private store?: SmartStore;
   private controller?: AbortController;
   private timer?: NodeJS.Timeout;
@@ -75,6 +76,7 @@ export class SmartSearchService {
   }
 
   start(): void {
+    if (this.closing) return;
     if (!this.enabled()) {
       if (this.timer) clearTimeout(this.timer);
       this.timer = undefined;
@@ -367,7 +369,7 @@ export class SmartSearchService {
     } finally {
       this.controller = undefined;
       this.unloadWhenIdle();
-      if (this.enabled()) {
+      if (this.enabled() && !this.closing) {
         if (controller.signal.aborted) this.start();
         else this.schedule(failed ? retryInterval : interval);
       }
@@ -454,6 +456,7 @@ export class SmartSearchService {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
     if (this.timer) clearTimeout(this.timer);
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.controller?.abort();

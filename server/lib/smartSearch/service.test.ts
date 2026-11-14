@@ -239,6 +239,60 @@ describe('smart search lifecycle', () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+  it('does not restart an enabled index while closing', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-close-'));
+    let pages = 0;
+    let starts = 0;
+    const engine = {
+      phase: 'idle' as 'idle' | 'ready',
+      downloadBytes: 0,
+      downloadTotal: 1,
+      async start() {
+        starts++;
+        this.phase = 'ready';
+      },
+      stop() {
+        this.phase = 'idle';
+      },
+      async embed() {
+        return [];
+      },
+    };
+    const source: MetadataSource = {
+      id: 'tmdb',
+      async fetchOne() {
+        return undefined;
+      },
+      async fetchPage(_type, _from, _to, _page, signal) {
+        pages++;
+        assert.ok(signal);
+        await new Promise<void>((resolve) =>
+          signal.addEventListener('abort', () => resolve(), { once: true })
+        );
+        signal.throwIfAborted();
+        return { documents: [], totalPages: 0 };
+      },
+    };
+    const service = new SmartSearchService(
+      () => true,
+      engine,
+      source,
+      () => new SmartStore(path.join(directory, 'index.sqlite'))
+    );
+    try {
+      service.start();
+      await waitFor(() => pages === 1);
+      await service.close();
+      await delay(20);
+      assert.equal(starts, 1);
+      assert.equal(pages, 1);
+      assert.equal(service.status().indexing, false);
+    } finally {
+      await service.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('aborts an in-flight source request when disabled', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-cancel-'));
     let enabled = true;

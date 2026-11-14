@@ -87,13 +87,21 @@ You can help improve Seerr too! Check out our [Contribution Guide](./CONTRIBUTIN
 
 Administrators can enable Local smart search in General Settings. Seerr downloads a pinned 119 MB multilingual embedding model, verifies its SHA-256 hash, then builds a separate local index of TMDB movie and series descriptions. The initial scan works from recent years backwards and can take a long time, use substantial CPU and network traffic, and require significant disk space. Search becomes available as titles are indexed. Titles without a release/first-air date or usable description are not included. English descriptions are preferred, with original-language descriptions used when English is unavailable.
 
-Open **Smart search** on the search page to search descriptions and filter by type, genre, original-language code, year, TMDB rating, and vote count. Recommendations use only the signed-in user's recent requests. Movie and series pages also show matches similar by description. These suggestions are based on indexed metadata, so coverage and relevance vary; normal search remains available.
+Open **Smart search** on the search page to search descriptions and filter by type, genre, original language, year, TMDB rating, and vote count. Recommendations use only the signed-in user's recent requests. Movie and series pages also show matches similar by description. A small, capped vote-count bonus breaks close similarity ties without removing lesser-known titles; ratings remain an explicit filter. These suggestions are based on indexed metadata, so coverage and relevance vary; normal search remains available.
 
 After the initial scan, the index checks TMDB change lists daily and only re-embeds changed descriptions. If a refresh is interrupted, Seerr resumes from its checkpoint. Change-list requests cover one day at a time, so refresh can resume after interruptions without requesting an oversized date range. Settings show progress and errors and provide a manual refresh. Disabling the feature stops indexing and the model process but retains the model and rebuildable index. The model process unloads after 15 minutes of inactivity.
 
 The device selector in General Settings chooses automatic, CPU, or a detected GPU. Automatic tries the first detected GPU and falls back to CPU if startup or a test embedding fails. A specifically selected device reports an error if unavailable. The status shows the active device and any fallback. Changing the selection restarts indexing from its checkpoint. The Docker runtime includes Vulkan support for GPUs accessible to the Linux container. On Linux, expose a compatible render device (for example `--device /dev/dri`) and grant the `node` user access to its render group. NVIDIA also requires its container toolkit, Vulkan driver and graphics capability. GPU models, drivers, container permissions and host VM support vary; CPU fallback remains available. The Vulkan container has not been validated on every GPU or driver.
 
-### macOS native or Docker Desktop with Metal
+### macOS app
+
+The private Apple Silicon build is a self-contained macOS app. Unzip `Seerr-macOS-arm64.zip`, drag `Seerr.app` to Applications, and open it. The Seerr menu-bar item shows whether the server is running and provides **Open Seerr**, **Show Data Folder**, and **Quit Seerr**. The app opens Seerr in your browser; it is a local server rather than a separate browser shell. It includes Node and the Metal inference runtime, but downloads the embedding model only after smart search is enabled. Metal is selected automatically when available.
+
+The app listens on `127.0.0.1:5055` by default. To allow access from other devices, choose **Allow Network Access** in its menu and then quit and reopen it; Seerr will listen on all interfaces and clients must sign in. Configuration, the database, cache and models are kept in `~/Library/Application Support/Seerr`, separate from the app, so replacing the app preserves your data. Quit the app before replacing it. If port 5055 is occupied, stop the other service first.
+
+The private archive is ad-hoc signed, not Developer ID signed or notarized. macOS Gatekeeper may require opening it once via System Settings → Privacy & Security. This build does not install a login item or start automatically after a reboot. To build it from this checkout on an Apple Silicon Mac with Node, pnpm, Git, CMake and Xcode command-line tools, run `scripts/build-macos-app.sh`; the app and ZIP are placed in `build/macos`. The model and TMDB/IMDb data are never embedded in the app.
+
+### macOS from source or Docker Desktop with Metal
 
 Seerr can run directly as a macOS Node application; it is still accessed in a browser. To compile the pinned Metal runtime, install Git, CMake and Xcode command-line tools, then run:
 
@@ -104,7 +112,7 @@ pnpm build
 SEERR_LLAMA_SERVER="$HOME/Library/Caches/Seerr/smart-search/llama-32bdc3a89e6528d3e419024c833c5dabf32c7541/bin/llama-server" pnpm start
 ```
 
-Enable smart search and leave the device on Automatic or select the detected Metal GPU. The runtime is built for the host; the model is downloaded separately when the feature is enabled. See [development setup](CONTRIBUTING.md#development) for Node and pnpm requirements. This is a native server, not a packaged Mac app. It uses Metal GPU inference; Apple Neural Engine inference is not supported.
+Enable smart search and leave the device on Automatic or select the detected Metal GPU. The runtime is built for the host; the model is downloaded separately when the feature is enabled. See [development setup](CONTRIBUTING.md#development) for Node and pnpm requirements. This runs the native server directly from the source checkout. It uses Metal GPU inference; Apple Neural Engine inference is not supported.
 
 Docker Desktop runs Linux containers and does not provide the macOS Metal API to the packaged Linux runtime. To use the Mac GPU while keeping Seerr in Docker, first build the runtime and run the optional host helper in a terminal:
 
