@@ -29,6 +29,7 @@ type Cursor = {
 const firstYear = 1870;
 const interval = 24 * 60 * 60 * 1000;
 const retryInterval = 60 * 60 * 1000;
+const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 
 /** Keep offline upstream discovery from blocking the local index indefinitely. */
 async function withDeadline<T>(
@@ -857,7 +858,17 @@ export class SmartSearchService {
             !firstPageKeys.has(key(item)) && !audienceKeys.has(key(item))
         ),
       ].slice(0, 100);
-      const reranked = await this.rerank(query, candidates);
+      // Very short searches often name concepts rather than describing the
+      // desired work. Give the reranker the media-search context while leaving
+      // longer natural-language requests unchanged.
+      const wordCount = [...wordSegmenter.segment(query)].filter(
+        (part) => part.isWordLike
+      ).length;
+      const rerankQuery =
+        wordCount > 0 && wordCount <= 4 && Array.from(query).length <= 60
+          ? `A film or series about ${query}`
+          : query;
+      const reranked = await this.rerank(rerankQuery, candidates);
       if (!reranked.some((item) => item.reranked)) {
         // The deeper audience-selected candidates are safe to promote only
         // after the reranker has assessed them. Keep the original retrieval

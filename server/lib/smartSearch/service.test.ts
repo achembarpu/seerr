@@ -537,6 +537,79 @@ describe('bounded search work', () => {
   });
 });
 
+it('gives short reranker queries media context without rewriting longer multilingual descriptions', async () => {
+  const embedded: string[] = [];
+  const lexical: string[] = [];
+  const remote: string[] = [];
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed(texts: string[]) {
+      embedded.push(...texts);
+      return [[1, 0]];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+    async searchRelated(query) {
+      remote.push(query);
+      return [];
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const seen: string[] = [];
+  const dense = [{ document, score: 0.5 }];
+  const internal = service as unknown as {
+    open: () => Promise<{
+      searchLexical: (query: string) => Promise<unknown[]>;
+    }>;
+    searchDense: () => Promise<typeof dense>;
+    rerank: (query: string, candidates: typeof dense) => Promise<typeof dense>;
+    idleTimer?: NodeJS.Timeout;
+  };
+  internal.open = async () => ({
+    searchLexical: async (query) => {
+      lexical.push(query);
+      return [];
+    },
+  });
+  internal.searchDense = async () => dense;
+  internal.rerank = async (query, candidates) => {
+    seen.push(query);
+    return candidates;
+  };
+  try {
+    await service.search('space cats', {});
+    await service.search('a family travels through space to a new home', {});
+    const japanese = '第二次世界大戦中に科学者が原子爆弾を開発する映画';
+    await service.search(japanese, {});
+    assert.deepEqual(seen, [
+      'A film or series about space cats',
+      'a family travels through space to a new home',
+      japanese,
+    ]);
+    const original = [
+      'space cats',
+      'a family travels through space to a new home',
+      japanese,
+    ];
+    assert.deepEqual(embedded, original);
+    assert.deepEqual(lexical, original);
+    assert.deepEqual(remote, original);
+  } finally {
+    if (internal.idleTimer) clearTimeout(internal.idleTimer);
+  }
+});
+
 it('blends reranking with initial retrieval so strong multilingual hits remain visible', async () => {
   const settings = getSettings().main;
   const originalRerank = settings.smartSearchRerank;
