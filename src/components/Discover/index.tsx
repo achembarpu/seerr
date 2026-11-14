@@ -51,7 +51,12 @@ const messages = defineMessages('components.Discover', {
   customizediscover: 'Customize Discover',
   stopediting: 'Stop Editing',
   createnewslider: 'Create New Slider',
-  smartRecommendations: 'Recommended from your requests',
+  smartRecommendations: 'Recommendations',
+  smartRecommendationsError: 'Unable to load recommendations right now.',
+  requestRecommendations: 'Recommended from your requests',
+  libraryRecommendations: 'Recommended from your library',
+  noSmartRecommendations:
+    'Recommendations will appear as your library and search index grow. Check your visibility settings if expected titles are missing.',
 });
 
 const Discover = () => {
@@ -215,6 +220,17 @@ const Discover = () => {
         <MediaSlider
           sliderKey="smart-recommendations"
           title={intl.formatMessage(messages.smartRecommendations)}
+          titleForBasis={(basis) =>
+            intl.formatMessage(
+              basis === 'requests'
+                ? messages.requestRecommendations
+                : basis === 'library'
+                  ? messages.libraryRecommendations
+                  : messages.smartRecommendations
+            )
+          }
+          emptyMessage={intl.formatMessage(messages.noSmartRecommendations)}
+          errorMessage={intl.formatMessage(messages.smartRecommendationsError)}
           url="/api/v1/search/smart/recommendations"
           hideWhenEmpty
         />

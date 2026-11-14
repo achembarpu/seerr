@@ -21,6 +21,7 @@ interface MixedResult {
   totalResults: number;
   totalPages: number;
   results: (TvResult | MovieResult | PersonResult)[];
+  basis?: 'requests' | 'library' | 'none';
 }
 
 interface MediaSliderProps {
@@ -29,8 +30,12 @@ interface MediaSliderProps {
   linkUrl?: string;
   sliderKey: string;
   hideWhenEmpty?: boolean;
+  maxItems?: number;
   extraParams?: string;
   onNewTitles?: (titleCount: number) => void;
+  titleForBasis?: (basis: MixedResult['basis']) => string;
+  emptyMessage?: string;
+  errorMessage?: string;
 }
 
 const MediaSlider = ({
@@ -40,7 +45,11 @@ const MediaSlider = ({
   extraParams,
   sliderKey,
   hideWhenEmpty = false,
+  maxItems = 20,
   onNewTitles,
+  titleForBasis,
+  emptyMessage,
+  errorMessage,
 }: MediaSliderProps) => {
   const settings = useSettings();
   const { hasPermission } = useUser();
@@ -108,9 +117,14 @@ const MediaSlider = ({
     }
   }, [titles, setSize, size, data, onNewTitles]);
 
-  if (hideWhenEmpty && (data?.[0].results ?? []).length === 0) {
+  if (
+    hideWhenEmpty &&
+    (data?.[0].results ?? []).length === 0 &&
+    !emptyMessage
+  ) {
     return null;
   }
+  const displayTitle = titleForBasis ? titleForBasis(data?.[0]?.basis) : title;
 
   const blocklistVisibility = hasPermission(
     [Permission.MANAGE_BLOCKLIST, Permission.VIEW_BLOCKLIST],
@@ -118,7 +132,7 @@ const MediaSlider = ({
   );
 
   const finalTitles = titles
-    .slice(0, 20)
+    .slice(0, maxItems)
     .filter((title) => {
       if (!blocklistVisibility)
         return (
@@ -172,12 +186,12 @@ const MediaSlider = ({
       }
     });
 
-  if (linkUrl && titles.length > 20) {
+  if (linkUrl && titles.length > maxItems) {
     finalTitles.push(
       <ShowMoreCard
         url={linkUrl}
         posters={titles
-          .slice(20, 24)
+          .slice(maxItems, maxItems + 4)
           .map((title) =>
             title.mediaType !== 'person' ? title.posterPath : undefined
           )}
@@ -190,21 +204,27 @@ const MediaSlider = ({
       <div className="slider-header">
         {linkUrl ? (
           <Link href={linkUrl} className="slider-title min-w-0 pr-16">
-            <span className="truncate">{title}</span>
+            <span className="truncate">{displayTitle}</span>
             <ArrowRightCircleIcon />
           </Link>
         ) : (
           <div className="slider-title">
-            <span>{title}</span>
+            <span>{displayTitle}</span>
           </div>
         )}
       </div>
-      <Slider
-        sliderKey={sliderKey}
-        isLoading={!data && !error}
-        isEmpty={false}
-        items={finalTitles}
-      />
+      {error && errorMessage ? (
+        <p className="mb-6 text-sm text-gray-400">{errorMessage}</p>
+      ) : emptyMessage && data && finalTitles.length === 0 ? (
+        <p className="mb-6 text-sm text-gray-400">{emptyMessage}</p>
+      ) : (
+        <Slider
+          sliderKey={sliderKey}
+          isLoading={!data && !error}
+          isEmpty={false}
+          items={finalTitles}
+        />
+      )}
     </>
   );
 };

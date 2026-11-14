@@ -81,9 +81,7 @@ const messages = defineMessages('components.MovieDetails', {
   overview: 'Overview',
   runtime: '{minutes} minutes',
   cast: 'Cast',
-  recommendations: 'Recommendations',
-  similar: 'Similar Titles',
-  smartSimilar: 'Similar by description',
+  moreLikeThis: 'More like this',
   overviewunavailable: 'Overview unavailable.',
   studio: '{studioCount, plural, one {Studio} other {Studios}}',
   viewfullcrew: 'View Full Crew',
@@ -1158,27 +1156,12 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
           />
         </>
       )}
-      {settings.currentSettings.smartSearch && (
-        <MediaSlider
-          sliderKey="smart-similar"
-          title={intl.formatMessage(messages.smartSimilar)}
-          url="/api/v1/search/smart/similar"
-          extraParams={`mediaType=movie&id=${router.query.movieId}`}
-          hideWhenEmpty
-        />
-      )}
       <MediaSlider
-        sliderKey="recommendations"
-        title={intl.formatMessage(messages.recommendations)}
-        url={`/api/v1/movie/${router.query.movieId}/recommendations`}
-        linkUrl={`/movie/${data.id}/recommendations`}
-        hideWhenEmpty
-      />
-      <MediaSlider
-        sliderKey="similar"
-        title={intl.formatMessage(messages.similar)}
-        url={`/api/v1/movie/${router.query.movieId}/similar`}
-        linkUrl={`/movie/${data.id}/similar`}
+        sliderKey="more-like-this"
+        maxItems={30}
+        title={intl.formatMessage(messages.moreLikeThis)}
+        url="/api/v1/search/smart/similar"
+        extraParams={`mediaType=movie&id=${router.query.movieId}`}
         hideWhenEmpty
       />
       <div className="extra-bottom-space relative" />

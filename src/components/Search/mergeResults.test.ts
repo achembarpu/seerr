@@ -113,3 +113,32 @@ it('does not put every weak fuzzy title before relevant description matches', ()
       results.findIndex((item) => item.id === 2)
   );
 });
+
+it('keeps weak fuzzy guesses below a relevant descriptive result', () => {
+  const results = mergeResults(
+    'barber murderers',
+    [],
+    Array.from({ length: 7 }, (_, index) =>
+      movie(index + 1, `Unrelated ${index}`, { matchScore: 0.8 })
+    ),
+    Array.from({ length: 12 }, (_, index) =>
+      movie(index + 20, `Story ${index}`)
+    ),
+    filters
+  );
+  assert.equal(
+    results.findIndex((item) => item.id === 29),
+    9
+  );
+});
+
+it('keeps a close full-title typo in a short non-Latin script above unrelated description matches', () => {
+  const results = mergeResults(
+    '기생총',
+    [],
+    [movie(496243, 'Parasite', { originalTitle: '기생충', matchScore: 0.778 })],
+    [movie(7, 'Miles and Ellen'), movie(8, 'Guns and Gear')],
+    filters
+  );
+  assert.equal(results[0].id, 496243);
+});

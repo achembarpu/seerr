@@ -717,6 +717,11 @@ const SettingsSearch = () => {
                               {smartStatus.deviceWarning}
                             </p>
                           )}
+                          {smartStatus.retrievalWarning && (
+                            <p className="text-yellow-400">
+                              {smartStatus.retrievalWarning}
+                            </p>
+                          )}
                           {smartStatus.lexical?.error && (
                             <p className="text-red-400">
                               {smartStatus.lexical.error}

@@ -85,9 +85,7 @@ const messages = defineMessages('components.TvDetails', {
   originallanguage: 'Original Language',
   overview: 'Overview',
   cast: 'Cast',
-  recommendations: 'Recommendations',
-  similar: 'Similar Series',
-  smartSimilar: 'Similar by description',
+  moreLikeThis: 'More like this',
   watchtrailer: 'Watch Trailer',
   overviewunavailable: 'Overview unavailable.',
   originaltitle: 'Original Title',
@@ -1391,27 +1389,12 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
           />
         </>
       )}
-      {settings.currentSettings.smartSearch && (
-        <MediaSlider
-          sliderKey="smart-similar"
-          title={intl.formatMessage(messages.smartSimilar)}
-          url="/api/v1/search/smart/similar"
-          extraParams={`mediaType=tv&id=${router.query.tvId}`}
-          hideWhenEmpty
-        />
-      )}
       <MediaSlider
-        sliderKey="recommendations"
-        title={intl.formatMessage(messages.recommendations)}
-        url={`/api/v1/tv/${router.query.tvId}/recommendations`}
-        linkUrl={`/tv/${data.id}/recommendations`}
-        hideWhenEmpty
-      />
-      <MediaSlider
-        sliderKey="similar"
-        title={intl.formatMessage(messages.similar)}
-        url={`/api/v1/tv/${router.query.tvId}/similar`}
-        linkUrl={`/tv/${data.id}/similar`}
+        sliderKey="more-like-this"
+        maxItems={30}
+        title={intl.formatMessage(messages.moreLikeThis)}
+        url="/api/v1/search/smart/similar"
+        extraParams={`mediaType=tv&id=${router.query.tvId}`}
         hideWhenEmpty
       />
       <div className="extra-bottom-space relative" />

@@ -28,6 +28,36 @@ const titleScore = (query: string, item: SearchItem): number => {
   );
 };
 
+// For very short non-Latin titles, one changed character leaves little
+// similarity evidence. A same-length full-title match is stronger than a
+// partial match elsewhere in a long title, even with a lower raw score.
+const compactScriptTitleScore = (query: string, item: SearchItem): number => {
+  const length = Array.from(query).length;
+  if (
+    length < 2 ||
+    length > 4 ||
+    query.includes(' ') ||
+    !/[^\p{ASCII}]/u.test(query)
+  )
+    return 0;
+  const names =
+    item.mediaType === 'movie'
+      ? [item.title, item.originalTitle]
+      : item.mediaType === 'tv'
+        ? [item.name, item.originalName]
+        : [item.name];
+  return Math.max(
+    0,
+    ...names.map((name) => {
+      const normalized = normalizeTitle(name ?? '');
+      return !normalized.includes(' ') &&
+        Array.from(normalized).length === length
+        ? titleSimilarity(query, normalized)
+        : 0;
+    })
+  );
+};
+
 export const matchesFilters = (
   item: SearchItem,
   filters: SearchFilters
@@ -75,7 +105,8 @@ export const mergeResults = (
   const decisiveTitle = [...regular, ...approximate].some(
     (item) =>
       matchesFilters(item, filters) &&
-      Math.max(titleScore(normalized, item), item.matchScore ?? 0) >= 0.94
+      (Math.max(titleScore(normalized, item), item.matchScore ?? 0) >= 0.94 ||
+        compactScriptTitleScore(normalized, item) >= 0.75)
   );
   let extraSemantic = 0;
   for (const [method, items] of [
@@ -93,7 +124,21 @@ export const mergeResults = (
       // Source scores use different scales. Fuse positions instead of assuming
       // that a weak fuzzy title is always better than a description match.
       // Strong title evidence remains a separate signal for title lookups.
-      const contribution = (method === 'semantic' ? 1.5 : 1) / (position + 3);
+      const weight =
+        method === 'semantic'
+          ? 1.5
+          : semantic.length && !decisiveTitle
+            ? 0.3
+            : 1;
+      const contribution = weight / (position + 3);
+      const compactScore =
+        method === 'approximate'
+          ? compactScriptTitleScore(normalized, item)
+          : 0;
+      const titleEvidence =
+        compactScore >= 0.75
+          ? Math.max(score, 0.94 + (compactScore - 0.75) * 0.2)
+          : score;
       const existing = merged.get(key);
       if (
         method === 'semantic' &&
@@ -107,12 +152,12 @@ export const mergeResults = (
           existing.item.matchMethods?.push(method);
           existing.rank += contribution;
         }
-        existing.titleScore = Math.max(existing.titleScore, score);
+        existing.titleScore = Math.max(existing.titleScore, titleEvidence);
       } else {
         merged.set(key, {
           item: { ...item, matchMethods: [method] },
           rank: contribution,
-          titleScore: score,
+          titleScore: titleEvidence,
           order: order++,
         });
       }
