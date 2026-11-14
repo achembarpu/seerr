@@ -13,6 +13,7 @@ import { Field, Form, Formik } from 'formik';
 import type { ChangeEvent } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR, { mutate } from 'swr';
+import { indexProgress } from './indexProgress';
 
 type SmartStatus = ReturnType<SmartSearchService['status']> & {
   popularCursor?: { type: 'movie' | 'tv'; page: number; totalPages?: number };
@@ -45,6 +46,7 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   searchIndexWaiting: 'Waiting for first download',
   searchIndexReady: 'Ready',
   searchIndexFailed: 'Update failed; retry scheduled',
+  searchIndexFailedManual: 'Update failed; use Refresh now to retry',
   searchIndexNext: 'Next update: {date}',
   searchIndexChecked: 'Last checked: {date}',
   searchIndexRefresh: 'Refresh now',
@@ -80,11 +82,15 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   lexicalProgress: 'Keyword index: {indexed} of {total} indexed descriptions',
   lexicalUpdating: 'Updating keyword index',
   popularProgress: 'Prioritizing popular {mediaType}, page {page}',
+  popularPaused: 'Popular {mediaType} indexing paused at page {page}',
+  popularPausedTotal:
+    'Popular {mediaType} indexing paused at page {page} of {total}',
   popularProgressTotal:
     'Prioritizing popular {mediaType}, page {page} of {total}',
   popularMovies: 'movies',
   popularSeries: 'series',
   scanProgressDetailed: 'Indexing {mediaType} from {period}, page {page}',
+  scanPausedDetailed: 'Indexing paused at {period}, {mediaType}, page {page}',
   rerank: 'Improve relevance with local reranking',
   rerankTip:
     'Download a separate 396 MB multilingual model when needed to refine search and similar-title results. It requires additional inference memory.',
@@ -95,6 +101,9 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   rerank20: '20 — faster',
   rerank40: '40 — balanced',
   rerank80: '80 — more thorough',
+  titleRefreshInterval: 'Title index refresh schedule',
+  titleRefreshIntervalTip:
+    'Daily and weekly check for title updates automatically. Manual only uses the current index until Refresh now is pressed.',
   smartRefreshInterval: 'Description index refresh schedule',
   smartRefreshIntervalTip:
     'Daily and weekly run the initial scan and check for updates automatically. Manual only requires Refresh now to start or resume indexing and to check for updates.',
@@ -134,6 +143,8 @@ const SettingsSearch = () => {
     'tmdb-tv': messages.searchIndexTv,
   } as const;
 
+  const progress = smartStatus ? indexProgress(smartStatus) : undefined;
+
   if (!data && !error) return <LoadingSpinner />;
   if (!data)
     return (
@@ -159,6 +170,8 @@ const SettingsSearch = () => {
         <Formik
           initialValues={{
             localTitleSearch: data.localTitleSearch,
+            localTitleSearchRefreshInterval:
+              data.localTitleSearchRefreshInterval ?? 'daily',
             smartSearch: data.smartSearch,
             smartSearchRerank: data.smartSearchRerank ?? false,
             smartSearchRerankCandidates: data.smartSearchRerankCandidates ?? 40,
@@ -219,6 +232,36 @@ const SettingsSearch = () => {
                   />
                 </div>
               </div>
+              {values.localTitleSearch && (
+                <div className="form-row">
+                  <label
+                    htmlFor="localTitleSearchRefreshInterval"
+                    className="text-label"
+                  >
+                    {intl.formatMessage(messages.titleRefreshInterval)}
+                    <span className="label-tip">
+                      {intl.formatMessage(messages.titleRefreshIntervalTip)}
+                    </span>
+                  </label>
+                  <div className="form-input-area">
+                    <Field
+                      as="select"
+                      id="localTitleSearchRefreshInterval"
+                      name="localTitleSearchRefreshInterval"
+                    >
+                      <option value="daily">
+                        {intl.formatMessage(messages.refreshDaily)}
+                      </option>
+                      <option value="weekly">
+                        {intl.formatMessage(messages.refreshWeekly)}
+                      </option>
+                      <option value="manual">
+                        {intl.formatMessage(messages.refreshManual)}
+                      </option>
+                    </Field>
+                  </div>
+                </div>
+              )}
               {data?.localTitleSearch && (
                 <div className="form-row">
                   <div className="form-input-area">
@@ -236,7 +279,10 @@ const SettingsSearch = () => {
                             searchIndexStatus.currentSource === key
                               ? messages.searchIndexUpdating
                               : searchIndexStatus.failedSources.includes(key)
-                                ? messages.searchIndexFailed
+                                ? data.localTitleSearchRefreshInterval ===
+                                  'manual'
+                                  ? messages.searchIndexFailedManual
+                                  : messages.searchIndexFailed
                                 : sourceStatus.available
                                   ? messages.searchIndexReady
                                   : messages.searchIndexWaiting;
@@ -505,50 +551,46 @@ const SettingsSearch = () => {
                           })}
                         </p>
                       )}
-                    {smartStatus.indexing && smartStatus.popularCursor && (
+                    {progress?.popular && (
                       <p className="mb-1 text-sm text-gray-300">
                         {intl.formatMessage(
-                          smartStatus.popularCursor.totalPages
-                            ? messages.popularProgressTotal
-                            : messages.popularProgress,
+                          progress.popular.paused
+                            ? progress.popular.totalPages
+                              ? messages.popularPausedTotal
+                              : messages.popularPaused
+                            : progress.popular.totalPages
+                              ? messages.popularProgressTotal
+                              : messages.popularProgress,
                           {
-                            total: smartStatus.popularCursor.totalPages,
+                            total: progress.popular.totalPages,
                             mediaType: intl.formatMessage(
-                              smartStatus.popularCursor.type === 'movie'
+                              progress.popular.type === 'movie'
                                 ? messages.popularMovies
                                 : messages.popularSeries
                             ),
-                            page: smartStatus.popularCursor.page,
+                            page: progress.popular.page,
                           }
                         )}
                       </p>
                     )}
-                    {smartStatus.indexing &&
-                      !smartStatus.popularCursor &&
-                      smartStatus.cursor && (
-                        <p className="mb-1 text-sm text-gray-300">
-                          {intl.formatMessage(messages.scanProgressDetailed, {
+                    {progress?.chronological && (
+                      <p className="mb-1 text-sm text-gray-300">
+                        {intl.formatMessage(
+                          progress.chronological.paused
+                            ? messages.scanPausedDetailed
+                            : messages.scanProgressDetailed,
+                          {
                             mediaType: intl.formatMessage(
-                              smartStatus.cursor.mediaType === 'movie'
+                              progress.chronological.mediaType === 'movie'
                                 ? messages.popularMovies
                                 : messages.popularSeries
                             ),
-                            period: [
-                              smartStatus.cursor.year,
-                              smartStatus.cursor.month || undefined,
-                              smartStatus.cursor.day || undefined,
-                            ]
-                              .filter(Boolean)
-                              .map((part, index) =>
-                                index
-                                  ? String(part).padStart(2, '0')
-                                  : String(part)
-                              )
-                              .join('-'),
-                            page: smartStatus.cursor.page,
-                          })}
-                        </p>
-                      )}
+                            period: progress.chronological.period,
+                            page: progress.chronological.page,
+                          }
+                        )}
+                      </p>
+                    )}
                     {smartStatus.indexing && (
                       <p className="mb-1 text-sm text-gray-400">
                         {intl.formatMessage(messages.indexCoverageTip)}

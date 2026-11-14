@@ -277,6 +277,10 @@ components:
         localTitleSearch:
           type: boolean
           example: false
+        localTitleSearchRefreshInterval:
+          type: string
+          enum: [daily, weekly, manual]
+          example: daily
         smartSearch:
           type: boolean
           example: false

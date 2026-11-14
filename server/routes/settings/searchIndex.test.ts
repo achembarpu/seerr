@@ -57,16 +57,20 @@ it('updates reranking without changing existing search settings and restarts the
   const before = { ...settings.main };
   const save = mock.method(settings, 'save', async () => undefined);
   const titleStart = mock.method(searchIndex, 'start', () => undefined);
+  const titleRestart = mock.method(searchIndex, 'reconfigure', () => undefined);
   const restart = mock.method(smartSearch, 'reconfigure', () => undefined);
   try {
     const result = await request(app)
       .post('/api/v1/settings/main')
       .send({
+        localTitleSearchRefreshInterval: 'weekly',
         smartSearchRerank: true,
         smartSearchRerankCandidates: 80,
         smartSearchRefreshInterval: 'weekly',
       })
       .expect(200);
+    assert.equal(result.body.localTitleSearchRefreshInterval, 'weekly');
+    assert.equal(titleRestart.mock.callCount(), 1);
     assert.equal(result.body.smartSearchRerank, true);
     assert.equal(result.body.smartSearchRerankCandidates, 80);
     assert.equal(result.body.smartSearchRefreshInterval, 'weekly');
@@ -86,11 +90,16 @@ it('updates reranking without changing existing search settings and restarts the
       .post('/api/v1/settings/main')
       .send({ smartSearchRefreshInterval: 'hourly' })
       .expect(400);
+    await request(app)
+      .post('/api/v1/settings/main')
+      .send({ localTitleSearchRefreshInterval: 'hourly' })
+      .expect(400);
     assert.equal(save.mock.callCount(), 1);
   } finally {
     Object.assign(settings.main, before);
     save.mock.restore();
     titleStart.mock.restore();
+    titleRestart.mock.restore();
     restart.mock.restore();
   }
 });

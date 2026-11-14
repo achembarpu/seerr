@@ -159,6 +159,7 @@ export interface MainSettings {
   youtubeUrl: string;
   versionCheck: boolean;
   localTitleSearch: boolean;
+  localTitleSearchRefreshInterval: 'daily' | 'weekly' | 'manual';
   smartSearch: boolean;
   smartSearchRerank: boolean;
   smartSearchRerankCandidates: number;
@@ -444,6 +445,7 @@ class Settings {
         youtubeUrl: '',
         versionCheck: true,
         localTitleSearch: false,
+        localTitleSearchRefreshInterval: 'daily',
         smartSearch: false,
         smartSearchRerank: false,
         smartSearchRerankCandidates: 40,

@@ -19,7 +19,8 @@ export interface SearchIndexStatus {
   sources: Record<Source, { available: boolean; lastChecked?: string }>;
 }
 
-const interval = 24 * 60 * 60 * 1000;
+const dailyInterval = 24 * 60 * 60 * 1000;
+const weeklyInterval = 7 * dailyInterval;
 const retryInterval = 60 * 60 * 1000;
 const sources: Source[] = ['imdb', 'imdb-ratings', 'tmdb-movie', 'tmdb-tv'];
 
@@ -44,7 +45,12 @@ export class SearchIndexService {
         case 'tmdb-tv':
           return refreshTmdb(index, 'tv', signal);
       }
-    }
+    },
+    private readonly refreshInterval: () =>
+      | 'daily'
+      | 'weekly'
+      | 'manual' = () =>
+      getSettings().main.localTitleSearchRefreshInterval ?? 'daily'
   ) {}
   private index?: SearchIndex;
   private opening?: Promise<SearchIndex>;
@@ -108,7 +114,26 @@ export class SearchIndexService {
       this.controller?.abort();
       return;
     }
+    if (this.refreshInterval() === 'manual') {
+      // Manual mode still opens the committed index for searches; it never
+      // triggers downloads unless the user explicitly requests a refresh.
+      void this.open().catch((error) => {
+        logger.warn('Unable to open local title search index', {
+          label: 'Search',
+          errorMessage: error instanceof Error ? error.message : String(error),
+        });
+      });
+      return;
+    }
     if (!this.controller && !this.timer) void this.refresh();
+  }
+
+  reconfigure(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    this.nextRefreshAt = undefined;
+    this.controller?.abort();
+    this.start();
   }
 
   refreshNow(): boolean {
@@ -183,15 +208,22 @@ export class SearchIndexService {
       this.controller = undefined;
       if (this.enabled()) {
         if (controller.signal.aborted) this.start();
-        else
-          this.schedule(this.failedSources.length ? retryInterval : interval);
+        else if (this.refreshInterval() !== 'manual')
+          this.schedule(
+            this.failedSources.length
+              ? retryInterval
+              : this.refreshInterval() === 'weekly'
+                ? weeklyInterval
+                : dailyInterval
+          );
       }
     }
   }
 
   async search(query: string, limit = 10) {
-    if (!this.enabled() || !this.index) return [];
-    return this.index.search(query, limit);
+    if (!this.enabled()) return [];
+    const index = await this.open();
+    return this.enabled() ? index.search(query, limit) : [];
   }
 }
 

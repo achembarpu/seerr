@@ -110,12 +110,28 @@ settingsRoutes.post('/main', async (req, res) => {
     !['daily', 'weekly', 'manual'].includes(req.body.smartSearchRefreshInterval)
   )
     return res.status(400).json({ message: 'Invalid search refresh interval' });
+  if (
+    req.body.localTitleSearchRefreshInterval !== undefined &&
+    !['daily', 'weekly', 'manual'].includes(
+      req.body.localTitleSearchRefreshInterval
+    )
+  )
+    return res
+      .status(400)
+      .json({ message: 'Invalid title search refresh interval' });
+  const previousTitleRefreshInterval =
+    settings.main.localTitleSearchRefreshInterval;
   const previousRefreshInterval = settings.main.smartSearchRefreshInterval;
   const previousDevice = settings.main.smartSearchDevice;
   const previousRerank = settings.main.smartSearchRerank;
   settings.main = merge(settings.main, req.body);
   await settings.save();
-  searchIndex.start();
+  if (
+    previousTitleRefreshInterval !==
+    settings.main.localTitleSearchRefreshInterval
+  )
+    searchIndex.reconfigure();
+  else searchIndex.start();
   if (
     previousDevice !== settings.main.smartSearchDevice ||
     previousRerank !== settings.main.smartSearchRerank ||

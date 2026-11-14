@@ -101,4 +101,127 @@ describe('local search index lifecycle', () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+  it('opens an existing index in manual mode without downloading and refreshes only on request', async () => {
+    let enabled = true;
+    const directory = await mkdtemp(
+      path.join(tmpdir(), 'seerr-service-manual-')
+    );
+    const filename = path.join(directory, 'index.sqlite3');
+    const existing = new SearchIndex(filename);
+    await existing.initialize();
+    await existing.beginImport('imdb');
+    await existing.writeBatch([
+      {
+        sourceId: 'tt1',
+        mediaType: 'movie',
+        title: 'Maaveeran',
+        originalTitle: 'Maaveeran',
+        popularity: 100,
+      },
+    ]);
+    await existing.finishImport('v1');
+    await existing.close();
+    const index = new SearchIndex(filename);
+    const calls: string[] = [];
+    const service = new SearchIndexService(
+      () => enabled,
+      () => index,
+      async (source) => {
+        calls.push(source);
+        return undefined;
+      },
+      () => 'manual'
+    );
+    try {
+      service.start();
+      assert.equal((await service.search('maveran'))[0]?.sourceId, 'tt1');
+      assert.deepEqual(calls, []);
+      assert.equal(service.status().sources.imdb.available, true);
+      assert.equal(service.status().nextRefreshAt, undefined);
+      assert.equal(service.refreshNow(), true);
+      // Saving an unrelated setting must not abort a user-requested refresh.
+      service.start();
+      await waitUntil(() => !service.status().refreshing);
+      assert.equal(calls.length, 4);
+      assert.equal(service.status().nextRefreshAt, undefined);
+      assert.equal((await service.search('maveran'))[0]?.sourceId, 'tt1');
+    } finally {
+      enabled = false;
+      service.start();
+      await index.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('cancels an active update when changed to manual without restarting it', async () => {
+    let enabled = true;
+    let schedule: 'daily' | 'manual' = 'daily';
+    let entered = false;
+    let calls = 0;
+    const directory = await mkdtemp(
+      path.join(tmpdir(), 'seerr-service-manual-')
+    );
+    const index = new SearchIndex(path.join(directory, 'index.sqlite3'));
+    const service = new SearchIndexService(
+      () => enabled,
+      () => index,
+      async (_source, _index, signal) => {
+        calls++;
+        if (calls === 1) {
+          entered = true;
+          await new Promise<void>((_resolve, reject) =>
+            signal.addEventListener('abort', () => reject(signal.reason), {
+              once: true,
+            })
+          );
+        }
+        return undefined;
+      },
+      () => schedule
+    );
+    try {
+      service.start();
+      await waitUntil(() => entered);
+      schedule = 'manual';
+      service.reconfigure();
+      await waitUntil(() => !service.status().refreshing);
+      assert.equal(calls, 1);
+      assert.equal(service.status().nextRefreshAt, undefined);
+      assert.equal(service.refreshNow(), true);
+      await waitUntil(() => !service.status().refreshing);
+      assert.equal(calls, 5);
+      assert.equal(service.status().nextRefreshAt, undefined);
+    } finally {
+      enabled = false;
+      service.start();
+      await index.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('schedules a weekly refresh after a successful update', async () => {
+    let enabled = true;
+    const directory = await mkdtemp(
+      path.join(tmpdir(), 'seerr-service-weekly-')
+    );
+    const index = new SearchIndex(path.join(directory, 'index.sqlite3'));
+    const service = new SearchIndexService(
+      () => enabled,
+      () => index,
+      async () => undefined,
+      () => 'weekly'
+    );
+    try {
+      service.start();
+      await waitUntil(() => !service.status().refreshing);
+      const refreshAt = Date.parse(service.status().nextRefreshAt ?? '');
+      assert.ok(refreshAt > Date.now() + 6 * 24 * 60 * 60 * 1000);
+      assert.ok(refreshAt <= Date.now() + 7 * 24 * 60 * 60 * 1000);
+    } finally {
+      enabled = false;
+      service.start();
+      await index.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });
