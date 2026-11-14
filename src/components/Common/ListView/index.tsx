@@ -12,6 +12,7 @@ import type {
   PersonResult,
   TvResult,
 } from '@server/models/Search';
+import type { Ref } from 'react';
 import { useIntl } from 'react-intl';
 
 type ListViewProps = {
@@ -22,6 +23,8 @@ type ListViewProps = {
   isReachingEnd?: boolean;
   onScrollBottom: () => void;
   mutateParent?: () => void;
+  /** Opt in to stable identities and a grid ref for search-result reordering. */
+  reorderGridRef?: Ref<HTMLUListElement>;
 };
 
 const ListView = ({
@@ -32,6 +35,7 @@ const ListView = ({
   isReachingEnd,
   plexItems,
   mutateParent,
+  reorderGridRef,
 }: ListViewProps) => {
   const intl = useIntl();
   const { hasPermission } = useUser();
@@ -49,7 +53,7 @@ const ListView = ({
           {intl.formatMessage(globalMessages.noresults)}
         </div>
       )}
-      <ul className="cards-vertical">
+      <ul className="cards-vertical" ref={reorderGridRef}>
         {plexItems?.map((title, index) => {
           return (
             <li key={`${title.ratingKey}-${index}`}>
@@ -145,7 +149,15 @@ const ListView = ({
                 break;
             }
 
-            return <li key={`${title.id}-${index}`}>{titleCard}</li>;
+            const resultKey = `${title.mediaType}:${title.id}`;
+            return (
+              <li
+                key={reorderGridRef ? resultKey : `${title.id}-${index}`}
+                data-result-key={reorderGridRef ? resultKey : undefined}
+              >
+                {titleCard}
+              </li>
+            );
           })}
         {isLoading &&
           !isReachingEnd &&

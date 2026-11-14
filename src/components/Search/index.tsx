@@ -18,6 +18,7 @@ import useSWR from 'swr';
 import SmartSearch, { emptySearchFilters } from './SmartSearch';
 import { mergeResults, type SearchItem } from './mergeResults';
 import { serializeSmartSearchParams } from './smartSearchQuery';
+import { useSearchReorderAnimation } from './useSearchReorderAnimation';
 
 const messages = defineMessages('components.Search', {
   search: 'Search',
@@ -97,6 +98,16 @@ const Search = () => {
     smart?.results ?? [],
     filters
   );
+  const reorderGridRef = useSearchReorderAnimation({
+    context: `${query}\u0000${JSON.stringify(filters)}`,
+    order: items.map((item) => `${item.mediaType}:${item.id}`).join('|'),
+    regularResults: titles
+      .map((item) => `${item.mediaType}:${item.id}`)
+      .join('|'),
+    suggestions,
+    smartResults: smart,
+    paginating: isLoadingMore,
+  });
   const loading =
     isLoadingInitialData ||
     suggestionsLoading ||
@@ -133,6 +144,7 @@ const Search = () => {
         </p>
       )}
       <ListView
+        reorderGridRef={reorderGridRef}
         items={items}
         isEmpty={!loading && items.length === 0}
         isLoading={loading || isLoadingMore}
