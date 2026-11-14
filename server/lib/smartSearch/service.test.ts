@@ -1,3 +1,4 @@
+import { getSettings } from '@server/lib/settings';
 import { mkdtemp, rm } from 'fs/promises';
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
@@ -350,4 +351,316 @@ describe('smart search lifecycle', () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+});
+
+describe('hybrid retrieval resilience', () => {
+  it('uses lexical and remote results when embedding startup fails', async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-hybrid-'));
+    const filename = path.join(directory, 'index.sqlite3');
+    const store = new SmartStore(filename);
+    await store.initialize();
+    await store.upsert(
+      {
+        ...document,
+        sourceId: '20',
+        title: 'Barber drama',
+        overview: 'A barber unravels a murder mystery',
+        card: { id: 20 },
+      },
+      quantize([1, 0])
+    );
+    await store.close();
+    const settings = getSettings().main;
+    const original = settings.smartSearchRefreshInterval;
+    settings.smartSearchRefreshInterval = 'manual';
+    const source: MetadataSource = {
+      id: 'tmdb',
+      async fetchOne() {
+        return undefined;
+      },
+      async fetchPage() {
+        return { documents: [], totalPages: 0 };
+      },
+      async searchRelated() {
+        return [{ ...document, sourceId: '21', card: { id: 21 } }];
+      },
+    };
+    const engine = {
+      phase: 'idle' as const,
+      downloadBytes: 0,
+      downloadTotal: 1,
+      async start() {
+        throw new Error('offline');
+      },
+      stop() {},
+      async embed() {
+        return [];
+      },
+    };
+    const service = new SmartSearchService(
+      () => true,
+      engine,
+      source,
+      () => new SmartStore(filename)
+    );
+    try {
+      service.start();
+      await waitFor(() => service.status().count === 1);
+      const results = await service.search('barber murder', {});
+      assert.ok(
+        results.some(
+          (result) =>
+            result.document.sourceId === '20' &&
+            result.methods?.includes('lexical')
+        )
+      );
+      assert.ok(results.some((result) => result.document.sourceId === '21'));
+      assert.ok(service.status().retrievalWarning);
+    } finally {
+      await service.close();
+      settings.smartSearchRefreshInterval = original;
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('serves TMDB related candidates with local smart search disabled', async () => {
+    const source: MetadataSource = {
+      id: 'tmdb',
+      async fetchOne() {
+        return undefined;
+      },
+      async fetchPage() {
+        return { documents: [], totalPages: 0 };
+      },
+      async fetchRelated(_type, _id, language) {
+        assert.equal(language, 'fr');
+        return [{ ...document, sourceId: '21', card: { id: 21 } }];
+      },
+    };
+    const service = new SmartSearchService(() => false, undefined, source);
+    const results = await service.similar('movie', '12', {}, 'fr');
+    assert.equal(results[0]?.document.sourceId, '21');
+    await service.close();
+  });
+});
+
+describe('bounded search work', () => {
+  it('waits briefly for an in-flight dense scan instead of dropping the next request', async () => {
+    const service = new SmartSearchService(() => true);
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let calls = 0;
+    const internal = service as unknown as {
+      store: { search: () => Promise<unknown[]> };
+      searchDense: (
+        vector: Buffer,
+        filters: object,
+        limit: number
+      ) => Promise<unknown[]>;
+    };
+    internal.store = {
+      async search() {
+        calls++;
+        if (calls === 1) await gate;
+        return [];
+      },
+    };
+    const first = internal.searchDense(Buffer.from([1]), {}, 1);
+    const second = internal.searchDense(Buffer.from([1]), {}, 1);
+    release();
+    await Promise.all([first, second]);
+    assert.equal(calls, 2);
+  });
+
+  it('does not wait for a reranker model still downloading', async () => {
+    const settings = getSettings().main;
+    const original = settings.smartSearchRerank;
+    settings.smartSearchRerank = true;
+    const service = new SmartSearchService(() => true);
+    const internal = service as unknown as {
+      reranker: { phase: string };
+      rerank: (
+        query: string,
+        candidates: { document: SmartDocument; score: number }[]
+      ) => Promise<unknown[]>;
+    };
+    internal.reranker = { phase: 'downloading' };
+    try {
+      const candidates = [{ document, score: 0.5 }];
+      const result = await Promise.race([
+        internal.rerank('query', candidates),
+        delay(500).then(() => {
+          throw new Error('waited for download');
+        }),
+      ]);
+      assert.deepEqual(result, candidates);
+    } finally {
+      settings.smartSearchRerank = original;
+    }
+  });
+});
+
+it('blends reranking with initial retrieval so strong multilingual hits remain visible', async () => {
+  const settings = getSettings().main;
+  const originalRerank = settings.smartSearchRerank;
+  const originalLimit = settings.smartSearchRerankCandidates;
+  settings.smartSearchRerank = true;
+  settings.smartSearchRerankCandidates = 40;
+  const service = new SmartSearchService(() => true);
+  const internal = service as unknown as {
+    reranker: {
+      phase: string;
+      rerank: (query: string, docs: string[]) => Promise<number[]>;
+    };
+    rerank: (
+      query: string,
+      candidates: { document: SmartDocument; score: number }[]
+    ) => Promise<{ document: SmartDocument }[]>;
+    rerankerIdle?: NodeJS.Timeout;
+    rerankerError?: string;
+  };
+  internal.reranker = {
+    phase: 'ready',
+    async rerank(_query, docs) {
+      return docs.map((_, index) => index);
+    },
+  };
+  try {
+    internal.rerankerError = 'previous timeout';
+    const candidates = Array.from({ length: 40 }, (_, index) => ({
+      document: { ...document, sourceId: String(index) },
+      score: 1 / (index + 1),
+    }));
+    const result = await internal.rerank('a multilingual query', candidates);
+    assert.ok(result.findIndex((item) => item.document.sourceId === '2') < 10);
+    assert.equal(service.status().reranker.error, undefined);
+  } finally {
+    if (internal.rerankerIdle) clearTimeout(internal.rerankerIdle);
+    settings.smartSearchRerank = originalRerank;
+    settings.smartSearchRerankCandidates = originalLimit;
+  }
+});
+
+it('offers a relevant high-audience deep candidate to the reranker without re-embedding', async () => {
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      return [[1, 0]];
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const dense = Array.from({ length: 500 }, (_, index) => ({
+    document: {
+      ...document,
+      sourceId: String(index),
+      voteCount: index === 300 ? 10000 : 0,
+    },
+    score: 1 / (index + 1),
+  }));
+  let offered: string[] = [];
+  const internal = service as unknown as {
+    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    searchDense: () => Promise<typeof dense>;
+    rerank: (query: string, candidates: typeof dense) => Promise<typeof dense>;
+    idleTimer?: NodeJS.Timeout;
+  };
+  internal.open = async () => ({
+    async searchLexical() {
+      return [];
+    },
+  });
+  internal.searchDense = async () => dense;
+  internal.rerank = async (_query, candidates) => {
+    offered = candidates.slice(0, 40).map((item) => item.document.sourceId);
+    return candidates;
+  };
+  try {
+    await service.search('an ordinary descriptive query', {});
+    assert.ok(offered.includes('300'));
+    assert.ok(offered.includes('0'));
+  } finally {
+    if (internal.idleTimer) clearTimeout(internal.idleTimer);
+  }
+});
+
+it('uses ephemeral description similarity to avoid promoting unrelated remote recommendations', async () => {
+  const settings = getSettings().main;
+  const original = settings.smartSearchRerank;
+  settings.smartSearchRerank = false;
+  const seed = { ...document, sourceId: '1', title: 'Seed' };
+  const remoteNoise = {
+    ...document,
+    sourceId: '2',
+    title: 'Noise',
+    overview: 'Unrelated',
+  };
+  const remoteMatch = {
+    ...document,
+    sourceId: '3',
+    title: 'Match',
+    overview: 'Related',
+  };
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed(texts: string[]) {
+      return texts.map((text) =>
+        text.includes('Unrelated') ? [0, 1] : [1, 0]
+      );
+    },
+  };
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+    async fetchRelated() {
+      return [remoteNoise, remoteMatch];
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const internal = service as unknown as {
+    store: {
+      find: () => Promise<{ document: SmartDocument; vector: Buffer }>;
+      search: () => Promise<never[]>;
+    };
+  };
+  internal.store = {
+    async find() {
+      return { document: seed, vector: quantize([1, 0]) };
+    },
+    async search() {
+      return [];
+    },
+  };
+  try {
+    const result = await service.similar('movie', '1', {});
+    assert.deepEqual(
+      result.map((item) => item.document.sourceId),
+      ['3', '2']
+    );
+  } finally {
+    settings.smartSearchRerank = original;
+  }
 });

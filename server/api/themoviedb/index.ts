@@ -183,7 +183,12 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
   constructor({
     discoverRegion,
     originalLanguage,
-  }: { discoverRegion?: string; originalLanguage?: string } = {}) {
+    timeout,
+  }: {
+    discoverRegion?: string;
+    originalLanguage?: string;
+    timeout?: number;
+  } = {}) {
     super(
       'https://api.themoviedb.org/3',
       {
@@ -191,6 +196,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
       },
       {
         nodeCache: cacheManager.getCache('tmdb').data,
+        timeout,
         rateLimit: {
           maxRequests: 20,
           maxRPS: 50,

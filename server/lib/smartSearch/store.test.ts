@@ -116,3 +116,158 @@ describe('smart search index', () => {
     assert.equal(await store.getState('cursor'), 'checkpoint');
   });
 });
+
+it('indexes lexical metadata without changing embeddings, and keeps it updated', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-lexical-'));
+  const store = new SmartStore(path.join(directory, 'store.sqlite3'));
+  try {
+    await store.initialize();
+    const vector = quantize([1, 0]);
+    await store.upsert(
+      doc('22', {
+        title: 'The Barber',
+        overview: 'A barber pursues a murderer',
+      }),
+      vector
+    );
+    assert.equal(
+      (await store.searchLexical('barber murder'))[0]?.document.sourceId,
+      '22'
+    );
+    assert.deepEqual((await store.find('tmdb', 'movie', '22'))?.vector, vector);
+    await store.upsert(
+      doc('22', { title: 'New Title', overview: 'A voyage to the stars' }),
+      vector
+    );
+    assert.equal((await store.searchLexical('barber')).length, 0);
+    assert.equal(
+      (await store.searchLexical('voyage'))[0]?.document.sourceId,
+      '22'
+    );
+    await store.remove('tmdb', 'movie', '22');
+    assert.equal((await store.searchLexical('voyage')).length, 0);
+  } finally {
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('pauses lexical backfill at its checkpoint and resumes without changing vectors', async () => {
+  const directory = await mkdtemp(
+    path.join(os.tmpdir(), 'smart-lexical-pause-')
+  );
+  const store = new SmartStore(path.join(directory, 'store.sqlite3'));
+  const methods = store as unknown as {
+    lexicalTask?: Promise<void>;
+    run: (sql: string, params?: (string | number | null)[]) => Promise<void>;
+  };
+  try {
+    await store.initialize();
+    store.pauseLexical();
+    await methods.lexicalTask;
+    const vector = quantize([1, 0]);
+    await store.upsertBatch(
+      Array.from({ length: 600 }, (_, index) => ({
+        document: doc(String(index), { overview: `unique story ${index}` }),
+        vector,
+      }))
+    );
+    await methods.run('DELETE FROM smart_fts');
+    await store.setState('lexicalCursor', '0');
+    const setState = store.setState.bind(store);
+    store.setState = async (key, value) => {
+      await setState(key, value);
+      if (key === 'lexicalCursor' && Number(value) > 0) store.pauseLexical();
+    };
+    store.resumeLexical();
+    await methods.lexicalTask;
+    const cursor = Number(await store.getState('lexicalCursor'));
+    assert.ok(cursor > 0 && cursor < 600);
+    assert.equal(store.lexicalStatus().complete, false);
+    store.setState = setState;
+    store.resumeLexical();
+    await methods.lexicalTask;
+    assert.equal(store.lexicalStatus().complete, true);
+    assert.equal(store.lexicalStatus().indexed, 600);
+    assert.deepEqual(
+      (await store.find('tmdb', 'movie', '599'))?.vector,
+      vector
+    );
+  } finally {
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('resumes if lexical indexing is re-enabled while a paused batch is finalizing', async () => {
+  const directory = await mkdtemp(
+    path.join(os.tmpdir(), 'smart-lexical-race-')
+  );
+  const store = new SmartStore(path.join(directory, 'store.sqlite3'));
+  const methods = store as unknown as {
+    lexicalTask?: Promise<void>;
+    run: (sql: string, params?: (string | number | null)[]) => Promise<void>;
+  };
+  let release: () => void = () => undefined;
+  let entered: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const finalizing = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  try {
+    await store.initialize();
+    store.pauseLexical();
+    await methods.lexicalTask;
+    const vector = quantize([1, 0]);
+    await store.upsertBatch(
+      Array.from({ length: 600 }, (_, index) => ({
+        document: doc(String(index)),
+        vector,
+      }))
+    );
+    await methods.run('DELETE FROM smart_fts');
+    await store.setState('lexicalCursor', '0');
+    const setState = store.setState.bind(store);
+    const count = store.count.bind(store);
+    let paused = false;
+    let blocked = false;
+    store.setState = async (key, value) => {
+      await setState(key, value);
+      if (!paused && key === 'lexicalCursor' && Number(value) > 0) {
+        paused = true;
+        store.pauseLexical();
+      }
+    };
+    store.count = async () => {
+      const result = await count();
+      if (paused && !blocked) {
+        blocked = true;
+        entered();
+        await gate;
+      }
+      return result;
+    };
+    store.resumeLexical();
+    const first = methods.lexicalTask;
+    await finalizing;
+    store.resumeLexical();
+    release();
+    await first;
+    for (let i = 0; i < 100 && !store.lexicalStatus().complete; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(store.lexicalStatus().complete, true);
+    assert.equal(store.lexicalStatus().indexed, 600);
+    assert.equal(Number(await store.getState('lexicalCursor')), 600);
+    assert.deepEqual(
+      (await store.find('tmdb', 'movie', '599'))?.vector,
+      vector
+    );
+  } finally {
+    release();
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

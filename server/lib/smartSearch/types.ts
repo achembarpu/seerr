@@ -34,6 +34,21 @@ export interface MetadataSource {
     id: string,
     signal?: AbortSignal
   ): Promise<SmartDocument | undefined>;
+  searchRelated?(
+    query: string,
+    filters: SmartFilters,
+    language?: string
+  ): Promise<SmartDocument[]>;
+  fetchRelated?(
+    mediaType: SmartMediaType,
+    id: string,
+    language?: string
+  ): Promise<SmartDocument[]>;
+  fetchPopular?(
+    mediaType: SmartMediaType,
+    page: number,
+    signal?: AbortSignal
+  ): Promise<{ documents: SmartDocument[]; totalPages: number }>;
   fetchChanges?(
     mediaType: SmartMediaType,
     from: string,

@@ -33,6 +33,10 @@ const modelName = 'bekko-embedding-v1-a8m-Q8_0.gguf';
 const modelHash =
   '0b0214214287e90ffb98ffb47e1071e5b193fb420d1d99b2ec8aab0ebb507fc0';
 const modelUrl = `https://huggingface.co/hotchpotch/bekko-embedding-v1-a8m-GGUF/resolve/4acacdea60b9393ae247a6ebf5b5707938c9755b/${modelName}`;
+const rerankerName = 'Qwen3-Reranker-0.6B-Q4_K_M.gguf';
+const rerankerHash =
+  '5290f5b9a2636be40baf807feafcfb222e0c4670a083fb3447d87993566190a9';
+const rerankerUrl = `https://huggingface.co/gorse-io/Qwen3-Reranker-0.6B-GGUF/resolve/7af0c7c371b5ad3daf771ce4f6d091a4d38c799a/${rerankerName}`;
 
 async function checksum(filename: string): Promise<string> {
   const hash = createHash('sha256');
@@ -70,29 +74,37 @@ export class EmbeddingEngine {
   devices: InferenceDevice[] = [];
   activeDevice?: string;
   deviceWarning?: string;
-  constructor(private readonly configuredDevice: () => string = () => 'auto') {}
+  constructor(
+    private readonly configuredDevice: () => string = () => 'auto',
+    private readonly mode: 'embedding' | 'reranking' = 'embedding'
+  ) {}
   downloadBytes = 0;
-  downloadTotal = 118639520;
+  get downloadTotal(): number {
+    return this.mode === 'embedding' ? 118639520 : 396476320;
+  }
   phase: 'idle' | 'downloading' | 'starting' | 'ready' = 'idle';
 
   private async model(signal: AbortSignal): Promise<string> {
     const directory = path.join(appDataPath(), 'models');
     await mkdir(directory, { recursive: true });
-    const filename = path.join(directory, modelName);
+    const name = this.mode === 'embedding' ? modelName : rerankerName;
+    const hash = this.mode === 'embedding' ? modelHash : rerankerHash;
+    const url = this.mode === 'embedding' ? modelUrl : rerankerUrl;
+    const filename = path.join(directory, name);
     if (
       await stat(filename).then(
         () => true,
         () => false
       )
     ) {
-      if ((await checksum(filename)) === modelHash) return filename;
+      if ((await checksum(filename)) === hash) return filename;
       await unlink(filename);
     }
     this.phase = 'downloading';
     this.downloadBytes = 0;
     const temporary = `${filename}.partial`;
     try {
-      const response = await axios.get<NodeJS.ReadableStream>(modelUrl, {
+      const response = await axios.get<NodeJS.ReadableStream>(url, {
         responseType: 'stream',
         signal,
         timeout: 60000,
@@ -102,7 +114,7 @@ export class EmbeddingEngine {
         this.downloadBytes += chunk.length;
       });
       await pipeline(response.data, createWriteStream(temporary), { signal });
-      if ((await checksum(temporary)) !== modelHash)
+      if ((await checksum(temporary)) !== hash)
         throw new Error('Downloaded model failed SHA-256 verification');
       await rename(temporary, filename);
       return filename;
@@ -127,7 +139,11 @@ export class EmbeddingEngine {
   }
 
   private async launch(signal: AbortSignal): Promise<void> {
-    const selection = this.configuredDevice() || 'auto';
+    const configured = this.configuredDevice() || 'auto';
+    const selection =
+      configured === 'external' && this.mode === 'reranking'
+        ? 'auto'
+        : configured;
     if (selection === 'external') {
       this.phase = 'starting';
       await this.connectExternal(signal);
@@ -229,11 +245,11 @@ export class EmbeddingEngine {
       [
         '--model',
         modelPath,
-        '--embedding',
-        '--pooling',
-        'mean',
+        ...(this.mode === 'embedding'
+          ? ['--embedding', '--pooling', 'mean']
+          : ['--reranking', '--pooling', 'rank']),
         '--ctx-size',
-        '512',
+        this.mode === 'embedding' ? '512' : '2048',
         '--threads',
         '2',
         '--parallel',
@@ -284,7 +300,8 @@ export class EmbeddingEngine {
           continue;
         }
         this.phase = 'ready';
-        await this.embed(['test']);
+        if (this.mode === 'embedding') await this.embed(['test']);
+        else await this.rerank('test', ['test']);
         signal.throwIfAborted();
         this.activeDevice = device ?? 'cpu';
         return;
@@ -298,7 +315,7 @@ export class EmbeddingEngine {
     }
   }
 
-  async embed(texts: string[]): Promise<number[][]> {
+  async embed(texts: string[], signal?: AbortSignal): Promise<number[][]> {
     if (this.phase !== 'ready') throw new Error('Embedding model is not ready');
     let response;
     try {
@@ -309,6 +326,7 @@ export class EmbeddingEngine {
         { input: texts },
         {
           timeout: 120000,
+          signal,
           headers: { Authorization: `Bearer ${this.externalKey ?? this.key}` },
           proxy: false,
         }
@@ -336,6 +354,40 @@ export class EmbeddingEngine {
     )
       throw new Error('Invalid embedding response');
     return data;
+  }
+
+  async rerank(
+    query: string,
+    documents: string[],
+    timeout = 6000
+  ): Promise<number[]> {
+    if (this.phase !== 'ready') throw new Error('Reranker is not ready');
+    if (!documents.length) return [];
+    const response = await this.local.post<{
+      results: { index: number; relevance_score: number }[];
+    }>(
+      `${this.baseUrl}/v1/rerank`,
+      { model: rerankerName, query, documents },
+      {
+        timeout,
+        headers: { Authorization: `Bearer ${this.key}` },
+        proxy: false,
+      }
+    );
+    const scores = Array<number>(documents.length).fill(NaN);
+    for (const item of response.data.results ?? []) {
+      if (
+        !Number.isInteger(item.index) ||
+        item.index < 0 ||
+        item.index >= scores.length ||
+        Number.isFinite(scores[item.index])
+      )
+        throw new Error('Invalid reranker response');
+      scores[item.index] = item.relevance_score;
+    }
+    if (scores.some((score) => !Number.isFinite(score)))
+      throw new Error('Invalid reranker response');
+    return scores;
   }
 
   stop(): void {

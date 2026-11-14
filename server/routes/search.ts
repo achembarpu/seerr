@@ -4,6 +4,7 @@ import type {
   TmdbSearchMultiResponse,
   TmdbTvResult,
 } from '@server/api/themoviedb/interfaces';
+import { MediaStatus } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
 import { MediaRequest } from '@server/entity/MediaRequest';
@@ -74,7 +75,7 @@ searchRoutes.get('/smart', async (req, res, next) => {
     const query =
       typeof req.query.query === 'string' ? req.query.query.trim() : '';
     const status = smartSearch.status();
-    if (!query || !status.enabled || !status.count)
+    if (!query || !status.enabled)
       return res.status(200).json({
         results: [],
         enabled: status.enabled,
@@ -82,12 +83,20 @@ searchRoutes.get('/smart', async (req, res, next) => {
       });
     const matches = await smartSearch.search(
       query.slice(0, 500),
-      smartFilters(req.query)
+      smartFilters(req.query),
+      (req.query.language as string) ?? req.locale
     );
     const results = (await smartCards(matches, req.user)).map(
-      (card, index) => ({ ...card, matchScore: matches[index].score })
+      (card, index) => ({
+        ...card,
+        matchScore: matches[index].score,
+        searchMethods: matches[index].methods,
+        reranked: matches[index].reranked ?? false,
+      })
     );
-    return res.status(200).json({ results, enabled: true, ready: true });
+    return res
+      .status(200)
+      .json({ results, enabled: true, ready: smartSearch.status().count > 0 });
   } catch (error) {
     return next(error);
   }
@@ -113,14 +122,52 @@ searchRoutes.get('/smart/recommendations', async (req, res, next) => {
         type: request.media.mediaType as SmartMediaType,
         id: String(request.media.tmdbId),
       }));
-    const matches = await smartSearch.recommendations(
-      seeds,
-      smartFilters(req.query)
-    );
+    let basis: 'requests' | 'library' | 'none' = seeds.length
+      ? 'requests'
+      : 'none';
+    let matches = seeds.length
+      ? await smartSearch.recommendations(
+          seeds,
+          smartFilters(req.query),
+          req.locale
+        )
+      : [];
+    if (!matches.length) {
+      const library = await getRepository(Media).find({
+        where: [
+          { status: MediaStatus.AVAILABLE },
+          { status: MediaStatus.PARTIALLY_AVAILABLE },
+        ],
+        order: { mediaAddedAt: 'DESC' },
+        take: 10,
+      });
+      const librarySeeds = library
+        .filter(
+          (media) =>
+            media.tmdbId &&
+            (media.mediaType === 'movie' || media.mediaType === 'tv')
+        )
+        .map((media) => ({
+          type: media.mediaType as SmartMediaType,
+          id: String(media.tmdbId),
+        }));
+      matches = librarySeeds.length
+        ? await smartSearch.recommendations(
+            librarySeeds,
+            smartFilters(req.query),
+            req.locale
+          )
+        : [];
+      basis = matches.length ? 'library' : 'none';
+    }
     const results = await smartCards(matches, req.user);
-    return res
-      .status(200)
-      .json({ page: 1, totalPages: 1, totalResults: results.length, results });
+    return res.status(200).json({
+      page: 1,
+      totalPages: 1,
+      totalResults: results.length,
+      results,
+      basis,
+    });
   } catch (error) {
     return next(error);
   }
@@ -132,7 +179,8 @@ searchRoutes.get('/smart/similar', async (req, res, next) => {
     const matches = await smartSearch.similar(
       type,
       String(req.query.id),
-      smartFilters(req.query)
+      smartFilters(req.query),
+      (req.query.language as string) ?? req.locale
     );
     const results = await smartCards(matches, req.user);
     return res

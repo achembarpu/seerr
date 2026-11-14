@@ -115,3 +115,23 @@ it('serves a valid paginated response for similar-title sliders', async () => {
   assert.equal(similar.mock.calls[0].arguments[2]?.yearFrom, 2000);
   assert.equal(similar.mock.calls[0].arguments[2]?.minRating, 7);
 });
+
+it('reports readiness after the index opens during a search', async () => {
+  status.mock.mockImplementationOnce(() => ({
+    enabled: true,
+    phase: 'ready' as const,
+    indexing: false,
+    count: 0,
+    cursor: undefined,
+    error: undefined,
+    nextRefreshAt: undefined,
+    downloadBytes: 0,
+    downloadTotal: 1,
+  }));
+  const response = await request(app)
+    .get('/api/v1/search/smart')
+    .query({ query: 'a mystery' })
+    .expect(200);
+  assert.equal(response.body.ready, true);
+  assert.equal(response.body.results[0].title, 'Example');
+});

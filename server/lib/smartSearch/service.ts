@@ -4,7 +4,12 @@ import { appDataPath } from '@server/utils/appDataVolume';
 import path from 'path';
 import { setTimeout as delay } from 'timers/promises';
 import { EmbeddingEngine } from './engine';
-import { documentHash, documentText, SmartStore } from './store';
+import {
+  documentHash,
+  documentText,
+  SmartStore,
+  type SmartMatch,
+} from './store';
 import { TmdbMetadataSource } from './tmdb';
 import type {
   MetadataSource,
@@ -12,7 +17,7 @@ import type {
   SmartFilters,
   SmartMediaType,
 } from './types';
-import { quantize } from './vectors';
+import { cosine, quantize } from './vectors';
 
 type Cursor = {
   year: number;
@@ -24,6 +29,68 @@ type Cursor = {
 const firstYear = 1870;
 const interval = 24 * 60 * 60 * 1000;
 const retryInterval = 60 * 60 * 1000;
+
+/** Keep offline upstream discovery from blocking the local index indefinitely. */
+async function withDeadline<T>(
+  operation: Promise<T>,
+  timeout = 2500
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('Search source timed out')),
+          timeout
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+const matchesFilters = (doc: SmartDocument, f: SmartFilters): boolean =>
+  (!f.mediaType || doc.mediaType === f.mediaType) &&
+  (!f.language || doc.originalLanguage === f.language) &&
+  (f.yearFrom === undefined || (doc.year !== null && doc.year >= f.yearFrom)) &&
+  (f.yearTo === undefined || (doc.year !== null && doc.year <= f.yearTo)) &&
+  (f.genre === undefined || doc.genreIds.includes(f.genre)) &&
+  (f.minRating === undefined || doc.voteAverage >= f.minRating) &&
+  (f.minVotes === undefined || doc.voteCount >= f.minVotes);
+
+/** Fuse independent ranked candidate lists without comparing incompatible score scales. */
+export function fuseSmartCandidates(
+  lists: SmartMatch[][],
+  limit = 100
+): SmartMatch[] {
+  const entries = new Map<
+    string,
+    { item: SmartMatch; rank: number; order: number }
+  >();
+  let order = 0;
+  for (const list of lists)
+    list.forEach((item, index) => {
+      const key = `${item.document.mediaType}:${item.document.source}:${item.document.sourceId}`;
+      const existing = entries.get(key);
+      if (existing) {
+        existing.rank += 1 / (40 + index + 1);
+        for (const method of item.methods ?? [])
+          if (!existing.item.methods?.includes(method))
+            existing.item.methods?.push(method);
+      } else
+        entries.set(key, {
+          item: { ...item, methods: [...(item.methods ?? [])] },
+          rank: 1 / (40 + index + 1),
+          order: order++,
+        });
+    });
+  return [...entries.values()]
+    .sort((a, b) => b.rank - a.rank || a.order - b.order)
+    .slice(0, limit)
+    .map(({ item, rank }) => ({ ...item, score: rank }));
+}
 
 export class SmartSearchService {
   constructor(
@@ -45,13 +112,36 @@ export class SmartSearchService {
     private readonly createStore: () => SmartStore = () =>
       new SmartStore(path.join(appDataPath(), 'smart-search.sqlite3'))
   ) {}
+  private readonly reranker = new EmbeddingEngine(
+    () => getSettings().main.smartSearchDevice || 'auto',
+    'reranking'
+  );
+  private rerankerError?: string;
+  private rerankerRetryAt = 0;
+  private rerankerBusy = false;
+  private rerankerDone?: Promise<void>;
+  private retrievalWarning?: string;
+  private denseBusy = false;
+  private denseWaiters = 0;
+  private denseDone?: Promise<void>;
+  private rerankerIdle?: NodeJS.Timeout;
   private closing = false;
   private store?: SmartStore;
+  private opening?: Promise<SmartStore>;
   private controller?: AbortController;
   private timer?: NodeJS.Timeout;
   private idleTimer?: NodeJS.Timeout;
   private runtimeController = new AbortController();
   private cursor?: Cursor;
+  private popularCursor?: {
+    type: SmartMediaType;
+    page: number;
+    totalPages: number;
+  };
+  private readonly seedCache = new Map<
+    string,
+    { document: SmartDocument; vector: Buffer }
+  >();
   private count = 0;
   private error?: string;
   private nextRefreshAt?: string;
@@ -64,6 +154,7 @@ export class SmartSearchService {
       indexing: !!this.controller,
       count: this.count,
       cursor: this.cursor,
+      popularCursor: this.popularCursor,
       error: this.error,
       nextRefreshAt: this.nextRefreshAt,
       downloadBytes: this.engine.downloadBytes,
@@ -72,7 +163,130 @@ export class SmartSearchService {
       externalAvailable: this.engine.externalAvailable ?? false,
       activeDevice: this.engine.activeDevice,
       deviceWarning: this.engine.deviceWarning,
+      lexical: this.lexicalStatus(),
+      retrievalWarning: this.retrievalWarning,
+      reranker: {
+        enabled: this.rerankerEnabled(),
+        phase: this.reranker.phase,
+        downloadBytes: this.reranker.downloadBytes,
+        downloadTotal: this.reranker.downloadTotal,
+        activeDevice: this.reranker.activeDevice,
+        error: this.rerankerError,
+      },
     };
+  }
+
+  private lexicalStatus() {
+    const status = this.store?.lexicalStatus();
+    if (!status) return { indexed: 0, total: this.count, indexing: false };
+    return {
+      ...status,
+      total: this.count,
+      indexed: status.complete
+        ? this.count
+        : Math.min(this.count, status.indexed),
+    };
+  }
+
+  private rerankerEnabled(): boolean {
+    return this.enabled() && !!getSettings().main.smartSearchRerank;
+  }
+
+  private async prepareReranker(): Promise<void> {
+    if (!this.rerankerEnabled()) return;
+    if (this.rerankerIdle) clearTimeout(this.rerankerIdle);
+    this.rerankerIdle = undefined;
+    if (this.runtimeController.signal.aborted)
+      this.runtimeController = new AbortController();
+    try {
+      await this.reranker.start(this.runtimeController.signal);
+      this.rerankerError = undefined;
+    } catch (error) {
+      this.rerankerError =
+        error instanceof Error ? error.message : String(error);
+      this.rerankerRetryAt = Date.now() + 60000;
+      throw error;
+    }
+  }
+
+  private releaseReranker(): void {
+    if (this.rerankerIdle) clearTimeout(this.rerankerIdle);
+    this.rerankerIdle = setTimeout(
+      () => {
+        this.reranker.stop();
+        this.rerankerIdle = undefined;
+      },
+      15 * 60 * 1000
+    );
+    this.rerankerIdle.unref();
+  }
+
+  private async rerank(
+    query: string,
+    candidates: SmartMatch[],
+    maxCandidates = 80,
+    timeout = 6000
+  ): Promise<SmartMatch[]> {
+    if (!this.rerankerEnabled() || !candidates.length) return candidates;
+    if (this.reranker.phase !== 'ready') {
+      if (this.reranker.phase === 'idle' && Date.now() >= this.rerankerRetryAt)
+        void this.prepareReranker()
+          .then(() => this.releaseReranker())
+          .catch(() => undefined);
+      return candidates;
+    }
+    if (this.rerankerBusy && this.rerankerDone) {
+      await Promise.race([this.rerankerDone, delay(750)]);
+      if (this.rerankerBusy) return candidates;
+    }
+    this.rerankerBusy = true;
+    let finish: () => void = () => undefined;
+    this.rerankerDone = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    try {
+      const configured =
+        Number(getSettings().main.smartSearchRerankCandidates) || 40;
+      const limit = Math.max(1, Math.min(maxCandidates, 80, configured));
+      const prefix = candidates.slice(0, limit);
+      const docs = prefix.map(({ document }) =>
+        `Title: ${document.title}. Description: ${document.overview}`.slice(
+          0,
+          700
+        )
+      );
+      const scores = await this.reranker.rerank(
+        query.slice(0, 600),
+        docs,
+        timeout
+      );
+      this.rerankerError = undefined;
+      this.rerankerRetryAt = 0;
+      const baseline = prefix.map(
+        (item): SmartMatch => ({ ...item, reranked: true })
+      );
+      const ranked = baseline
+        .map((item, i) => ({ ...item, score: scores[i] }))
+        .sort((a, b) => b.score - a.score);
+      // The model can demote good cross-language matches. Combine rankings
+      // without comparing uncalibrated scores, retaining a retrieval bias.
+      return fuseSmartCandidates([baseline, baseline, ranked], limit).concat(
+        candidates.slice(limit)
+      );
+    } catch (error) {
+      this.rerankerError =
+        error instanceof Error ? error.message : String(error);
+      logger.warn('Smart reranking unavailable; using hybrid order', {
+        label: 'Smart Search',
+        errorMessage: this.rerankerError,
+      });
+      return candidates;
+    } finally {
+      this.rerankerBusy = false;
+      finish();
+      this.rerankerDone = undefined;
+      this.releaseReranker();
+    }
   }
 
   start(): void {
@@ -82,10 +296,24 @@ export class SmartSearchService {
       this.timer = undefined;
       this.nextRefreshAt = undefined;
       this.controller?.abort();
+      this.store?.pauseLexical();
       this.runtimeController.abort();
       if (this.idleTimer) clearTimeout(this.idleTimer);
       this.idleTimer = undefined;
       this.engine.stop();
+      this.reranker.stop();
+      if (this.rerankerIdle) clearTimeout(this.rerankerIdle);
+      return;
+    }
+    this.store?.resumeLexical();
+    if (this.rerankerEnabled())
+      void this.prepareReranker()
+        .then(() => this.releaseReranker())
+        .catch(() => undefined);
+    if (getSettings().main.smartSearchRefreshInterval === 'manual') {
+      void this.open().catch((error) => {
+        this.error = String(error);
+      });
       return;
     }
     if (!this.controller && !this.timer) {
@@ -101,9 +329,12 @@ export class SmartSearchService {
   reconfigure(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
+    this.nextRefreshAt = undefined;
     this.controller?.abort();
     this.runtimeController.abort();
     this.engine.stop();
+    this.reranker.stop();
+    if (this.rerankerIdle) clearTimeout(this.rerankerIdle);
     if (!this.controller) this.start();
   }
 
@@ -112,7 +343,7 @@ export class SmartSearchService {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.nextRefreshAt = undefined;
-    this.start();
+    this.inFlight = this.refresh();
     return true;
   }
 
@@ -151,15 +382,31 @@ export class SmartSearchService {
 
   private async open(): Promise<SmartStore> {
     if (this.store) return this.store;
+    if (this.opening) return this.opening;
     const store = this.createStore();
+    this.opening = (async () => {
+      try {
+        await store.initialize();
+        this.count = await store.count();
+        const saved = await store.getState('cursor');
+        this.cursor = saved ? (JSON.parse(saved) as Cursor) : undefined;
+        const popular = await store.getState('popularBootstrapCursor');
+        this.popularCursor =
+          popular && popular !== 'complete'
+            ? { ...JSON.parse(popular), totalPages: 25 }
+            : undefined;
+        this.store = store;
+        if (!this.enabled()) store.pauseLexical();
+        return store;
+      } catch (error) {
+        await store.close().catch(() => undefined);
+        throw error;
+      }
+    })();
     try {
-      await store.initialize();
-      this.count = await store.count();
-      this.store = store;
-      return store;
-    } catch (error) {
-      await store.close().catch(() => undefined);
-      throw error;
+      return await this.opening;
+    } finally {
+      this.opening = undefined;
     }
   }
 
@@ -181,7 +428,10 @@ export class SmartSearchService {
     for (let offset = 0; offset < changed.length; offset += 8) {
       signal.throwIfAborted();
       const part = changed.slice(offset, offset + 8);
-      const embeddings = await this.engine.embed(part.map(documentText));
+      const embeddings = await this.engine.embed(
+        part.map(documentText),
+        signal
+      );
       signal.throwIfAborted();
       for (let i = 0; i < part.length; i++)
         fresh.set(part[i].sourceId, quantize(embeddings[i]));
@@ -264,6 +514,40 @@ export class SmartSearchService {
     await store.setState('changesCursor', '');
   }
 
+  private async indexPopular(
+    store: SmartStore,
+    signal: AbortSignal
+  ): Promise<void> {
+    if (!this.source.fetchPopular) return;
+    const saved = await store.getState('popularBootstrapCursor');
+    if (saved === 'complete') return;
+    let cursor: { type: SmartMediaType; page: number } = saved
+      ? JSON.parse(saved)
+      : { type: 'movie', page: 1 };
+    // A small independent first pass makes well-known older films discoverable
+    // without resetting the existing chronological scan or embedding data.
+    while (!signal.aborted) {
+      this.popularCursor = { ...cursor, totalPages: 25 };
+      const batch = await this.source.fetchPopular(
+        cursor.type,
+        cursor.page,
+        signal
+      );
+      signal.throwIfAborted();
+      await this.indexDocuments(store, cursor.type, batch.documents, signal);
+      this.count = await store.count();
+      if (cursor.page < Math.min(25, batch.totalPages))
+        cursor = { ...cursor, page: cursor.page + 1 };
+      else if (cursor.type === 'movie') cursor = { type: 'tv', page: 1 };
+      else {
+        await store.setState('popularBootstrapCursor', 'complete');
+        this.popularCursor = undefined;
+        return;
+      }
+      await store.setState('popularBootstrapCursor', JSON.stringify(cursor));
+    }
+  }
+
   private async refresh(): Promise<void> {
     const controller = new AbortController();
     this.controller = controller;
@@ -272,6 +556,15 @@ export class SmartSearchService {
     try {
       const store = await this.open();
       await this.startEngine();
+      try {
+        await this.indexPopular(store, controller.signal);
+      } catch (error) {
+        controller.signal.throwIfAborted();
+        logger.warn(
+          'Popular search bootstrap failed; continuing the existing scan',
+          { label: 'Smart Search', errorMessage: String(error) }
+        );
+      }
       const lastUpdated = await store.getState('lastUpdated');
       if (lastUpdated && this.source.fetchChanges) {
         await this.updateChanges(store, lastUpdated, controller.signal);
@@ -371,19 +664,170 @@ export class SmartSearchService {
       this.unloadWhenIdle();
       if (this.enabled() && !this.closing) {
         if (controller.signal.aborted) this.start();
-        else this.schedule(failed ? retryInterval : interval);
+        else {
+          const schedule = getSettings().main.smartSearchRefreshInterval;
+          if (schedule !== 'manual')
+            this.schedule(
+              failed
+                ? retryInterval
+                : schedule === 'weekly'
+                  ? interval * 7
+                  : interval
+            );
+        }
       }
     }
   }
 
-  async search(query: string, filters: SmartFilters) {
-    if (!this.enabled() || !this.store) return [];
-    await this.startEngine();
+  private async searchDense(
+    vector: Buffer,
+    filters: SmartFilters,
+    limit: number
+  ): Promise<SmartMatch[]> {
+    if (!this.store) throw new Error('Local semantic search is unavailable');
+    if (this.denseBusy) {
+      if (this.denseWaiters >= 2 || !this.denseDone)
+        throw new Error('Local semantic search is busy');
+      this.denseWaiters++;
+      try {
+        await Promise.race([this.denseDone, delay(1000)]);
+      } finally {
+        this.denseWaiters--;
+      }
+      if (this.denseBusy) throw new Error('Local semantic search is busy');
+    }
+    this.denseBusy = true;
+    let finish: () => void = () => undefined;
+    this.denseDone = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
     try {
-      const [vector] = await this.engine.embed([
-        query.replace(/\s+/gu, ' ').trim(),
-      ]);
-      return await this.store.search(quantize(vector), filters);
+      return await this.store.search(vector, filters, limit);
+    } finally {
+      this.denseBusy = false;
+      finish();
+      this.denseDone = undefined;
+    }
+  }
+
+  async search(query: string, filters: SmartFilters, language?: string) {
+    if (!this.enabled()) return [];
+    const store = await this.open().catch((error) => {
+      this.retrievalWarning = String(error);
+      return undefined;
+    });
+    const densePromise = (async () => {
+      if (!store) return [];
+      await withDeadline(this.startEngine(), 2000);
+      const [vector] = await this.engine.embed(
+        [query.replace(/\s+/gu, ' ').trim()],
+        AbortSignal.timeout(3000)
+      );
+      return this.searchDense(quantize(vector), filters, 500);
+    })();
+    const lexicalPromise = store
+      ? store.searchLexical(query, filters, 500)
+      : Promise.resolve([]);
+    const remotePromise = this.source.searchRelated
+      ? withDeadline(this.source.searchRelated(query, filters, language))
+      : Promise.resolve([]);
+    const [denseResult, lexicalResult, remoteResult] = await Promise.allSettled(
+      [densePromise, lexicalPromise, remotePromise]
+    );
+    const errors = [denseResult, lexicalResult, remoteResult].filter(
+      (result) => result.status === 'rejected'
+    );
+    this.retrievalWarning = errors.length
+      ? 'Some search sources are unavailable; showing available results.'
+      : undefined;
+    const dense = denseResult.status === 'fulfilled' ? denseResult.value : [];
+    const lexical =
+      lexicalResult.status === 'fulfilled' ? lexicalResult.value : [];
+    const remote =
+      remoteResult.status === 'fulfilled' ? remoteResult.value : [];
+    try {
+      const denseMatches = dense.map((item) => ({
+        ...item,
+        methods: ['semantic'] as SmartMatch['methods'],
+      }));
+      const remoteMatches = remote
+        .filter((doc) => matchesFilters(doc, filters))
+        .map((document) => ({
+          document,
+          score: 0,
+          methods: ['tmdb-keyword'] as SmartMatch['methods'],
+        }));
+      const fused = fuseSmartCandidates(
+        [denseMatches, lexical, remoteMatches],
+        1000
+      );
+      const key = (item: SmartMatch) =>
+        `${item.document.mediaType}:${item.document.source}:${item.document.sourceId}`;
+      // Reserve room for both strong dense candidates and high-ranked
+      // on-demand metadata candidates; RRF alone over-rewards overlap and
+      // can hide an older film that is not yet in the vector index.
+      const protectedKeys = new Set(
+        [...denseMatches.slice(0, 20), ...remoteMatches.slice(0, 5)].map(key)
+      );
+      const protectedItems = fused.filter((item) =>
+        protectedKeys.has(key(item))
+      );
+      const extras = fused.filter((item) => !protectedKeys.has(key(item)));
+      const firstPageKeys = new Set(
+        [
+          ...protectedItems,
+          ...extras.slice(0, Math.max(0, 30 - protectedItems.length)),
+        ].map(key)
+      );
+      // Let the reranker examine a few well-established titles from deeper in
+      // the dense pool. They are not guaranteed display slots: this only
+      // improves candidate recall when the first-stage model under-ranks them.
+      const deeperAudienceKeys = new Set(
+        denseMatches
+          .slice(20)
+          .filter((item) => !firstPageKeys.has(key(item)))
+          .sort((a, b) => b.document.voteCount - a.document.voteCount)
+          .slice(0, 5)
+          .map(key)
+      );
+      const candidates = [
+        ...fused.filter((item) => firstPageKeys.has(key(item))),
+        ...fused.filter((item) => deeperAudienceKeys.has(key(item))),
+        ...fused.filter(
+          (item) =>
+            !firstPageKeys.has(key(item)) && !deeperAudienceKeys.has(key(item))
+        ),
+      ].slice(0, 100);
+      const reranked = await this.rerank(query, candidates);
+      // Audience evidence only nudges a relevance ranking; it is capped so
+      // unrated and less-known work remains eligible. These scores are ranks,
+      // not calibrated probabilities.
+      const ranked = reranked
+        .map((item, order) => ({
+          item,
+          order,
+          rank:
+            item.score +
+            0.012 *
+              Math.min(
+                1,
+                Math.log1p(Math.max(0, item.document.voteCount)) /
+                  Math.log(5001)
+              ),
+        }))
+        .sort((a, b) => b.rank - a.rank || a.order - b.order)
+        .map(({ item, rank }) => ({ ...item, score: rank }));
+      const mandatory = ranked.filter((item) => protectedKeys.has(key(item)));
+      const supplemental = ranked.filter(
+        (item) => !protectedKeys.has(key(item))
+      );
+      const selected = new Set(
+        [
+          ...mandatory,
+          ...supplemental.slice(0, Math.max(0, 30 - mandatory.length)),
+        ].map(key)
+      );
+      return ranked.filter((item) => selected.has(key(item))).slice(0, 30);
     } finally {
       this.unloadWhenIdle();
     }
@@ -392,20 +836,26 @@ export class SmartSearchService {
   private async seed(type: SmartMediaType, id: string) {
     if (!this.store) return undefined;
     let seed = await this.store.find(this.source.id, type, id);
+    if (seed) {
+      this.seedCache.delete(`${type}:${id}`);
+      return seed;
+    }
+    const cached = this.seedCache.get(`${type}:${id}`);
+    if (cached) return cached;
     try {
       if (!seed) {
         await this.startEngine();
-        const document = await this.source.fetchOne(
-          type,
-          id,
-          this.runtimeController.signal
-        );
+        const signal = AbortSignal.timeout(2000);
+        const document = await this.source.fetchOne(type, id, signal);
         if (document) {
-          const [embedding] = await this.engine.embed([documentText(document)]);
-          const vector = quantize(embedding);
-          await this.store.upsert(document, vector);
-          this.count = await this.store.count();
-          seed = { document, vector };
+          const [embedding] = await this.engine.embed(
+            [documentText(document)],
+            signal
+          );
+          seed = { document, vector: quantize(embedding) };
+          this.seedCache.set(`${type}:${id}`, seed);
+          if (this.seedCache.size > 50)
+            this.seedCache.delete(this.seedCache.keys().next().value!);
         }
       }
       return seed;
@@ -414,21 +864,81 @@ export class SmartSearchService {
     }
   }
 
-  async similar(type: SmartMediaType, id: string, filters: SmartFilters) {
-    if (!this.enabled() || !this.store) return [];
-    const seed = await this.seed(type, id);
-    if (!seed) return [];
-    return (await this.store.search(seed.vector, filters, 31))
-      .filter(
-        (item) =>
-          item.document.mediaType !== type || item.document.sourceId !== id
-      )
-      .slice(0, 30);
+  async similar(
+    type: SmartMediaType,
+    id: string,
+    filters: SmartFilters,
+    language?: string
+  ) {
+    const applied = { ...filters, mediaType: filters.mediaType ?? type };
+    const remotePromise = this.source.fetchRelated
+      ? withDeadline(this.source.fetchRelated(type, id, language)).catch(
+          () => []
+        )
+      : Promise.resolve([]);
+    const seed =
+      this.enabled() && this.store
+        ? await withDeadline(this.seed(type, id), 2000).catch(() => undefined)
+        : undefined;
+    const local =
+      seed && this.store
+        ? await this.searchDense(seed.vector, applied, 80).catch(() => [])
+        : [];
+    const remote = (await remotePromise)
+      .filter((doc) => matchesFilters(doc, applied))
+      .slice(0, 24);
+    let related = remote;
+    if (seed && remote.length && this.engine.phase === 'ready') {
+      try {
+        // Score a small remote candidate pool in the same vector space as the
+        // seed. This is ephemeral: it does not update or rebuild the index.
+        const embeddings = await this.engine.embed(
+          remote.map(documentText),
+          AbortSignal.timeout(1200)
+        );
+        if (embeddings.length === remote.length)
+          related = remote
+            .map((doc, index) => ({
+              doc,
+              score: cosine(seed.vector, quantize(embeddings[index])),
+            }))
+            .sort((a, b) => b.score - a.score)
+            .map(({ doc }) => doc);
+      } catch {
+        /* Local and TMDB ordering remain available if inference is busy. */
+      }
+    }
+    const localMatches = local.map((item) => ({
+      ...item,
+      methods: ['semantic'] as SmartMatch['methods'],
+    }));
+    const remoteMatches = related.map((document) => ({
+      document,
+      score: 0,
+      methods: ['tmdb-similar'] as SmartMatch['methods'],
+    }));
+    const candidates = fuseSmartCandidates(
+      [localMatches, localMatches, remoteMatches],
+      80
+    ).filter(
+      (item) =>
+        item.document.mediaType !== type || item.document.sourceId !== id
+    );
+    const query = seed
+      ? `Find films or series similar in themes, plot and tone to: ${seed.document.title}. ${seed.document.overview}`.slice(
+          0,
+          1000
+        )
+      : '';
+    return (
+      query ? await this.rerank(query, candidates, 12, 2500) : candidates
+    ).slice(0, 30);
   }
 
   async recommendations(
     seeds: { type: SmartMediaType; id: string }[],
-    filters: SmartFilters
+    filters: SmartFilters,
+    language?: string
   ) {
     if (!this.enabled() || !this.store) return [];
     const unique = [
@@ -436,18 +946,32 @@ export class SmartSearchService {
         seeds.map((seed) => [`${seed.type}:${seed.id}`, seed])
       ).values(),
     ].slice(0, 5);
-    const vectors: Buffer[] = [];
-    for (const item of unique) {
-      const result = await this.seed(item.type, item.id);
-      if (result) vectors.push(result.vector);
-    }
-    if (!vectors.length) return [];
-    const aggregate = Array.from({ length: vectors[0].length }, (_, index) =>
-      vectors.reduce((sum, vector) => sum + vector.readInt8(index), 0)
-    );
-    if (!aggregate.some((value) => value !== 0)) return [];
+    const pools: SmartMatch[][] = [];
     const exclude = new Set(unique.map((item) => `${item.type}:${item.id}`));
-    return (await this.store.search(quantize(aggregate), filters, 35))
+    for (const item of unique.slice(0, 3)) {
+      const seed = await this.seed(item.type, item.id).catch(() => undefined);
+      const [local, remote] = await Promise.all([
+        seed
+          ? this.searchDense(seed.vector, filters, 50).catch(() => [])
+          : Promise.resolve([]),
+        this.source.fetchRelated
+          ? withDeadline(
+              this.source.fetchRelated(item.type, item.id, language)
+            ).catch(() => [])
+          : Promise.resolve([]),
+      ]);
+      pools.push(local.map((match) => ({ ...match, methods: ['semantic'] })));
+      pools.push(
+        remote
+          .filter((doc) => matchesFilters(doc, filters))
+          .map((document) => ({
+            document,
+            score: 0,
+            methods: ['tmdb-recommendation'],
+          }))
+      );
+    }
+    return fuseSmartCandidates(pools, 60)
       .filter(
         (item) =>
           !exclude.has(`${item.document.mediaType}:${item.document.sourceId}`)
@@ -462,7 +986,10 @@ export class SmartSearchService {
     this.controller?.abort();
     this.runtimeController.abort();
     this.engine.stop();
+    this.reranker.stop();
+    if (this.rerankerIdle) clearTimeout(this.rerankerIdle);
     await this.inFlight;
+    await this.opening?.catch(() => undefined);
     await this.store?.close();
     this.store = undefined;
   }

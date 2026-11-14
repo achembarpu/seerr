@@ -6,6 +6,14 @@ import { cosine } from './vectors';
 export interface SmartMatch {
   document: SmartDocument;
   score: number;
+  reranked?: boolean;
+  methods?: (
+    | 'semantic'
+    | 'lexical'
+    | 'tmdb-keyword'
+    | 'tmdb-similar'
+    | 'tmdb-recommendation'
+  )[];
 }
 export const documentText = (document: SmartDocument): string => {
   const genres: Record<number, string> = {
@@ -61,6 +69,13 @@ type Row = {
 };
 export class SmartStore {
   private db: sqlite3.Database;
+  private lexicalTask?: Promise<void>;
+  private lexicalPaused = false;
+  private lexicalComplete = false;
+  private closing = false;
+  private lexicalCount = 0;
+  private lexicalTotal = 0;
+  private lexicalError?: string;
   constructor(filename: string) {
     this.db = new sqlite3.Database(filename);
   }
@@ -92,6 +107,205 @@ export class SmartStore {
     await this.run(
       'CREATE TABLE IF NOT EXISTS smart_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)'
     );
+    await this.run(
+      `CREATE VIRTUAL TABLE IF NOT EXISTS smart_fts USING fts5(title, overview, tokenize='unicode61 remove_diacritics 2')`
+    );
+    await this
+      .run(`CREATE TRIGGER IF NOT EXISTS smart_fts_insert AFTER INSERT ON smart_documents BEGIN
+      INSERT OR REPLACE INTO smart_fts(rowid, title, overview) VALUES (new.id, json_extract(new.document, '$.title'), json_extract(new.document, '$.overview'));
+    END`);
+    await this
+      .run(`CREATE TRIGGER IF NOT EXISTS smart_fts_update AFTER UPDATE ON smart_documents BEGIN
+      DELETE FROM smart_fts WHERE rowid = old.id;
+      INSERT OR REPLACE INTO smart_fts(rowid, title, overview) VALUES (new.id, json_extract(new.document, '$.title'), json_extract(new.document, '$.overview'));
+    END`);
+    await this
+      .run(`CREATE TRIGGER IF NOT EXISTS smart_fts_delete AFTER DELETE ON smart_documents BEGIN
+      DELETE FROM smart_fts WHERE rowid = old.id;
+    END`);
+    this.lexicalCount = (
+      await this.all<{ n: number }>('SELECT count(*) AS n FROM smart_fts')
+    )[0].n;
+    this.lexicalTotal = await this.count();
+    this.resumeLexical();
+  }
+
+  pauseLexical(): void {
+    this.lexicalPaused = true;
+  }
+
+  resumeLexical(): void {
+    this.lexicalPaused = false;
+    if (this.closing || this.lexicalTask || this.lexicalComplete) return;
+    this.lexicalError = undefined;
+    this.lexicalTask = this.backfillLexical()
+      .catch((error) => {
+        this.lexicalError =
+          error instanceof Error ? error.message : String(error);
+      })
+      .finally(() => {
+        this.lexicalTask = undefined;
+        if (
+          !this.lexicalPaused &&
+          !this.closing &&
+          !this.lexicalComplete &&
+          !this.lexicalError
+        )
+          this.resumeLexical();
+      });
+  }
+
+  lexicalStatus() {
+    return {
+      indexed: this.lexicalCount,
+      total: Math.max(this.lexicalCount, this.lexicalTotal),
+      indexing: !!this.lexicalTask && !this.lexicalPaused,
+      complete: this.lexicalComplete,
+      error: this.lexicalError,
+    };
+  }
+
+  private async backfillLexical(): Promise<void> {
+    let cursor = Number((await this.getState('lexicalCursor')) || 0);
+    let reachedEnd = false;
+    while (!this.closing && !this.lexicalPaused) {
+      const rows = await this.all<{ id: number }>(
+        'SELECT id FROM smart_documents WHERE id > ? ORDER BY id LIMIT 512',
+        [cursor]
+      );
+      if (!rows.length) {
+        reachedEnd = true;
+        break;
+      }
+      const last = rows[rows.length - 1].id;
+      await this.run(
+        `INSERT OR REPLACE INTO smart_fts(rowid, title, overview)
+        SELECT id, json_extract(document, '$.title'), json_extract(document, '$.overview')
+        FROM smart_documents WHERE id > ? AND id <= ?`,
+        [cursor, last]
+      );
+      cursor = last;
+      await this.setState('lexicalCursor', String(cursor));
+      if (cursor % 8192 < 512)
+        this.lexicalCount = (
+          await this.all<{ n: number }>('SELECT count(*) AS n FROM smart_fts')
+        )[0].n;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    this.lexicalCount = (
+      await this.all<{ n: number }>('SELECT count(*) AS n FROM smart_fts')
+    )[0].n;
+    this.lexicalTotal = await this.count();
+    this.lexicalComplete = reachedEnd;
+  }
+
+  async searchLexical(
+    query: string,
+    filters: SmartFilters = {},
+    limit = 60
+  ): Promise<SmartMatch[]> {
+    const stopwords = new Set([
+      'the',
+      'and',
+      'for',
+      'with',
+      'from',
+      'into',
+      'about',
+      'this',
+      'that',
+      'their',
+      'have',
+      'who',
+      'are',
+      'was',
+      'were',
+      'where',
+      'when',
+      'what',
+      'film',
+      'movie',
+      'movies',
+      'show',
+      'shows',
+      'series',
+    ]);
+    const words = [
+      ...new Set(
+        (query.toLowerCase().match(/[\p{L}\p{M}\p{N}]+/gu) ?? []).filter(
+          (word) => {
+            if (/^[a-z0-9]+$/u.test(word))
+              return word.length >= 3 && !stopwords.has(word);
+            return Array.from(word).length >= 2;
+          }
+        )
+      ),
+    ].slice(0, 8);
+    if (!words.length) return [];
+    // Plot search uses whole terms; title typo/substring matching has its own
+    // index. Prefix expansion of common words can stall SQLite for minutes.
+    const expression = words
+      .map((word) => `"${word.replace(/"/g, '""')}"`)
+      .join(' OR ');
+    const conditions = [
+      'smart_fts MATCH ?',
+      "smart_fts.rank MATCH 'bm25(3.0, 1.0)'",
+    ];
+    const params: (string | number)[] = [expression];
+    if (filters.mediaType) {
+      conditions.push('d.mediaType = ?');
+      params.push(filters.mediaType);
+    }
+    if (filters.language) {
+      conditions.push('d.language = ?');
+      params.push(filters.language);
+    }
+    if (filters.yearFrom !== undefined) {
+      conditions.push('d.year >= ?');
+      params.push(filters.yearFrom);
+    }
+    if (filters.yearTo !== undefined) {
+      conditions.push('d.year <= ?');
+      params.push(filters.yearTo);
+    }
+    if (filters.minRating !== undefined) {
+      conditions.push('d.voteAverage >= ?');
+      params.push(filters.minRating);
+    }
+    if (filters.minVotes !== undefined) {
+      conditions.push('d.voteCount >= ?');
+      params.push(filters.minVotes);
+    }
+    if (filters.genre !== undefined) {
+      conditions.push(
+        'EXISTS (SELECT 1 FROM json_each(d.genres) WHERE value = ?)'
+      );
+      params.push(filters.genre);
+    }
+    params.push(limit);
+    const rows = await this.all<{ document: string; rank: number }>(
+      `SELECT d.document, smart_fts.rank AS rank
+      FROM smart_fts CROSS JOIN smart_documents d ON d.id=smart_fts.rowid WHERE ${conditions.join(' AND ')} ORDER BY smart_fts.rank LIMIT ?`,
+      params
+    );
+    const fold = (value: string) =>
+      value
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/(\p{Script=Latin})\p{M}+/gu, '$1')
+        .normalize('NFC');
+    const terms = words.map(fold);
+    const minimum = words.length >= 4 ? Math.ceil(words.length / 3) : 1;
+    return rows
+      .map((row) => ({
+        document: JSON.parse(row.document) as SmartDocument,
+        score: -row.rank,
+        methods: ['lexical'] as SmartMatch['methods'],
+      }))
+      .filter(({ document }) => {
+        const text = fold(`${document.title} ${document.overview}`);
+        return terms.filter((word) => text.includes(word)).length >= minimum;
+      });
   }
   async getState(key: string): Promise<string | undefined> {
     return (
@@ -229,7 +443,7 @@ export class SmartStore {
     const best: (SmartMatch & { rank: number })[] = [];
     for (;;) {
       const rows = await this.all<Row>(
-        `SELECT id, vector, document, voteCount FROM smart_documents WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 512`,
+        `SELECT id, vector, document, voteCount FROM smart_documents NOT INDEXED WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 512`,
         [after, ...params]
       );
       if (!rows.length) break;
@@ -260,6 +474,8 @@ export class SmartStore {
     return best.map(({ document, score }) => ({ document, score }));
   }
   async close(): Promise<void> {
+    this.closing = true;
+    await this.lexicalTask;
     await new Promise<void>((resolve, reject) =>
       this.db.close((error) => (error ? reject(error) : resolve()))
     );

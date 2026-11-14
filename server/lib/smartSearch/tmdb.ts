@@ -9,11 +9,16 @@ import {
   mapTvDetailsToResult,
   mapTvResult,
 } from '@server/models/Search';
-import type { MetadataSource, SmartDocument, SmartMediaType } from './types';
+import type {
+  MetadataSource,
+  SmartDocument,
+  SmartFilters,
+  SmartMediaType,
+} from './types';
 
 export class TmdbMetadataSource implements MetadataSource {
   readonly id = 'tmdb';
-  constructor(private readonly tmdb = new TheMovieDb()) {}
+  constructor(private readonly tmdb = new TheMovieDb({ timeout: 2000 })) {}
 
   private document(
     item: TmdbMovieResult | TmdbTvResult,
@@ -81,6 +86,136 @@ export class TmdbMetadataSource implements MetadataSource {
       );
     }
     return this.document(item, mediaType);
+  }
+
+  async fetchRelated(
+    mediaType: SmartMediaType,
+    id: string,
+    language = 'en-US'
+  ): Promise<SmartDocument[]> {
+    const num = Number(id);
+    const results = await Promise.allSettled(
+      mediaType === 'movie'
+        ? [
+            this.tmdb.getMovieSimilar({ movieId: num, language }),
+            this.tmdb.getMovieRecommendations({
+              movieId: num,
+              language,
+            }),
+          ]
+        : [
+            this.tmdb.getTvSimilar({ tvId: num, language }),
+            this.tmdb.getTvRecommendations({ tvId: num, language }),
+          ]
+    );
+    const lists = results.map((result) =>
+      result.status === 'fulfilled' ? result.value.results : []
+    );
+    const documents: SmartDocument[] = [];
+    for (let i = 0; i < 20; i++)
+      for (const list of lists) {
+        const item = list[i];
+        if (!item) continue;
+        const doc = this.document(item, mediaType);
+        if (doc) documents.push(doc);
+      }
+    return documents;
+  }
+
+  /** Use TMDB keywords to find popular titles outside the partially built index. */
+  async searchRelated(
+    query: string,
+    filters: SmartFilters,
+    language = 'en-US'
+  ): Promise<SmartDocument[]> {
+    const ignored = new Set([
+      'about',
+      'with',
+      'from',
+      'that',
+      'this',
+      'film',
+      'movie',
+      'series',
+      'show',
+      'looking',
+    ]);
+    const terms = (query.toLowerCase().match(/[\p{L}\p{N}]{4,}/gu) ?? [])
+      .filter((word) => !ignored.has(word))
+      .slice(0, 2);
+    if (!terms.length) return [];
+    // TMDB's keyword search is fuzzy and related compounds may occur on later
+    // pages. Keep prefix-related keyword names rather than unrelated spellings.
+    const keywordPages = await Promise.allSettled(
+      terms.flatMap((term) =>
+        [1, 2, 3].map((page) => this.tmdb.searchKeyword({ query: term, page }))
+      )
+    );
+    const keywordGroups = terms
+      .map((term, i) => {
+        const root = term.length > 4 ? term.replace(/s$/u, '') : term;
+        const candidates = keywordPages
+          .slice(i * 3, i * 3 + 3)
+          .flatMap((page) =>
+            page.status === 'fulfilled' ? page.value.results : []
+          );
+        return [
+          ...new Map(
+            candidates
+              .filter((item) =>
+                item.name.toLowerCase().replace(/\s+/gu, '').startsWith(root)
+              )
+              .map((item) => [item.id, item])
+          ).values(),
+        ]
+          .sort((a, b) => a.name.length - b.name.length)
+          .slice(0, 5)
+          .map((item) => item.id)
+          .join('|');
+      })
+      .filter(Boolean);
+    if (!keywordGroups.length) return [];
+    const requests = keywordGroups.flatMap((keywords) => {
+      const opts = {
+        keywords,
+        language,
+        page: 1,
+        sortBy: 'popularity.desc' as const,
+        originalLanguage: filters.language,
+        genre: filters.genre?.toString(),
+        voteAverageGte: filters.minRating?.toString(),
+        voteCountGte: filters.minVotes?.toString(),
+      };
+      return [
+        ...(!filters.mediaType || filters.mediaType === 'movie'
+          ? [this.tmdb.getDiscoverMovies({ ...opts, includeVideo: false })]
+          : []),
+        ...(!filters.mediaType || filters.mediaType === 'tv'
+          ? [this.tmdb.getDiscoverTv(opts)]
+          : []),
+      ];
+    });
+    const responses = await Promise.allSettled(requests);
+    const lists = responses.map((response) =>
+      response.status === 'fulfilled' ? response.value.results : []
+    );
+    const documents: SmartDocument[] = [];
+    for (let i = 0; i < 20; i++)
+      for (const list of lists) {
+        const item = list[i];
+        if (!item) continue;
+        const doc = this.document(item, 'title' in item ? 'movie' : 'tv');
+        if (doc) documents.push(doc);
+      }
+    return documents;
+  }
+
+  async fetchPopular(
+    mediaType: SmartMediaType,
+    page: number,
+    signal?: AbortSignal
+  ) {
+    return this.fetchPage(mediaType, '1900-01-01', '2100-12-31', page, signal);
   }
 
   async fetchChanges(
