@@ -61,10 +61,12 @@ const search = mock.method(smartSearch, 'search', async () => [
     },
   },
 ]);
+const similar = mock.method(smartSearch, 'similar', async () => []);
 const related = mock.method(Media, 'getRelatedMedia', async () => []);
 after(() => {
   status.mock.restore();
   search.mock.restore();
+  similar.mock.restore();
   related.mock.restore();
 });
 
@@ -93,4 +95,15 @@ it('passes structured filters through the validated smart search endpoint', asyn
     .get('/api/v1/search/smart')
     .query({ query: 'test', minRating: 11 })
     .expect(400);
+});
+
+it('serves a valid paginated response for similar-title sliders', async () => {
+  const response = await request(app)
+    .get('/api/v1/search/smart/similar')
+    .query({ id: 12, mediaType: 'movie', page: 1 })
+    .expect(200);
+  assert.equal(response.body.totalPages, 1);
+  assert.deepEqual(response.body.results, []);
+  assert.equal(similar.mock.calls[0].arguments[0], 'movie');
+  assert.equal(similar.mock.calls[0].arguments[1], '12');
 });
