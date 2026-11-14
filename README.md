@@ -95,7 +95,7 @@ The device selector in General Settings chooses automatic, CPU, or a detected GP
 
 ### macOS app
 
-The private Apple Silicon build is a self-contained macOS app. Unzip `Seerr-macOS-arm64.zip`, drag `Seerr.app` to Applications, and open it. The Seerr menu-bar item shows whether the server is running and provides **Open Seerr**, **Show Data Folder**, and **Quit Seerr**. The app opens Seerr in your browser; it is a local server rather than a separate browser shell. It includes Node and the Metal inference runtime, but downloads the embedding model only after smart search is enabled. Metal is selected automatically when available.
+The private Apple Silicon build is a self-contained macOS app for macOS 13.5 or later. Unzip `Seerr-macOS-arm64.zip`, drag `Seerr.app` to Applications, and open it. The Seerr menu-bar item shows whether the server is running and provides **Open Seerr**, **Show Data Folder**, and **Quit Seerr**. The app opens Seerr in your browser; it is a local server rather than a separate browser shell. It includes Node and the Metal inference runtime, but downloads the embedding model only after smart search is enabled. Metal is selected automatically when available.
 
 The app listens on `127.0.0.1:5055` by default. To allow access from other devices, choose **Allow Network Access** in its menu and then quit and reopen it; Seerr will listen on all interfaces and clients must sign in. Configuration, the database, cache and models are kept in `~/Library/Application Support/Seerr`, separate from the app, so replacing the app preserves your data. Quit the app before replacing it. If port 5055 is occupied, stop the other service first.
 
