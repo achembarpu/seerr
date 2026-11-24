@@ -7,11 +7,16 @@ import useDiscover from '@app/hooks/useDiscover';
 import useSettings from '@app/hooks/useSettings';
 import { Permission, useUser } from '@app/hooks/useUser';
 import defineMessages from '@app/utils/defineMessages';
-import { ArrowPathIcon, ChevronDownIcon } from '@heroicons/react/24/outline';
+import {
+  ArrowPathIcon,
+  ChevronDownIcon,
+  ChevronUpIcon,
+  SparklesIcon,
+} from '@heroicons/react/24/outline';
 import { MediaStatus } from '@server/constants/media';
 import axios from 'axios';
 import { useRouter } from 'next/router';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 import SmartSearch, {
@@ -33,10 +38,8 @@ const messages = defineMessages('components.Search', {
   descriptionMatches: 'Suggestions',
   moreMatches: 'Show more matches',
   moreSuggestions: 'Show more suggestions',
-  searchMode: 'Search mode',
-  automatic: 'Automatic',
-  titlesOnly: 'Titles only',
-  titlesAndSemantic: 'Titles + semantic',
+  fewerResults: 'Show fewer',
+  smartSearch: 'Smart search',
   noTitleMatches: 'No matching titles.',
   noDescriptionMatches: 'No suggestions found.',
   titleUnavailable: 'Some title matches are temporarily unavailable.',
@@ -47,10 +50,54 @@ const messages = defineMessages('components.Search', {
     'Information courtesy of IMDb (https://www.imdb.com). Used with permission.',
 });
 
-const words = new Intl.Segmenter(undefined, { granularity: 'word' });
 const resultsPerPage = 20;
 
-type SearchMode = 'automatic' | 'titles' | 'semantic';
+const ResultControls = ({
+  moreLabel,
+  onMore,
+  onFewer,
+  isLoading,
+}: {
+  moreLabel: string;
+  onMore?: () => void;
+  onFewer?: () => void;
+  isLoading?: boolean;
+}) => {
+  const intl = useIntl();
+  const primary = useRef<HTMLButtonElement>(null);
+  if (!onMore && !onFewer) return null;
+
+  const fewerLabel = intl.formatMessage(messages.fewerResults);
+  const collapse = () => {
+    onFewer?.();
+    // Return to the controls after the removed rows leave the layout.
+    requestAnimationFrame(() => {
+      primary.current?.focus({ preventScroll: true });
+      primary.current?.scrollIntoView({ block: 'nearest' });
+    });
+  };
+
+  return (
+    <div className="mt-4 flex flex-wrap items-center gap-2">
+      <Button
+        ref={primary}
+        buttonType="ghost"
+        buttonSize="sm"
+        onClick={onMore ?? collapse}
+        disabled={!!onMore && isLoading}
+      >
+        {onMore ? <ChevronDownIcon /> : <ChevronUpIcon />}
+        <span>{onMore ? moreLabel : fewerLabel}</span>
+      </Button>
+      {onMore && onFewer && (
+        <Button buttonType="ghost" buttonSize="sm" onClick={collapse}>
+          <ChevronUpIcon />
+          <span>{fewerLabel}</span>
+        </Button>
+      )}
+    </div>
+  );
+};
 
 const supportsSemanticSearch = (query: string, filters: SearchFilters) =>
   !isDirectLookup(query) && filters.type !== 'person';
@@ -58,34 +105,22 @@ const supportsSemanticSearch = (query: string, filters: SearchFilters) =>
 const SearchResults = ({
   query,
   filters,
-  mode,
+  showSuggestions,
 }: {
   query: string;
   filters: SearchFilters;
-  mode: SearchMode;
+  showSuggestions: boolean;
 }) => {
   const intl = useIntl();
-  const settings = useSettings();
   const { hasPermission } = useUser();
   const [settled, setSettled] = useState(false);
-  const [titleDeadline, setTitleDeadline] = useState(false);
   const [matchLimit, setMatchLimit] = useState(resultsPerPage);
-  const [suggestionLimit, setSuggestionLimit] = useState(resultsPerPage);
+  const [suggestionsExpanded, setSuggestionsExpanded] = useState(false);
   const directLookup = isDirectLookup(query);
-  const longQuery =
-    [...words.segment(query)].filter((word) => word.isWordLike).length >= 6;
-  const canSearchDescriptions =
-    settings.currentSettings.smartSearch &&
-    supportsSemanticSearch(query, filters);
   useEffect(() => {
-    if (!canSearchDescriptions) return;
     const settle = setTimeout(() => setSettled(true), 450);
-    const deadline = setTimeout(() => setTitleDeadline(true), 750);
-    return () => {
-      clearTimeout(settle);
-      clearTimeout(deadline);
-    };
-  }, [canSearchDescriptions]);
+    return () => clearTimeout(settle);
+  }, []);
 
   const {
     firstResultData,
@@ -136,14 +171,6 @@ const SearchResults = ({
   );
   const titlesLoading =
     (isLoadingInitialData && !firstResultData) || fuzzyLoading;
-  const showSuggestions =
-    canSearchDescriptions &&
-    mode !== 'titles' &&
-    (mode === 'semantic' || !ranked.confident);
-  const searchDescriptions =
-    showSuggestions &&
-    settled &&
-    (mode === 'semantic' || longQuery || !titlesLoading || titleDeadline);
   const params = new URLSearchParams({ query });
   for (const [key, value] of Object.entries({
     mediaType: filters.type,
@@ -155,16 +182,20 @@ const SearchResults = ({
     genre: filters.genre,
   }))
     if (value) params.set(key, value);
-  const descriptionKey = searchDescriptions
-    ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
-    : null;
+  const descriptionKey =
+    showSuggestions && settled
+      ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
+      : null;
   const [descriptionResponse, setDescriptionResponse] = useState<{
     key: string;
     data?: { ready: boolean; results: SearchItem[] };
     error?: true;
   }>();
+  const readyKey = descriptionResponse?.data?.ready
+    ? descriptionResponse.key
+    : undefined;
   useEffect(() => {
-    if (!descriptionKey) return;
+    if (!descriptionKey || descriptionKey === readyKey) return;
     const controller = new AbortController();
     axios
       .get<{ ready: boolean; results: SearchItem[] }>(descriptionKey, {
@@ -181,7 +212,7 @@ const SearchResults = ({
         }
       );
     return () => controller.abort();
-  }, [descriptionKey]);
+  }, [descriptionKey, readyKey]);
   const latest =
     descriptionResponse?.key === descriptionKey
       ? descriptionResponse
@@ -235,18 +266,20 @@ const SearchResults = ({
           placeholderCount={6}
           isLoading={!shownTitles.length && titlesLoading}
         />
-        {(ranked.all.length > shownTitles.length || hasMoreTitlePages) && (
-          <Button
-            className="mt-4"
-            buttonType="ghost"
-            buttonSize="sm"
-            disabled={isLoadingMore}
-            onClick={showMoreMatches}
-          >
-            <ChevronDownIcon />
-            <span>{intl.formatMessage(messages.moreMatches)}</span>
-          </Button>
-        )}
+        <ResultControls
+          moreLabel={intl.formatMessage(messages.moreMatches)}
+          onMore={
+            ranked.all.length > shownTitles.length || hasMoreTitlePages
+              ? showMoreMatches
+              : undefined
+          }
+          onFewer={
+            matchLimit > resultsPerPage
+              ? () => setMatchLimit(resultsPerPage)
+              : undefined
+          }
+          isLoading={isLoadingMore}
+        />
         {!!fuzzy?.results.length && (
           <p className="mt-4 text-xs text-gray-400">
             {intl.formatMessage(messages.imdbAttribution)}
@@ -288,23 +321,27 @@ const SearchResults = ({
           )}
           {!!descriptions.length && (
             <ListView
-              items={descriptions.slice(0, suggestionLimit)}
+              items={
+                suggestionsExpanded
+                  ? descriptions
+                  : descriptions.slice(0, resultsPerPage)
+              }
               stableItemKeys
             />
           )}
-          {descriptions.length > suggestionLimit && (
-            <Button
-              className="mt-4"
-              buttonType="ghost"
-              buttonSize="sm"
-              onClick={() =>
-                setSuggestionLimit(suggestionLimit + resultsPerPage)
-              }
-            >
-              <ChevronDownIcon />
-              <span>{intl.formatMessage(messages.moreSuggestions)}</span>
-            </Button>
-          )}
+          <ResultControls
+            moreLabel={intl.formatMessage(messages.moreSuggestions)}
+            onMore={
+              !suggestionsExpanded && descriptions.length > resultsPerPage
+                ? () => setSuggestionsExpanded(true)
+                : undefined
+            }
+            onFewer={
+              suggestionsExpanded
+                ? () => setSuggestionsExpanded(false)
+                : undefined
+            }
+          />
         </section>
       )}
     </div>
@@ -316,9 +353,13 @@ const Search = () => {
   const router = useRouter();
   const settings = useSettings();
   const [filters, setFilters] = useState(emptySearchFilters);
-  const [mode, setMode] = useState<SearchMode>('automatic');
+  const [smartSearch, setSmartSearch] = useState(false);
   const query =
     typeof router.query.query === 'string' ? router.query.query.trim() : '';
+  const canSearchDescriptions =
+    settings.currentSettings.smartSearch &&
+    supportsSemanticSearch(query, filters);
+  const showSuggestions = smartSearch && canSearchDescriptions;
   return (
     <>
       <PageTitle title={intl.formatMessage(messages.search)} />
@@ -328,24 +369,16 @@ const Search = () => {
       <div className="mb-6 flex flex-wrap items-center gap-3">
         <SmartSearch filters={filters} setFilters={setFilters} />
         {settings.currentSettings.smartSearch && (
-          <label className="flex items-center gap-2 text-sm text-gray-300">
-            {intl.formatMessage(messages.searchMode)}
-            <select
-              value={supportsSemanticSearch(query, filters) ? mode : 'titles'}
-              disabled={!supportsSemanticSearch(query, filters)}
-              onChange={(event) => setMode(event.target.value as SearchMode)}
-            >
-              <option value="automatic">
-                {intl.formatMessage(messages.automatic)}
-              </option>
-              <option value="titles">
-                {intl.formatMessage(messages.titlesOnly)}
-              </option>
-              <option value="semantic">
-                {intl.formatMessage(messages.titlesAndSemantic)}
-              </option>
-            </select>
-          </label>
+          <Button
+            type="button"
+            buttonType={showSuggestions ? 'primary' : 'default'}
+            aria-pressed={showSuggestions}
+            disabled={!canSearchDescriptions}
+            onClick={() => setSmartSearch((enabled) => !enabled)}
+          >
+            <SparklesIcon aria-hidden="true" />
+            <span>{intl.formatMessage(messages.smartSearch)}</span>
+          </Button>
         )}
       </div>
       {query && (
@@ -353,7 +386,7 @@ const Search = () => {
           key={query}
           query={query}
           filters={filters}
-          mode={mode}
+          showSuggestions={showSuggestions}
         />
       )}
     </>
