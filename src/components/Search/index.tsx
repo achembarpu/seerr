@@ -25,8 +25,8 @@ import SmartSearch, {
 } from './SmartSearch';
 import { serializeSmartSearchParams } from './smartSearchQuery';
 import {
-  descriptionResults,
   isDirectLookup,
+  mergeSearchResults,
   rankTitleResults,
   type SearchItem,
 } from './titleResults';
@@ -35,22 +35,21 @@ const messages = defineMessages('components.Search', {
   search: 'Search',
   searchresults: 'Search Results',
   matches: 'Matches',
-  descriptionMatches: 'Suggestions',
   moreMatches: 'Show more matches',
-  moreSuggestions: 'Show more suggestions',
   fewerResults: 'Show fewer',
   smartSearch: 'Smart search',
   noTitleMatches: 'No matching titles.',
-  noDescriptionMatches: 'No suggestions found.',
+  noSmartMatches: 'No matches found.',
   titleUnavailable: 'Some title matches are temporarily unavailable.',
-  descriptionUnavailable: 'Suggestions are temporarily unavailable.',
+  descriptionUnavailable: 'Description search is temporarily unavailable.',
   smartLoading: 'The search index is still getting ready.',
-  smartSearching: 'Finding suggestions…',
+  smartSearching: 'Searching descriptions…',
   imdbAttribution:
     'Information courtesy of IMDb (https://www.imdb.com). Used with permission.',
 });
 
 const resultsPerPage = 20;
+const smartResultLimit = 25;
 
 const ResultControls = ({
   moreLabel,
@@ -105,16 +104,15 @@ const supportsSemanticSearch = (query: string, filters: SearchFilters) =>
 const SearchResults = ({
   query,
   filters,
-  showSuggestions,
+  smartEnabled,
 }: {
   query: string;
   filters: SearchFilters;
-  showSuggestions: boolean;
+  smartEnabled: boolean;
 }) => {
   const intl = useIntl();
   const { hasPermission } = useUser();
   const [matchLimit, setMatchLimit] = useState(resultsPerPage);
-  const [suggestionsExpanded, setSuggestionsExpanded] = useState(false);
   const directLookup = isDirectLookup(query);
 
   const {
@@ -177,7 +175,7 @@ const SearchResults = ({
     genre: filters.genre,
   }))
     if (value) params.set(key, value);
-  const descriptionKey = showSuggestions
+  const descriptionKey = smartEnabled
     ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
     : null;
   const [descriptionResponse, setDescriptionResponse] = useState<{
@@ -213,57 +211,75 @@ const SearchResults = ({
       : undefined;
   const smart = latest?.data;
   const smartError = latest?.error;
-  const smartLoading = showSuggestions && !latest;
+  const smartLoading = smartEnabled && !latest;
 
-  const matches =
-    showSuggestions &&
-    !ranked.confident &&
-    matchLimit === resultsPerPage &&
-    !smartError &&
-    (!smart || smart.results.length > 0)
-      ? ranked.credible
-      : ranked.all;
-  const shownTitles = matches.slice(0, matchLimit);
-  const descriptions = descriptionResults(
-    visible(smart?.results ?? []),
-    shownTitles,
-    filters
+  const descriptions = visible(smart?.results ?? []);
+  const matches = descriptions.length
+    ? mergeSearchResults(ranked, descriptions, filters)
+    : ranked.map(({ item }) => item);
+  const shownTitles = matches.slice(
+    0,
+    smartEnabled ? smartResultLimit : matchLimit
   );
   const hasMoreTitlePages = !isReachingEnd && !!firstResultData;
   const showMoreMatches = () => {
     const nextLimit = matchLimit + resultsPerPage;
     setMatchLimit(nextLimit);
-    if (nextLimit > ranked.all.length && hasMoreTitlePages) fetchMore();
+    if (nextLimit > ranked.length && hasMoreTitlePages) fetchMore();
   };
 
   return (
-    <div className="space-y-8">
-      <section aria-labelledby="title-matches">
-        <div className="slider-header flex-wrap items-center justify-between gap-2">
-          <h3 id="title-matches" className="slider-title">
-            {intl.formatMessage(messages.matches)}
-          </h3>
-        </div>
-        {(error || fuzzyError) && (
-          <Alert type="warning">
-            {intl.formatMessage(messages.titleUnavailable)}
-          </Alert>
-        )}
-        {!shownTitles.length && !titlesLoading && (
-          <p className="text-sm text-gray-400">
-            {intl.formatMessage(messages.noTitleMatches)}
+    <section aria-labelledby="title-matches">
+      <div className="slider-header flex-wrap items-baseline gap-x-4 gap-y-1">
+        <h3 id="title-matches" className="slider-title">
+          {intl.formatMessage(messages.matches)}
+        </h3>
+        {smartLoading && (
+          <p
+            role="status"
+            className="inline-flex items-center gap-2 text-sm text-gray-400"
+          >
+            <ArrowPathIcon
+              className="h-4 w-4 animate-spin motion-reduce:animate-none"
+              aria-hidden="true"
+            />
+            {intl.formatMessage(messages.smartSearching)}
           </p>
         )}
-        <ListView
-          items={shownTitles}
-          stableItemKeys
-          placeholderCount={6}
-          isLoading={!shownTitles.length && titlesLoading}
-        />
+      </div>
+      {(error || fuzzyError) && (
+        <Alert type="warning">
+          {intl.formatMessage(messages.titleUnavailable)}
+        </Alert>
+      )}
+      {smartError && (
+        <Alert type="warning">
+          {intl.formatMessage(messages.descriptionUnavailable)}
+        </Alert>
+      )}
+      {smart && !smart.ready && descriptions.length === 0 && (
+        <p role="status" className="mb-3 text-sm text-gray-400">
+          {intl.formatMessage(messages.smartLoading)}
+        </p>
+      )}
+      {!shownTitles.length && !titlesLoading && !smartLoading && (
+        <p className="text-sm text-gray-400">
+          {intl.formatMessage(
+            smartEnabled ? messages.noSmartMatches : messages.noTitleMatches
+          )}
+        </p>
+      )}
+      <ListView
+        items={shownTitles}
+        stableItemKeys
+        placeholderCount={6}
+        isLoading={!shownTitles.length && titlesLoading}
+      />
+      {!smartEnabled && (
         <ResultControls
           moreLabel={intl.formatMessage(messages.moreMatches)}
           onMore={
-            ranked.all.length > shownTitles.length || hasMoreTitlePages
+            ranked.length > shownTitles.length || hasMoreTitlePages
               ? showMoreMatches
               : undefined
           }
@@ -274,71 +290,13 @@ const SearchResults = ({
           }
           isLoading={isLoadingMore}
         />
-        {!!fuzzy?.results.length && (
-          <p className="mt-4 text-xs text-gray-400">
-            {intl.formatMessage(messages.imdbAttribution)}
-          </p>
-        )}
-      </section>
-      {showSuggestions && (
-        <section aria-labelledby="description-matches">
-          <div className="slider-header">
-            <h3 id="description-matches" className="slider-title">
-              {intl.formatMessage(messages.descriptionMatches)}
-            </h3>
-          </div>
-          {smartLoading && (
-            <p
-              role="status"
-              className="flex items-center gap-2 text-sm text-gray-400"
-            >
-              <ArrowPathIcon
-                className="h-4 w-4 animate-spin motion-reduce:animate-none"
-                aria-hidden="true"
-              />
-              {intl.formatMessage(messages.smartSearching)}
-            </p>
-          )}
-          {smartError && (
-            <Alert type="warning">
-              {intl.formatMessage(messages.descriptionUnavailable)}
-            </Alert>
-          )}
-          {smart && !descriptions.length && (
-            <p role="status" className="text-sm text-gray-400">
-              {intl.formatMessage(
-                smart.ready
-                  ? messages.noDescriptionMatches
-                  : messages.smartLoading
-              )}
-            </p>
-          )}
-          {!!descriptions.length && (
-            <ListView
-              items={
-                suggestionsExpanded
-                  ? descriptions
-                  : descriptions.slice(0, resultsPerPage)
-              }
-              stableItemKeys
-            />
-          )}
-          <ResultControls
-            moreLabel={intl.formatMessage(messages.moreSuggestions)}
-            onMore={
-              !suggestionsExpanded && descriptions.length > resultsPerPage
-                ? () => setSuggestionsExpanded(true)
-                : undefined
-            }
-            onFewer={
-              suggestionsExpanded
-                ? () => setSuggestionsExpanded(false)
-                : undefined
-            }
-          />
-        </section>
       )}
-    </div>
+      {!!fuzzy?.results.length && (
+        <p className="mt-4 text-xs text-gray-400">
+          {intl.formatMessage(messages.imdbAttribution)}
+        </p>
+      )}
+    </section>
   );
 };
 
@@ -353,7 +311,7 @@ const Search = () => {
   const canSearchDescriptions =
     settings.currentSettings.smartSearch &&
     supportsSemanticSearch(query, filters);
-  const showSuggestions = smartSearch && canSearchDescriptions;
+  const smartEnabled = smartSearch && canSearchDescriptions;
   return (
     <>
       <PageTitle title={intl.formatMessage(messages.search)} />
@@ -365,8 +323,8 @@ const Search = () => {
         {settings.currentSettings.smartSearch && (
           <Button
             type="button"
-            buttonType={showSuggestions ? 'primary' : 'default'}
-            aria-pressed={showSuggestions}
+            buttonType={smartEnabled ? 'primary' : 'default'}
+            aria-pressed={smartEnabled}
             disabled={!canSearchDescriptions}
             onClick={() => setSmartSearch((enabled) => !enabled)}
           >
@@ -380,7 +338,7 @@ const Search = () => {
           key={query}
           query={query}
           filters={filters}
-          showSuggestions={showSuggestions}
+          smartEnabled={smartEnabled}
         />
       )}
     </>
