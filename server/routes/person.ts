@@ -6,6 +6,7 @@ import {
   mapCrewCredits,
   mapPersonDetails,
 } from '@server/models/Person';
+import { mediaByIdentity } from '@server/models/Search';
 import { Router } from 'express';
 
 const personRoutes = Router();
@@ -41,24 +42,15 @@ personRoutes.get('/:id/combined_credits', async (req, res, next) => {
       language: (req.query.language as string) ?? req.locale,
     });
 
-    const castMedia = await Media.getRelatedMedia(
-      req.user,
-      combinedCredits.cast
-        .filter((result) => result.media_type)
-        .map((result) => ({
-          tmdbId: result.id,
-          mediaType: result.media_type!,
-        }))
-    );
-
-    const crewMedia = await Media.getRelatedMedia(
-      req.user,
-      combinedCredits.crew
-        .filter((result) => result.media_type)
-        .map((result) => ({
-          tmdbId: result.id,
-          mediaType: result.media_type!,
-        }))
+    const related = mediaByIdentity(
+      await Media.getRelatedMedia(
+        req.user,
+        [...combinedCredits.cast, ...combinedCredits.crew].flatMap((result) =>
+          result.media_type
+            ? [{ tmdbId: result.id, mediaType: result.media_type }]
+            : []
+        )
+      )
     );
 
     return res.status(200).json({
@@ -66,10 +58,7 @@ personRoutes.get('/:id/combined_credits', async (req, res, next) => {
         .map((result) =>
           mapCastCredits(
             result,
-            castMedia.find(
-              (med) =>
-                med.tmdbId === result.id && med.mediaType === result.media_type
-            )
+            related.get(`${result.media_type}:${result.id}`)
           )
         )
         .filter((item) => !item.adult && item.character !== 'Thanks'),
@@ -77,10 +66,7 @@ personRoutes.get('/:id/combined_credits', async (req, res, next) => {
         .map((result) =>
           mapCrewCredits(
             result,
-            crewMedia.find(
-              (med) =>
-                med.tmdbId === result.id && med.mediaType === result.media_type
-            )
+            related.get(`${result.media_type}:${result.id}`)
           )
         )
         .filter((item) => !item.adult && item.job !== 'Thanks'),

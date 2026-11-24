@@ -8,15 +8,15 @@ import TitleCard from '@app/components/TitleCard';
 import globalMessages from '@app/i18n/globalMessages';
 import ErrorPage from '@app/pages/_error';
 import defineMessages from '@app/utils/defineMessages';
-import { CircleStackIcon } from '@heroicons/react/24/solid';
+import { BarsArrowDownIcon, CircleStackIcon } from '@heroicons/react/24/solid';
 import type { PersonCombinedCreditsResponse } from '@server/interfaces/api/personInterfaces';
 import type { PersonDetails as PersonDetailsType } from '@server/models/Person';
-import { groupBy } from 'lodash';
 import { useRouter } from 'next/router';
 import { useMemo, useState } from 'react';
 import { useIntl } from 'react-intl';
 import TruncateMarkup from 'react-truncate-markup';
 import useSWR from 'swr';
+import { rankCredits, type CreditMediaType, type CreditSort } from './credits';
 
 const messages = defineMessages('components.PersonDetails', {
   birthdate: 'Born {birthdate}',
@@ -25,14 +25,18 @@ const messages = defineMessages('components.PersonDetails', {
   appearsin: 'Appearances',
   crewmember: 'Crew',
   ascharacter: 'as {character}',
+  creditMediaType: 'Credit type',
+  creditSort: 'Sort credits',
+  topCredits: 'Top credits',
+  newestCredits: 'Newest first',
 });
-
-type MediaType = 'all' | 'movie' | 'tv';
 
 const PersonDetails = () => {
   const intl = useIntl();
   const router = useRouter();
-  const [currentMediaType, setCurrentMediaType] = useState<string>('all');
+  const [currentMediaType, setCurrentMediaType] =
+    useState<CreditMediaType>('all');
+  const [creditSort, setCreditSort] = useState<CreditSort>('top');
   const { data, error } = useSWR<PersonDetailsType>(
     `/api/v1/person/${router.query.personId}`
   );
@@ -43,49 +47,33 @@ const PersonDetails = () => {
       `/api/v1/person/${router.query.personId}/combined_credits`
     );
 
-  const sortedCast = useMemo(() => {
-    const filtered = (combinedCredits?.cast ?? []).filter(
-      (media) =>
-        currentMediaType === 'all' || media.mediaType === currentMediaType
-    );
-    const grouped = groupBy(filtered, 'id');
+  const sortedCast = useMemo(
+    () =>
+      rankCredits(
+        combinedCredits?.cast ?? [],
+        currentMediaType,
+        creditSort,
+        (credit) => credit.character
+      ),
+    [combinedCredits?.cast, currentMediaType, creditSort]
+  );
 
-    const reduced = Object.values(grouped).map((objs) => ({
-      ...objs[0],
-      character: objs.map((pos) => pos.character).join(', '),
-    }));
-
-    return reduced.sort((a, b) => {
-      const aVotes = a.voteCount ?? 0;
-      const bVotes = b.voteCount ?? 0;
-      if (aVotes > bVotes) {
-        return -1;
-      }
-      return 1;
-    });
-  }, [combinedCredits, currentMediaType]);
-
-  const sortedCrew = useMemo(() => {
-    const filtered = (combinedCredits?.crew ?? []).filter(
-      (media) =>
-        currentMediaType === 'all' || media.mediaType === currentMediaType
-    );
-    const grouped = groupBy(filtered, 'id');
-
-    const reduced = Object.values(grouped).map((objs) => ({
-      ...objs[0],
-      job: objs.map((pos) => pos.job).join(', '),
-    }));
-
-    return reduced.sort((a, b) => {
-      const aVotes = a.voteCount ?? 0;
-      const bVotes = b.voteCount ?? 0;
-      if (aVotes > bVotes) {
-        return -1;
-      }
-      return 1;
-    });
-  }, [combinedCredits, currentMediaType]);
+  const sortedCrew = useMemo(
+    () =>
+      rankCredits(
+        combinedCredits?.crew ?? [],
+        currentMediaType,
+        creditSort,
+        (credit) => credit.job,
+        data?.knownForDepartment
+      ),
+    [
+      combinedCredits?.crew,
+      currentMediaType,
+      creditSort,
+      data?.knownForDepartment,
+    ]
+  );
 
   if (!data && !error) {
     return <LoadingSpinner />;
@@ -135,26 +123,45 @@ const PersonDetails = () => {
 
   const isLoading = !combinedCredits && !errorCombinedCredits;
 
-  const mediaTypePicker = (
-    <div className="mb-2 flex flex-grow sm:mb-0 sm:mr-2 lg:flex-grow-0">
-      <span className="inline-flex cursor-default items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-sm text-gray-100">
-        <CircleStackIcon className="h-6 w-6" />
-      </span>
-      <select
-        id="mediaType"
-        name="mediaType"
-        onChange={(e) => {
-          setCurrentMediaType(e.target.value as MediaType);
-        }}
-        value={currentMediaType}
-        className="rounded-r-only"
-      >
-        <option value="all">{intl.formatMessage(globalMessages.all)}</option>
-        <option value="movie">
-          {intl.formatMessage(globalMessages.movies)}
-        </option>
-        <option value="tv">{intl.formatMessage(globalMessages.tvshows)}</option>
-      </select>
+  const creditControls = (
+    <div className="mb-2 flex flex-wrap justify-center gap-2 lg:mb-0 lg:justify-end">
+      <div className="flex">
+        <span className="inline-flex items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-gray-100">
+          <CircleStackIcon className="h-5 w-5" />
+        </span>
+        <select
+          aria-label={intl.formatMessage(messages.creditMediaType)}
+          onChange={(e) =>
+            setCurrentMediaType(e.target.value as CreditMediaType)
+          }
+          value={currentMediaType}
+          className="rounded-r-only"
+        >
+          <option value="all">{intl.formatMessage(globalMessages.all)}</option>
+          <option value="movie">
+            {intl.formatMessage(globalMessages.movies)}
+          </option>
+          <option value="tv">
+            {intl.formatMessage(globalMessages.tvshows)}
+          </option>
+        </select>
+      </div>
+      <div className="flex">
+        <span className="inline-flex items-center rounded-l-md border border-r-0 border-gray-500 bg-gray-800 px-3 text-gray-100">
+          <BarsArrowDownIcon className="h-5 w-5" />
+        </span>
+        <select
+          aria-label={intl.formatMessage(messages.creditSort)}
+          onChange={(e) => setCreditSort(e.target.value as CreditSort)}
+          value={creditSort}
+          className="rounded-r-only"
+        >
+          <option value="top">{intl.formatMessage(messages.topCredits)}</option>
+          <option value="newest">
+            {intl.formatMessage(messages.newestCredits)}
+          </option>
+        </select>
+      </div>
     </div>
   );
 
@@ -166,9 +173,9 @@ const PersonDetails = () => {
         </div>
       </div>
       <ul className="cards-vertical">
-        {sortedCast?.map((media, index) => {
+        {sortedCast.map((media) => {
           return (
-            <li key={`list-cast-item-${media.id}-${index}`}>
+            <li key={`list-cast-item-${media.mediaType}-${media.id}`}>
               <TitleCard
                 key={media.id}
                 id={media.id}
@@ -181,14 +188,14 @@ const PersonDetails = () => {
                 }
                 image={media.posterPath}
                 summary={media.overview}
-                mediaType={media.mediaType as 'movie' | 'tv'}
+                mediaType={media.mediaType}
                 status={media.mediaInfo?.status}
                 canExpand
               />
-              {media.character && (
+              {media.roles && (
                 <div className="mt-2 w-full truncate text-center text-xs text-gray-300">
                   {intl.formatMessage(messages.ascharacter, {
-                    character: media.character,
+                    character: media.roles,
                   })}
                 </div>
               )}
@@ -207,9 +214,9 @@ const PersonDetails = () => {
         </div>
       </div>
       <ul className="cards-vertical">
-        {sortedCrew?.map((media, index) => {
+        {sortedCrew.map((media) => {
           return (
-            <li key={`list-crew-item-${media.id}-${index}`}>
+            <li key={`list-crew-item-${media.mediaType}-${media.id}`}>
               <TitleCard
                 key={media.id}
                 id={media.id}
@@ -222,13 +229,13 @@ const PersonDetails = () => {
                 }
                 image={media.posterPath}
                 summary={media.overview}
-                mediaType={media.mediaType as 'movie' | 'tv'}
+                mediaType={media.mediaType}
                 status={media.mediaInfo?.status}
                 canExpand
               />
-              {media.job && (
+              {media.roles && (
                 <div className="mt-2 w-full truncate text-center text-xs text-gray-300">
-                  {media.job}
+                  {media.roles}
                 </div>
               )}
             </li>
@@ -247,11 +254,11 @@ const PersonDetails = () => {
             isDarker
             backgroundImages={[...(sortedCast ?? []), ...(sortedCrew ?? [])]
               .filter((media) => media.backdropPath)
+              .slice(0, 6)
               .map(
                 (media) =>
                   `https://image.tmdb.org/t/p/w1920_and_h800_multi_faces/${media.backdropPath}`
-              )
-              .slice(0, 6)}
+              )}
           />
         </div>
       )}
@@ -275,7 +282,7 @@ const PersonDetails = () => {
           <div className="flex w-full items-center justify-center lg:justify-between">
             <h1 className="text-3xl text-white lg:text-4xl">{data.name}</h1>
             <div className="hidden flex-shrink-0 lg:block">
-              {mediaTypePicker}
+              {creditControls}
             </div>
           </div>
           <div className="flex w-full items-center justify-center lg:justify-between">
@@ -302,7 +309,7 @@ const PersonDetails = () => {
               </div>
             )}
           </div>
-          <div className="lg:hidden">{mediaTypePicker}</div>
+          <div className="lg:hidden">{creditControls}</div>
           {data.biography && (
             <div className="relative text-left">
               {/* eslint-disable-next-line jsx-a11y/click-events-have-key-events */}
