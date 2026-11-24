@@ -50,7 +50,7 @@ jobs:
           pnpm test
 
       - name: Verify archive and headless startup
-        run: bash scripts/test-macos-artifact.sh build/macos/Seerr-macOS-arm64.zip
+        run: bash scripts/test-macos-artifact.sh build/macos/Seerr-macOS-arm64.zip "$GITHUB_SHA"
 
       - name: Record source commit and archive checksum
         working-directory: build/macos

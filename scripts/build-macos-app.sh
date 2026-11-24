@@ -29,6 +29,8 @@ mkdir -p "$output"
 
 "$root/scripts/test-macos-installer.sh"
 cd "$root"
+build_commit=$(git rev-parse --verify HEAD)
+if [[ -n "$(git status --porcelain)" ]]; then build_commit="$build_commit-dirty"; fi
 pnpm build
 
 # Install only production dependencies. Skip this project's developer lifecycle
@@ -66,6 +68,7 @@ fi
 app="$work/Seerr.app"
 resources="$app/Contents/Resources"
 mkdir -p "$app/Contents/MacOS" "$resources/app" "$resources/runtime"
+printf '%s\n' "$build_commit" > "$resources/BUILD_COMMIT"
 cp native/macos/Info.plist "$app/Contents/Info.plist"
 install -m 755 native/macos/SeerrServer "$app/Contents/MacOS/SeerrServer"
 CLANG_MODULE_CACHE_PATH="$work/swift-cache" swiftc -target arm64-apple-macos13.5 -module-cache-path "$work/swift-cache" -O \

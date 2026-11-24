@@ -1,7 +1,8 @@
 #!/bin/bash
 # Test the delivered ZIP with a disposable data directory and loopback listener.
 set -euo pipefail
-archive="${1:?Usage: bash scripts/test-macos-artifact.sh /path/to/Seerr-macOS-arm64.zip}"
+archive="${1:?Usage: bash scripts/test-macos-artifact.sh /path/to/Seerr-macOS-arm64.zip [expected-commit]}"
+expected_commit=${2:-}
 work=$(mktemp -d "${TMPDIR:-/tmp}/seerr-artifact-test.XXXXXX")
 server_pid=
 # Called by the EXIT trap.
@@ -25,6 +26,9 @@ runtime="$app/Contents/Resources/runtime"
 test -x "$work/Install Seerr.command"
 test -x "$app/Contents/MacOS/SeerrServer"
 codesign --verify --deep --strict "$app"
+if [[ -n "$expected_commit" ]]; then
+  test "$(cat "$app/Contents/Resources/BUILD_COMMIT")" = "$expected_commit"
+fi
 for binary in "$app/Contents/MacOS/Seerr" "$runtime/node" "$runtime/llama-server" "$runtime/seerrvectors.dylib"; do
   test "$(lipo -archs "$binary")" = arm64
 done
