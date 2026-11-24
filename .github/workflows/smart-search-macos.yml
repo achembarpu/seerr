@@ -17,7 +17,7 @@ concurrency:
 jobs:
   build:
     if: github.repository == 'achembarpu/seerr' && github.ref == 'refs/heads/smart-search'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 45
     env:
       CI: true
