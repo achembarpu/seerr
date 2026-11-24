@@ -33,13 +33,15 @@ export const normalizeTmdbKeyword = (name: string) =>
 
 const decompress = promisify(gunzip);
 
-async function parseCatalog(data: Buffer): Promise<string[]> {
+type KeywordEntries = { names: string[]; ids: Float64Array };
+
+async function parseCatalog(data: Buffer): Promise<KeywordEntries> {
   if (!data.length || data.length > maxCompressedSize)
     throw new Error('Invalid TMDB keyword export size');
   const lines = (
     await decompress(data, { maxOutputLength: maxExpandedSize })
   ).toString('utf8');
-  const names: string[] = [];
+  const entries: { name: string; id: number }[] = [];
   let start = 0;
   while (start < lines.length) {
     const newline = lines.indexOf('\n', start);
@@ -50,17 +52,22 @@ async function parseCatalog(data: Buffer): Promise<string[]> {
     const row = JSON.parse(line) as { id?: number; name?: string } | null;
     if (
       !row ||
+      typeof row.id !== 'number' ||
       !Number.isSafeInteger(row.id) ||
       typeof row.name !== 'string' ||
       !row.name.trim()
     )
       throw new Error('Invalid TMDB keyword record');
-    names.push(normalizeTmdbKeyword(row.name));
-    if (names.length % 4096 === 0) await nextTurn();
+    entries.push({ name: normalizeTmdbKeyword(row.name), id: row.id });
+    if (entries.length % 4096 === 0) await nextTurn();
   }
-  if (names.length < minCatalogSize)
+  if (entries.length < minCatalogSize)
     throw new Error('Incomplete TMDB keyword export');
-  return names.sort();
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return {
+    names: entries.map(({ name }) => name),
+    ids: Float64Array.from(entries, ({ id }) => id),
+  };
 }
 
 async function downloadCatalog(now: number): Promise<Buffer> {
@@ -81,7 +88,7 @@ async function downloadCatalog(now: number): Promise<Buffer> {
 }
 
 export class TmdbKeywordCatalog {
-  private snapshot?: { names: string[]; updatedAt: number };
+  private snapshot?: KeywordEntries & { updatedAt: number };
   private checkedDisk = false;
   private nextRefreshAt = 0;
   private retryDelay = hour;
@@ -105,10 +112,10 @@ export class TmdbKeywordCatalog {
     return this.task;
   }
 
-  possiblyContains(prefix: string): boolean {
+  private findPrefix(prefix: string) {
     const snapshot = this.snapshot;
     const age = snapshot ? Date.now() - snapshot.updatedAt : Infinity;
-    if (!snapshot || age < 0 || age >= maxAge) return true;
+    if (!snapshot || age < 0 || age >= maxAge) return undefined;
     let left = 0;
     let right = snapshot.names.length;
     while (left < right) {
@@ -116,7 +123,26 @@ export class TmdbKeywordCatalog {
       if (snapshot.names[middle] < prefix) left = middle + 1;
       else right = middle;
     }
-    return snapshot.names[left]?.startsWith(prefix) ?? false;
+    return { snapshot, first: left };
+  }
+
+  possiblyContains(prefix: string): boolean {
+    const match = this.findPrefix(prefix);
+    if (!match) return true;
+    return match.snapshot.names[match.first]?.startsWith(prefix) ?? false;
+  }
+
+  /** Return the whole prefix set when it fits, or defer to the provider. */
+  prefixIds(prefix: string, limit: number): number[] | undefined {
+    const match = this.findPrefix(prefix);
+    if (!match) return undefined;
+    const { names, ids } = match.snapshot;
+    const found: number[] = [];
+    for (let i = match.first; names[i]?.startsWith(prefix); i++) {
+      if (found.length === limit) return undefined;
+      found.push(ids[i]);
+    }
+    return found;
   }
 
   private async prepareCatalog(allowRefresh: boolean): Promise<void> {
@@ -128,7 +154,7 @@ export class TmdbKeywordCatalog {
     if (!allowRefresh || now < this.nextRefreshAt) return;
     try {
       const data = await this.download(now);
-      const names = await parseCatalog(data);
+      const entries = await parseCatalog(data);
       const temporary = `${this.filename}.${randomUUID()}.tmp`;
       try {
         await writeFile(temporary, data, { flag: 'wx', mode: 0o600 });
@@ -137,7 +163,7 @@ export class TmdbKeywordCatalog {
         await unlink(temporary).catch(() => undefined);
       }
       const updatedAt = Date.now();
-      this.snapshot = { names, updatedAt };
+      this.snapshot = { ...entries, updatedAt };
       this.nextRefreshAt = updatedAt + day;
       this.retryDelay = hour;
     } catch {
@@ -166,7 +192,7 @@ export class TmdbKeywordCatalog {
         if (!bytesRead) return;
         offset += bytesRead;
       }
-      this.snapshot = { names: await parseCatalog(data), updatedAt };
+      this.snapshot = { ...(await parseCatalog(data)), updatedAt };
       this.nextRefreshAt = updatedAt + day;
     } finally {
       await file.close();

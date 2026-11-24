@@ -9,6 +9,9 @@
 
 SQLITE_EXTENSION_INIT1
 
+#define MAX_VOTE_BONUS 0.015
+#define VOTE_BONUS_COUNT 1001
+
 typedef struct {
     sqlite3_int64 id;
     double score;
@@ -22,6 +25,8 @@ typedef struct {
     int norm;
     int8_t *query;
     Hit *hits;
+    double max_bonus;
+    double vote_bonuses[VOTE_BONUS_COUNT];
 } Search;
 
 static void products(const int8_t *a, const int8_t *b, int length,
@@ -75,8 +80,17 @@ static void collect(Search *s, Hit hit) {
     s->hits[i] = hit;
 }
 
+static double bonus_for_votes(double votes, const char *values) {
+    if (values && votes <= 1000 && floor(votes) == votes) {
+        double bonus;
+        memcpy(&bonus, values + (int)votes * sizeof(double), sizeof(double));
+        return bonus;
+    }
+    return MAX_VOTE_BONUS * fmin(1, log1p(votes) / log(1001));
+}
+
 static void top_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
-    (void)argc;
+    const int with_votes = argc == 6;
     Search *s = sqlite3_aggregate_context(ctx, sizeof(*s));
     if (!s) { sqlite3_result_error_nomem(ctx); return; }
     if (!s->query) {
@@ -88,6 +102,24 @@ static void top_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
         }
         const void *query = sqlite3_value_blob(argv[0]);
         if (!query) { sqlite3_result_error_nomem(ctx); return; }
+        if (with_votes) {
+            if (sqlite3_value_bytes(argv[5]) != sizeof(s->vote_bonuses)) {
+                sqlite3_result_error(ctx, "Invalid vote bonus table", -1);
+                return;
+            }
+            const void *bonuses = sqlite3_value_blob(argv[5]);
+            if (!bonuses) { sqlite3_result_error_nomem(ctx); return; }
+            memcpy(s->vote_bonuses, bonuses, sizeof(s->vote_bonuses));
+            s->max_bonus = MAX_VOTE_BONUS;
+            for (int i = 0; i < VOTE_BONUS_COUNT; ++i) {
+                double bonus = s->vote_bonuses[i];
+                if (!isfinite(bonus)) {
+                    sqlite3_result_error(ctx, "Invalid vote bonus", -1);
+                    return;
+                }
+                if (bonus > s->max_bonus) s->max_bonus = bonus;
+            }
+        }
         s->hits = sqlite3_malloc64((sqlite3_uint64)s->capacity * sizeof(Hit));
         s->query = sqlite3_malloc(s->length);
         if (!s->hits || !s->query) {
@@ -110,9 +142,17 @@ static void top_step(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
         products(s->query, candidate, s->length, &dot, &norm);
         if (norm) score = dot / sqrt((double)s->norm * norm);
     }
-    /* Vote bonus supplied by the caller uses the same arithmetic as JS. */
-    collect(s, (Hit){sqlite3_value_int64(argv[4]), score,
-                     score + sqlite3_value_double(argv[3])});
+    double bonus;
+    if (with_votes) {
+        /* Equal ranks can still win by row ID. */
+        if (s->count == s->capacity && score + s->max_bonus < s->hits[0].rank)
+            return;
+        bonus = bonus_for_votes(fmax(0, sqlite3_value_double(argv[3])),
+                                (const char *)s->vote_bonuses);
+    } else {
+        bonus = sqlite3_value_double(argv[3]);
+    }
+    collect(s, (Hit){sqlite3_value_int64(argv[4]), score, score + bonus});
 }
 
 static int compare_hits(const void *a, const void *b) {
@@ -147,16 +187,13 @@ static void top_final(sqlite3_context *ctx) {
 static void vote_bonus(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     (void)argc;
     double votes = fmax(0, sqlite3_value_double(argv[1]));
-    double bonus;
-    int bytes = sqlite3_value_bytes(argv[0]);
-    if (votes <= 1000 && floor(votes) == votes && bytes == 1001 * sizeof(double)) {
-        const char *values = sqlite3_value_blob(argv[0]);
+    const char *values = NULL;
+    if (votes <= 1000 && floor(votes) == votes &&
+        sqlite3_value_bytes(argv[0]) == VOTE_BONUS_COUNT * sizeof(double)) {
+        values = sqlite3_value_blob(argv[0]);
         if (!values) { sqlite3_result_error_nomem(ctx); return; }
-        memcpy(&bonus, values + (int)votes * sizeof(double), sizeof(double));
-    } else {
-        bonus = 0.015 * fmin(1, log1p(votes) / log(1001));
     }
-    sqlite3_result_double(ctx, bonus);
+    sqlite3_result_double(ctx, bonus_for_votes(votes, values));
 }
 
 int sqlite3_seerrvectors_init(sqlite3 *db, char **error,
@@ -166,6 +203,10 @@ int sqlite3_seerrvectors_init(sqlite3 *db, char **error,
     int rc = sqlite3_create_function_v2(db, "seerr_votes", 2,
         SQLITE_UTF8 | SQLITE_DETERMINISTIC | SQLITE_DIRECTONLY, NULL,
         vote_bonus, NULL, NULL, NULL);
+    if (rc != SQLITE_OK) return rc;
+    rc = sqlite3_create_function_v2(db, "seerr_top_votes", 6,
+        SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL, NULL,
+        top_step, top_final, NULL);
     if (rc != SQLITE_OK) return rc;
     return sqlite3_create_function_v2(db, "seerr_top", 5,
         SQLITE_UTF8 | SQLITE_DIRECTONLY, NULL, NULL,

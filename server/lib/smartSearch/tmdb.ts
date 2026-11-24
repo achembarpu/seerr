@@ -187,25 +187,47 @@ export class TmdbMetadataSource implements MetadataSource {
     return [...documents.values()];
   }
 
-  private async searchKeywordPages(query: string, signal?: AbortSignal) {
+  private async searchKeywordPages(
+    query: string,
+    root: string,
+    signal?: AbortSignal
+  ) {
+    const known = this.keywordCatalog.prefixIds(root, 4);
     const request = (page: number, requestSignal?: AbortSignal) =>
       this.tmdb
         .searchKeyword({ query, page, signal: requestSignal })
         .catch(() => undefined);
-    const lastPage = (first?: TmdbKeywordSearchResponse) =>
-      first && Number.isSafeInteger(first.total_pages) && first.total_pages >= 0
-        ? Math.min(3, first.total_pages)
-        : 3;
+    const lastPage = (first?: TmdbKeywordSearchResponse) => {
+      const available =
+        first &&
+        Number.isSafeInteger(first.total_pages) &&
+        first.total_pages >= 0
+          ? Math.min(3, first.total_pages)
+          : 3;
+      if (available <= 1 || !first || !known?.length) return available;
+      const found = new Set(
+        (first.results ?? [])
+          .filter(({ name }) => normalizeTmdbKeyword(name).startsWith(root))
+          .map(({ id }) => id)
+      );
+      // A provider ID outside the catalog may signal the export is stale.
+      return found.size === known.length && known.every((id) => found.has(id))
+        ? 1
+        : available;
+    };
     const first = request(1, signal);
-    // A cached first page can tell us exactly which pages exist. On a cold
-    // search, start valid candidates in parallel instead of adding another RTT.
-    const early = await Promise.race([
-      first.then((response) => ({ response })),
-      nextTurn(),
-    ]);
+    // Small prefix sets usually fit on the first page. Let broad queries
+    // retain parallel pagination so they do not pay an extra round trip.
+    const early = known?.length
+      ? { response: await first }
+      : await Promise.race([
+          first.then((response) => ({ response })),
+          nextTurn(),
+        ]);
     signal?.throwIfAborted();
+    const earlyLimit = early ? lastPage(early.response) : 3;
     const pending = [2, 3]
-      .filter((page) => !early || page <= lastPage(early.response))
+      .filter((page) => page <= earlyLimit)
       .map((page) => {
         const controller = new AbortController();
         const abort = () => controller.abort(signal?.reason);
@@ -216,7 +238,7 @@ export class TmdbMetadataSource implements MetadataSource {
         return { page, response, controller };
       });
     const pageOne = early ? early.response : await first;
-    const limit = lastPage(pageOne);
+    const limit = early ? earlyLimit : lastPage(pageOne);
     for (const { page, controller } of pending)
       if (page > limit) controller.abort();
     const more = await Promise.all(
@@ -261,7 +283,7 @@ export class TmdbMetadataSource implements MetadataSource {
     // pages. Keep prefix-related keyword names rather than unrelated spellings.
     const groups = await Promise.all(
       terms.map(async ({ term, root }) => {
-        const candidates = await this.searchKeywordPages(term, signal);
+        const candidates = await this.searchKeywordPages(term, root, signal);
         const keywords = [
           ...new Map(
             candidates

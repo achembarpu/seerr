@@ -204,6 +204,8 @@ export class SmartStore {
   private lexicalTotal = 0;
   private lexicalError?: string;
   private readonly activeSearches = new Set<Promise<void>>();
+  private idleDenseReader?: sqlite3.Database;
+  private readonly nativeReaders = new WeakSet<sqlite3.Database>();
   private readonly neighbors = new LRUCache<string, NeighborPool>({
     max: 48,
     maxSize: 4096,
@@ -214,6 +216,7 @@ export class SmartStore {
   private activeDocumentWrites = 0;
   private canLoadVectorExtension = true;
   private vectorExtensionLoaded = false;
+  private nativeVoteRanking?: boolean;
   private denseCoverAvailable = false;
   constructor(
     private readonly filename: string,
@@ -249,7 +252,8 @@ export class SmartStore {
   }
 
   private async read<T>(
-    query: (connection: sqlite3.Database, transient: boolean) => Promise<T>
+    query: (connection: sqlite3.Database, transient: boolean) => Promise<T>,
+    dense = false
   ): Promise<T> {
     if (this.closing) throw new Error('Search index is closing');
     // In-memory and temporary databases cannot be reopened by filename.
@@ -264,17 +268,21 @@ export class SmartStore {
     });
     this.activeSearches.add(active);
     let connection: sqlite3.Database | undefined;
+    let began = false;
+    let completed = false;
     try {
-      connection = transient
-        ? this.db
-        : await new Promise<sqlite3.Database>((resolve, reject) => {
-            const reader: sqlite3.Database = new sqlite3.Database(
-              this.filename,
-              sqlite3.OPEN_READONLY,
-              (error) => (error ? reject(error) : resolve(reader))
-            );
-          });
-      if (!transient) {
+      if (transient) connection = this.db;
+      else if (dense && this.idleDenseReader) {
+        connection = this.idleDenseReader;
+        this.idleDenseReader = undefined;
+      } else {
+        connection = await new Promise<sqlite3.Database>((resolve, reject) => {
+          const reader: sqlite3.Database = new sqlite3.Database(
+            this.filename,
+            sqlite3.OPEN_READONLY,
+            (error) => (error ? reject(error) : resolve(reader))
+          );
+        });
         // Use SQLite's standard mmap ceiling for demand-paged reads of
         // shortlisted documents. Other VFSes can fall back to cached I/O.
         await this.run(
@@ -283,18 +291,39 @@ export class SmartStore {
           connection
         ).catch(() => undefined);
       }
-      return await query(connection, transient);
+      if (dense && !transient) {
+        await this.run('BEGIN', [], connection);
+        began = true;
+      }
+      const result = await query(connection, transient);
+      completed = true;
+      return result;
     } finally {
       try {
-        if (!transient && connection)
-          await new Promise<void>((resolve, reject) =>
-            connection!.close((error) => (error ? reject(error) : resolve()))
-          );
+        if (!transient && connection) {
+          const reset =
+            began &&
+            (await this.run('ROLLBACK', [], connection).then(
+              () => true,
+              () => false
+            ));
+          // A cleared snapshot can be lent to the next scan. Keep only one
+          // idle handle and discard any connection that encountered an error.
+          if (completed && reset && !this.closing && !this.idleDenseReader) {
+            this.idleDenseReader = connection;
+          } else await this.closeConnection(connection);
+        }
       } finally {
         this.activeSearches.delete(active);
         finish();
       }
     }
+  }
+
+  private closeConnection(connection: sqlite3.Database): Promise<void> {
+    return new Promise((resolve, reject) =>
+      connection.close((error) => (error ? reject(error) : resolve()))
+    );
   }
 
   private readSearchRows<T>(
@@ -812,25 +841,37 @@ export class SmartStore {
       vectors.some((vector) => !vector.length || vector.length > 4096)
     )
       return undefined;
-    try {
-      await new Promise<void>((resolve, reject) =>
-        snapshot.loadExtension(extension, (error) =>
-          error ? reject(error) : resolve()
-        )
-      );
-    } catch {
-      // Keep the portable path available on builds without extension support.
-      this.canLoadVectorExtension = false;
-      return undefined;
+    if (!this.nativeReaders.has(snapshot)) {
+      try {
+        await new Promise<void>((resolve, reject) =>
+          snapshot.loadExtension(extension, (error) =>
+            error ? reject(error) : resolve()
+          )
+        );
+      } catch {
+        // Keep the portable path available on builds without extension support.
+        this.canLoadVectorExtension = false;
+        return undefined;
+      }
+      this.nativeReaders.add(snapshot);
     }
     this.vectorExtensionLoaded = true;
+    this.nativeVoteRanking ??= await this.all(
+      "SELECT 1 FROM pragma_function_list WHERE name = 'seerr_top_votes' AND narg = 6",
+      [],
+      snapshot
+    ).then(
+      (rows) => rows.length > 0,
+      () => false
+    );
     signal?.throwIfAborted();
     const interrupt = () => snapshot.interrupt();
     signal?.addEventListener('abort', interrupt, { once: true });
     try {
-      const expressions = vectors.map(
-        (_, index) =>
-          `seerr_top(?, ?, vector, seerr_votes(?, voteCount), id) AS hits${index}`
+      const expressions = vectors.map((_, index) =>
+        this.nativeVoteRanking
+          ? `seerr_top_votes(?, ?, vector, voteCount, id, ?) AS hits${index}`
+          : `seerr_top(?, ?, vector, seerr_votes(?, voteCount), id) AS hits${index}`
       );
       const [row] = await this.all<Record<string, Buffer | null>>(
         `SELECT ${expressions.join(', ')} FROM smart_documents ${scanIndex} WHERE ${conditions.join(' AND ')}`,
@@ -937,7 +978,6 @@ export class SmartStore {
     // snapshot even when a title is updated or removed during the scan.
     return this.read(async (snapshot, transient) => {
       signal?.throwIfAborted();
-      if (!transient) await this.run('BEGIN', [], snapshot);
       if (reuseNeighbors && !transient)
         return await this.searchNeighborSnapshot(
           snapshot,
@@ -957,7 +997,7 @@ export class SmartStore {
           }))
         );
       return await this.loadDenseDocuments(hits, snapshot);
-    });
+    }, true);
   }
   private async scanDense(
     snapshot: sqlite3.Database,
@@ -1264,8 +1304,11 @@ export class SmartStore {
     this.closing = true;
     await this.lexicalTask;
     await Promise.all(this.activeSearches);
-    await new Promise<void>((resolve, reject) =>
-      this.db.close((error) => (error ? reject(error) : resolve()))
-    );
+    const idle = this.idleDenseReader;
+    this.idleDenseReader = undefined;
+    await Promise.all([
+      this.closeConnection(this.db),
+      idle && this.closeConnection(idle),
+    ]);
   }
 }

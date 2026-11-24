@@ -56,40 +56,46 @@ const rerankLimit = (maximum: number) =>
 const matchKey = ({ document }: SmartMatch) =>
   `${document.mediaType}:${document.source}:${document.sourceId}`;
 
-export function hasStrongLocalResults(
+export function localSearchEvidence(
   query: string,
-  dense: SmartMatch[],
   lexical: SmartMatch[],
   keywords: SmartMatch[]
-): boolean {
+): Set<string> {
   const terms = [...new Set(plotSearchWords(query).map(foldText))];
-  if (dense.length < 10 || terms.length < 5 || !lexical.length) return false;
-  const strongestOutsideHead = Math.max(
-    ...dense.slice(4, 10).map(({ score }) => score)
-  );
-  const lexicalHead = lexical.slice(0, 15).map(matchKey);
+  const evidence = new Set<string>();
+  if (terms.length < 5 || !lexical.length) return evidence;
   const keywordHead = new Set(keywords.slice(0, 5).map(matchKey));
-  // Broad lexical matches and raw cosine alone can both be confident about
-  // the wrong plot. Require a separated semantic head, a second retrieval
-  // signal and several query words present in the actual synopsis.
-  return dense.slice(0, 3).some((item) => {
-    if (
-      dense[0].score - item.score > 0.03 ||
-      item.score - strongestOutsideHead < 0.045
-    )
-      return false;
+  lexical.slice(0, 15).forEach((item, position) => {
     const key = matchKey(item);
-    const lexicalRank = lexicalHead.indexOf(key);
-    if (lexicalRank < 0 || (lexicalRank >= 5 && !keywordHead.has(key)))
-      return false;
+    if (position >= 5 && !keywordHead.has(key)) return;
     const synopsis = new Set(
       foldText(item.document.overview).match(/[\p{L}\p{M}\p{N}]+/gu) ?? []
     );
-    return (
+    if (
       terms.filter((term) => synopsis.has(term)).length >=
       Math.max(3, Math.ceil(terms.length * 0.4))
-    );
+    )
+      evidence.add(key);
   });
+  return evidence;
+}
+
+export function hasStrongLocalResults(
+  dense: SmartMatch[],
+  evidence: ReadonlySet<string>
+): boolean {
+  if (dense.length < 10 || !evidence.size) return false;
+  const strongestOutsideHead = Math.max(
+    ...dense.slice(4, 10).map(({ score }) => score)
+  );
+  return dense
+    .slice(0, 3)
+    .some(
+      (item) =>
+        dense[0].score - item.score <= 0.03 &&
+        item.score - strongestOutsideHead >= 0.045 &&
+        evidence.has(matchKey(item))
+    );
 }
 
 /** Keep offline upstream discovery from blocking the local index indefinitely. */
@@ -1318,15 +1324,31 @@ export class SmartSearchService {
     const keywordsPromise = store
       ? store.searchKeywords(query, filters, 80, signal)
       : Promise.resolve([]);
-    const [denseResult, lexicalResult, keywordsResult] =
-      await Promise.allSettled([densePromise, lexicalPromise, keywordsPromise]);
-    signal?.throwIfAborted();
-    const dense = denseResult.status === 'fulfilled' ? denseResult.value : [];
-    const lexical =
-      lexicalResult.status === 'fulfilled' ? lexicalResult.value : [];
-    const keywords =
-      keywordsResult.status === 'fulfilled' ? keywordsResult.value : [];
+    const pendingDense = Promise.allSettled([densePromise]);
     try {
+      const [lexicalResult, keywordsResult] = await Promise.allSettled([
+        lexicalPromise,
+        keywordsPromise,
+      ]);
+      signal?.throwIfAborted();
+      const lexical =
+        lexicalResult.status === 'fulfilled' ? lexicalResult.value : [];
+      const keywords =
+        keywordsResult.status === 'fulfilled' ? keywordsResult.value : [];
+      const evidence = localSearchEvidence(query, lexical, keywords);
+      const allowFallback =
+        !!this.source.searchRelated &&
+        getSettings().main.smartSearchLiveKeywords !== false &&
+        this.source.canSearchRelated?.(query) !== false;
+      // Without text evidence, a vector hit cannot satisfy the confidence
+      // rule. Begin an already required lookup while the vector scan finishes.
+      const earlyFallback =
+        allowFallback && !evidence.size
+          ? this.startSearchFallback(query, filters, language, signal)
+          : undefined;
+      const [denseResult] = await pendingDense;
+      signal?.throwIfAborted();
+      const dense = denseResult.status === 'fulfilled' ? denseResult.value : [];
       const denseMatches = dense.map((item) => ({
         ...item,
         methods: ['semantic'] as SmartMatch['methods'],
@@ -1344,39 +1366,24 @@ export class SmartSearchService {
       const budget = rerankLimit(maxRerankLimit);
       let remote: SmartDocument[] = [];
       let fallbackFailed = false;
-      if (
-        this.source.searchRelated &&
-        getSettings().main.smartSearchLiveKeywords !== false &&
-        this.source.canSearchRelated?.(query) !== false &&
-        !hasStrongLocalResults(query, dense, lexical, keywords)
-      ) {
-        const controller = new AbortController();
-        const deadline = AbortSignal.timeout(searchFallbackTimeout);
-        const abort = () => controller.abort(signal?.reason);
-        const timeout = () => controller.abort(deadline.reason);
-        signal?.addEventListener('abort', abort, { once: true });
-        deadline.addEventListener('abort', timeout, { once: true });
-        try {
-          const fallback = withDeadline(
-            this.source.searchRelated(
-              query,
-              filters,
-              language,
-              controller.signal
-            ),
-            searchFallbackTimeout + 50
-          );
-          const [result] = await Promise.allSettled([
-            fallback,
-            this.preloadSearchRerank(rerankQuery, denseMatches, budget, signal),
-          ]);
-          signal?.throwIfAborted();
-          if (result.status === 'fulfilled') remote = result.value;
-          else fallbackFailed = !deadline.aborted;
-        } finally {
-          signal?.removeEventListener('abort', abort);
-          deadline.removeEventListener('abort', timeout);
-        }
+      if (allowFallback && !hasStrongLocalResults(dense, evidence)) {
+        const fallback =
+          earlyFallback ??
+          this.startSearchFallback(query, filters, language, signal);
+        const [result] = await Promise.all([
+          fallback.result,
+          fallback.pending
+            ? this.preloadSearchRerank(
+                rerankQuery,
+                denseMatches,
+                budget,
+                signal
+              )
+            : undefined,
+        ]);
+        signal?.throwIfAborted();
+        remote = result.documents;
+        fallbackFailed = result.failed;
       }
       this.retrievalWarning =
         fallbackFailed ||
@@ -1490,6 +1497,47 @@ export class SmartSearchService {
     } finally {
       this.unloadWhenIdle();
     }
+  }
+
+  private startSearchFallback(
+    query: string,
+    filters: SmartFilters,
+    language?: string,
+    signal?: AbortSignal
+  ) {
+    const controller = new AbortController();
+    const deadline = AbortSignal.timeout(searchFallbackTimeout);
+    const abort = () => controller.abort(signal?.reason);
+    const timeout = () => controller.abort(deadline.reason);
+    signal?.addEventListener('abort', abort, { once: true });
+    deadline.addEventListener('abort', timeout, { once: true });
+    let pending = true;
+    const result = (async () => {
+      try {
+        const documents = await withDeadline(
+          this.source.searchRelated?.(
+            query,
+            filters,
+            language,
+            controller.signal
+          ) ?? Promise.resolve([]),
+          searchFallbackTimeout + 50
+        );
+        return { documents, failed: false };
+      } catch {
+        return { documents: [], failed: !deadline.aborted };
+      } finally {
+        pending = false;
+        signal?.removeEventListener('abort', abort);
+        deadline.removeEventListener('abort', timeout);
+      }
+    })();
+    return {
+      result,
+      get pending() {
+        return pending;
+      },
+    };
   }
 
   private async preloadSearchRerank(

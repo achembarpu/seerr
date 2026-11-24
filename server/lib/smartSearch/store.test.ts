@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { after, before, describe, it } from 'node:test';
 import os from 'os';
 import path from 'path';
+import type sqlite3 from 'sqlite3';
 import { promisify } from 'util';
 import { SmartStore, documentHash } from './store';
 import type { SmartDocument } from './types';
@@ -451,6 +452,44 @@ it('reports an inaccessible snapshot without an unhandled SQLite error', async (
     );
     assert.match(result.stdout, /handled/u);
   } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('reuses one dense reader after rollback and discards it after a failed reset', async () => {
+  const { directory, store } = await versionTestStore();
+  const methods = store as unknown as VersionTestInternals;
+  const run = methods.run.bind(store);
+  const readers: unknown[] = [];
+  let failReset = false;
+  methods.run = async (sql, params, connection) => {
+    if (sql === 'BEGIN') readers.push(connection);
+    if (sql === 'ROLLBACK' && failReset) {
+      failReset = false;
+      throw new Error('Unable to reset fixture reader');
+    }
+    return run(sql, params, connection);
+  };
+  try {
+    const vector = quantize([1, 0]);
+    await store.upsert(doc('1'), vector);
+    assert.equal((await store.search(vector))[0]?.document.title, 'Film 1');
+
+    await store.upsert(doc('1', { title: 'Committed title' }), vector);
+    failReset = true;
+    assert.equal(
+      (await store.search(vector))[0]?.document.title,
+      'Committed title'
+    );
+    assert.equal(readers[0], readers[1]);
+
+    assert.equal(
+      (await store.search(vector))[0]?.document.title,
+      'Committed title'
+    );
+    assert.notEqual(readers[1], readers[2]);
+  } finally {
+    await store.close();
     await rm(directory, { recursive: true, force: true });
   }
 });
@@ -975,6 +1014,24 @@ it(
       filename,
       path.join(directory, 'missing.dylib')
     );
+    const nativeMethods = native as unknown as VersionTestInternals;
+    const nativeRun = nativeMethods.run.bind(native);
+    const measured = new WeakSet<sqlite3.Database>();
+    let extensionLoads = 0;
+    nativeMethods.run = (sql, params, connection) => {
+      if (sql === 'BEGIN') {
+        const reader = connection as sqlite3.Database;
+        if (!measured.has(reader)) {
+          measured.add(reader);
+          const load = reader.loadExtension.bind(reader);
+          reader.loadExtension = (filename, callback) => {
+            extensionLoads++;
+            return load(filename, callback);
+          };
+        }
+      }
+      return nativeRun(sql, params, connection);
+    };
     try {
       await portable.initialize();
       const vectors = [
@@ -992,6 +1049,7 @@ it(
           vector: vectors[index % vectors.length],
         }))
       );
+      await native.initialize();
       const expected = await portable.searchMany(
         vectors,
         { language: 'en' },
@@ -1011,6 +1069,24 @@ it(
         expected
       );
       assert.equal(unavailable.vectorBackend, 'javascript');
+
+      const tiedVector = quantize([1, 0, 1]);
+      await portable.upsertBatch([
+        {
+          document: doc('50', { originalLanguage: 'fr', voteCount: 1000 }),
+          vector: tiedVector,
+        },
+        {
+          document: doc('51', { originalLanguage: 'en', voteCount: 1000 }),
+          vector: tiedVector,
+        },
+      ]);
+      // The native covering index reads English first. The French title
+      // must still win because its lower row ID breaks an exact rank tie.
+      const tied = await portable.search(tiedVector, {}, 1);
+      assert.equal(tied[0]?.document.sourceId, '50');
+      assert.deepEqual(await native.search(tiedVector, {}, 1), tied);
+      assert.equal(extensionLoads, 1);
     } finally {
       await Promise.all([
         portable.close(),

@@ -10,6 +10,7 @@ import {
   SmartSearchService,
   balanceRecommendationPools,
   hasStrongLocalResults,
+  localSearchEvidence,
   ratingEvidence,
   relatedPrior,
   searchRerankShortlist,
@@ -58,21 +59,85 @@ it('requires both retrieval agreement and plot evidence to skip fallback', () =>
       score: 0.6,
     })),
   ];
-  assert.equal(hasStrongLocalResults(query, dense, [strong], []), true);
-  assert.equal(hasStrongLocalResults(query, dense, [], [strong]), false);
+  const evidence = localSearchEvidence(query, [strong], []);
+  assert.equal(hasStrongLocalResults(dense, evidence), true);
   assert.equal(
-    hasStrongLocalResults('hidden valley', dense, [strong], []),
+    hasStrongLocalResults(dense, localSearchEvidence(query, [], [strong])),
     false
+  );
+  assert.equal(localSearchEvidence('hidden valley', [strong], []).size, 0);
+  assert.equal(
+    localSearchEvidence(query, [{ ...strong, document }], []).size,
+    0
   );
   assert.equal(
     hasStrongLocalResults(
-      query,
-      [{ ...strong, document }, ...dense.slice(1)],
-      [strong],
-      []
+      dense.map((match) => ({ ...match, score: 0.7 })),
+      evidence
     ),
     false
   );
+});
+
+it('starts required fallback before the vector scan finishes', async () => {
+  let finishDense: () => void = () => undefined;
+  const pendingDense = new Promise<void>((resolve) => {
+    finishDense = resolve;
+  });
+  let started = false;
+  const source: MetadataSource = {
+    id: 'tmdb',
+    async fetchOne() {
+      return undefined;
+    },
+    async fetchPage() {
+      return { documents: [], totalPages: 0 };
+    },
+    async searchRelated() {
+      started = true;
+      return [document];
+    },
+  };
+  const engine = {
+    phase: 'ready' as const,
+    downloadBytes: 0,
+    downloadTotal: 1,
+    async start() {},
+    stop() {},
+    async embed() {
+      return [[1, 0]];
+    },
+  };
+  const service = new SmartSearchService(() => true, engine, source);
+  const internal = service as unknown as {
+    open: () => Promise<{
+      searchLexical: () => Promise<SmartMatch[]>;
+      searchKeywords: () => Promise<SmartMatch[]>;
+    }>;
+    searchDense: () => Promise<SmartMatch[]>;
+  };
+  internal.open = async () => ({
+    searchLexical: async () => [],
+    searchKeywords: async () => [],
+  });
+  internal.searchDense = async () => {
+    await pendingDense;
+    return [];
+  };
+  const search = service.search(
+    'a detective searches for a missing traveller',
+    {}
+  );
+  try {
+    await waitFor(() => started);
+    finishDense();
+    const matches = await search;
+    assert.equal(matches[0]?.document.sourceId, document.sourceId);
+  } finally {
+    finishDense();
+    await search.catch(() => undefined);
+    await service.close();
+  }
 });
 
 it('keeps independently strong plot matches and spends the full budget on short queries', () => {
