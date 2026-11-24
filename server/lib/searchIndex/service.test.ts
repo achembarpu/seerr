@@ -224,4 +224,49 @@ describe('local search index lifecycle', () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  it('resumes from saved source checks and still allows a full manual refresh', async () => {
+    let enabled = true;
+    const directory = await mkdtemp(path.join(tmpdir(), 'seerr-service-test-'));
+    const filename = path.join(directory, 'index.sqlite3');
+    const existing = new SearchIndex(filename);
+    const checked = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+    await existing.initialize();
+    for (const source of ['imdb', 'imdb-ratings', 'tmdb-movie'] as const)
+      await existing.markChecked(source, checked);
+    await existing.close();
+    const index = new SearchIndex(filename);
+    const calls: string[] = [];
+    const service = new SearchIndexService(
+      () => enabled,
+      () => index,
+      async (source) => {
+        calls.push(source);
+        return undefined;
+      }
+    );
+    try {
+      service.start();
+      await waitUntil(() => !service.status().refreshing);
+      assert.deepEqual(calls, ['tmdb-tv']);
+      const next = Date.parse(service.status().nextRefreshAt ?? '');
+      assert.ok(
+        Math.abs(next - Date.parse(checked) - 24 * 60 * 60 * 1000) < 50
+      );
+
+      assert.equal(service.refreshNow(), true);
+      await waitUntil(() => !service.status().refreshing);
+      assert.deepEqual(calls.slice(1), [
+        'imdb',
+        'imdb-ratings',
+        'tmdb-movie',
+        'tmdb-tv',
+      ]);
+    } finally {
+      enabled = false;
+      service.start();
+      await index.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });

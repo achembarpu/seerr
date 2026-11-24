@@ -141,7 +141,7 @@ export class SearchIndexService {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.nextRefreshAt = undefined;
-    void this.refresh();
+    void this.refresh(true);
     return true;
   }
 
@@ -155,15 +155,29 @@ export class SearchIndexService {
     this.timer.unref();
   }
 
-  private async refresh(): Promise<void> {
+  private nextCheck(source: Source, interval: number, now: number): number {
+    const checked = Date.parse(this.sourceStatus[source].lastChecked ?? '');
+    return checked <= now ? checked + interval : now;
+  }
+
+  private async refresh(force = false): Promise<void> {
     if (this.controller || !this.enabled()) return;
     const controller = new AbortController();
     this.controller = controller;
-    this.failedSources = [];
+    const failures = new Set(this.failedSources);
+    const interval =
+      this.refreshInterval() === 'weekly' ? weeklyInterval : dailyInterval;
     try {
       const index = await this.open();
       for (const source of sources) {
         if (controller.signal.aborted) break;
+        const now = Date.now();
+        if (
+          !force &&
+          !failures.has(source) &&
+          this.nextCheck(source, interval, now) > now
+        )
+          continue;
         this.currentSource = source;
         try {
           const count = await this.refreshSource(
@@ -178,6 +192,7 @@ export class SearchIndexService {
             available: (await index.version(source)) !== undefined,
             lastChecked,
           };
+          failures.delete(source);
           if (count !== undefined)
             logger.info('Updated local title search index', {
               label: 'Search',
@@ -186,7 +201,7 @@ export class SearchIndexService {
             });
         } catch (error) {
           if (controller.signal.aborted) break;
-          this.failedSources.push(source);
+          failures.add(source);
           logger.warn('Unable to update local title search index', {
             label: 'Search',
             source,
@@ -197,7 +212,7 @@ export class SearchIndexService {
       }
     } catch (error) {
       if (!controller.signal.aborted) {
-        this.failedSources = [...sources];
+        for (const source of sources) failures.add(source);
         logger.warn('Unable to open local title search index', {
           label: 'Search',
           errorMessage: error instanceof Error ? error.message : String(error),
@@ -206,16 +221,18 @@ export class SearchIndexService {
     } finally {
       this.currentSource = undefined;
       this.controller = undefined;
+      this.failedSources = sources.filter((source) => failures.has(source));
       if (this.enabled()) {
         if (controller.signal.aborted) this.start();
-        else if (this.refreshInterval() !== 'manual')
-          this.schedule(
-            this.failedSources.length
-              ? retryInterval
-              : this.refreshInterval() === 'weekly'
-                ? weeklyInterval
-                : dailyInterval
+        else if (this.refreshInterval() !== 'manual') {
+          const now = Date.now();
+          const next = Math.min(
+            ...sources.map((source) => this.nextCheck(source, interval, now))
           );
+          this.schedule(
+            failures.size ? retryInterval : Math.max(0, next - now)
+          );
+        }
       }
     }
   }

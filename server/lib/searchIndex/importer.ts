@@ -1,8 +1,9 @@
-import type {
-  ImdbRating,
-  IndexSource,
-  IndexedTitle,
-  SearchIndex,
+import {
+  titleImportBatchSize,
+  type ImdbRating,
+  type IndexSource,
+  type IndexedTitle,
+  type SearchIndex,
 } from '@server/lib/searchIndex';
 import { proxyRequestInterceptor } from '@server/utils/customProxyAgent';
 import { userAgentRequestInterceptor } from '@server/utils/userAgent';
@@ -148,7 +149,7 @@ export async function importTitleStream(
       signal?.throwIfAborted();
       batch.push(title);
       count++;
-      if (batch.length === 1000) {
+      if (batch.length === titleImportBatchSize) {
         await index.writeBatch(batch);
         batch = [];
       }

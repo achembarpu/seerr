@@ -12,7 +12,7 @@ type IndexTestMethods = {
     sql: string,
     params?: (string | number | null)[],
     database?: sqlite3.Database
-  ) => Promise<void>;
+  ) => Promise<number>;
   all: (
     sql: string,
     params?: (string | number)[],
@@ -59,11 +59,12 @@ it('continues to search the committed index while an update is being published',
     const methods = index as unknown as IndexTestMethods;
     const run = methods.run.bind(index);
     methods.run = async (sql, params, database) => {
-      await run(sql, params, database);
+      const changed = await run(sql, params, database);
       if (sql.startsWith('INSERT INTO titles ')) {
         entered();
         await gate;
       }
+      return changed;
     };
     updating = index.finishImport('v2');
     await published;
@@ -108,7 +109,7 @@ it('uses the exact fallback during pair backfill and maintains indexed matches a
     old.run = async (sql, params, database) => {
       if (sql.startsWith('CREATE VIRTUAL TABLE IF NOT EXISTS title_pairs '))
         throw new Error('unrecognized option: contentless_delete');
-      await oldRun(sql, params, database);
+      return oldRun(sql, params, database);
     };
     await index.initialize();
     await old.titlePairsBuild;
@@ -131,7 +132,7 @@ it('uses the exact fallback during pair backfill and maintains indexed matches a
         entered();
         await gate;
       }
-      await run(sql, params, database);
+      return run(sql, params, database);
     };
     await index.initialize();
     const build = methods.titlePairsBuild;
@@ -303,8 +304,41 @@ describe('local title search index', () => {
     assert.equal((await index.search('matrix'))[0]?.sourceId, '603');
   });
 
+  it('reconciles staged titles with the committed rows at publication', async () => {
+    const concurrent = new SearchIndex(path.join(directory, 'index.sqlite3'));
+    const methods = index as unknown as IndexTestMethods;
+    await methods.titlePairsBuild;
+    await concurrent.initialize();
+    try {
+      await index.beginImport('tmdb-movie');
+      await index.writeBatch([movie('603', 'The Matrix')]);
+      await concurrent.beginImport('tmdb-movie');
+      await concurrent.writeBatch([movie('12', 'Finding Nemo')]);
+      const run = methods.run.bind(index);
+      const publish = mock.method(
+        methods,
+        'run',
+        async (...args: Parameters<IndexTestMethods['run']>) => {
+          if (args[0] === 'BEGIN IMMEDIATE' && !args[2])
+            await concurrent.finishImport('earlier');
+          return run(...args);
+        }
+      );
+      try {
+        await index.finishImport('latest');
+      } finally {
+        publish.mock.restore();
+      }
+      assert.equal(await index.version('tmdb-movie'), 'latest');
+      assert.equal((await index.search('matrix'))[0]?.sourceId, '603');
+      assert.deepEqual(await index.search('finding nemo'), []);
+    } finally {
+      await concurrent.close();
+    }
+  });
+
   it('imports titles and ratings across batch boundaries', async () => {
-    const titles = Array.from({ length: 1001 }, (_, i) =>
+    const titles = Array.from({ length: 2001 }, (_, i) =>
       movie(`tt${i + 1}`, `Film Number ${i + 1}`)
     );
     await index.beginImport('imdb');
@@ -315,10 +349,10 @@ describe('local title search index', () => {
       titles.map((title, i) => ({ sourceId: title.sourceId, votes: i + 1 }))
     );
     await index.finishRatingsImport('ratings');
-    const last = (await index.search('film number 1001')).find(
-      (result) => result.sourceId === 'tt1001'
+    const last = (await index.search('film number 2001')).find(
+      (result) => result.sourceId === 'tt2001'
     );
-    assert.equal(last?.popularity, 1001);
+    assert.equal(last?.popularity, 2001);
   });
 
   it('refuses to publish an empty import', async () => {
@@ -391,6 +425,9 @@ describe('local title search index', () => {
     await index.beginImport('imdb');
     await index.writeBatch([movie('tt1', 'The Matrix')]);
     await index.finishImport('v1');
+    await index.beginRatingsImport();
+    await index.writeRatingsBatch([{ sourceId: 'tt1', votes: 10 }]);
+    await index.finishRatingsImport('ratings1');
     const methods = index as unknown as {
       findMatches: (
         query: string,
@@ -411,8 +448,19 @@ describe('local title search index', () => {
       assert.equal(findMatches.mock.callCount(), 1);
 
       await index.beginImport('imdb');
-      await index.writeBatch([movie('tt1', 'Matrix Reloaded')]);
+      await index.writeBatch([movie('tt1', 'The Matrix')]);
       await index.finishImport('v2');
+      assert.equal(await index.version('imdb'), 'v2');
+      await index.beginRatingsImport();
+      await index.writeRatingsBatch([{ sourceId: 'tt1', votes: 10 }]);
+      await index.finishRatingsImport('ratings2');
+      assert.equal(await index.version('imdb-ratings'), 'ratings2');
+      assert.equal((await index.search('matrix'))[0].popularity, 10);
+      assert.equal(findMatches.mock.callCount(), 1);
+
+      await index.beginImport('imdb');
+      await index.writeBatch([movie('tt1', 'Matrix Reloaded')]);
+      await index.finishImport('v3');
       assert.equal((await index.search('matrix'))[0].title, 'Matrix Reloaded');
       assert.equal(findMatches.mock.callCount(), 2);
     } finally {

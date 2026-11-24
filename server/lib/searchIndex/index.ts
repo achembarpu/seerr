@@ -7,6 +7,7 @@ export { normalizeTitle } from './ranking';
 
 export type IndexSource = 'imdb' | 'tmdb-movie' | 'tmdb-tv';
 export type IndexedMediaType = 'movie' | 'tv';
+export const titleImportBatchSize = 2000;
 
 export interface IndexedTitle {
   sourceId: string;
@@ -123,9 +124,12 @@ export class SearchIndex {
     sql: string,
     params: (string | number | null)[] = [],
     database = this.database
-  ): Promise<void> {
+  ): Promise<number> {
     return new Promise((resolve, reject) => {
-      database.run(sql, params, (error) => (error ? reject(error) : resolve()));
+      database.run(sql, params, function (error) {
+        if (error) reject(error);
+        else resolve(this.changes);
+      });
     });
   }
 
@@ -349,8 +353,12 @@ export class SearchIndex {
   async writeBatch(titles: IndexedTitle[]): Promise<void> {
     if (!this.importing) throw new Error('No search index import is running');
     if (!titles.length) return;
-    for (let offset = 0; offset < titles.length; offset += 500) {
-      const batch = titles.slice(offset, offset + 500);
+    for (
+      let offset = 0;
+      offset < titles.length;
+      offset += titleImportBatchSize
+    ) {
+      const batch = titles.slice(offset, offset + titleImportBatchSize);
       const values = batch.map(() => '(?,?,?,?,?,?,?)').join(',');
       const params = batch.flatMap((item) => {
         const title = normalizeTitle(item.title);
@@ -383,18 +391,17 @@ export class SearchIndex {
       throw new Error(
         'Refusing to replace the search index with an empty import'
       );
-    const [previous] = await this.all<{ count: number }>(
-      'SELECT count(*) AS count FROM titles WHERE source = ?',
-      [source]
-    );
-    if (previous.count > 1000 && count < previous.count * 0.5) {
-      throw new Error(
-        'Refusing to replace the search index with an incomplete import'
+    await this.publishImport(source, version, async () => {
+      const [previous] = await this.all<{ count: number }>(
+        'SELECT count(*) AS count FROM titles WHERE source = ?',
+        [source]
       );
-    }
-    try {
-      await this.run('BEGIN IMMEDIATE');
-      await this.run(
+      if (previous.count > 1000 && count < previous.count * 0.5) {
+        throw new Error(
+          'Refusing to replace the search index with an incomplete import'
+        );
+      }
+      const changed = await this.run(
         `INSERT INTO titles (source, sourceId, mediaType, title, originalTitle, searchTitle, searchOriginalTitle, popularity)
         SELECT ?, sourceId, mediaType, title, originalTitle, searchTitle, searchOriginalTitle, popularity FROM incoming_titles WHERE 1
         ON CONFLICT(source, sourceId) DO UPDATE SET
@@ -404,27 +411,22 @@ export class SearchIndex {
           OR titles.searchTitle != excluded.searchTitle OR titles.searchOriginalTitle != excluded.searchOriginalTitle`,
         [source]
       );
-      await this.run(
-        `UPDATE titles SET popularity = (SELECT popularity FROM incoming_titles WHERE incoming_titles.sourceId = titles.sourceId)
-        WHERE source = ? AND EXISTS (SELECT 1 FROM incoming_titles WHERE incoming_titles.sourceId = titles.sourceId AND incoming_titles.popularity != titles.popularity)`,
+      // The first import inserts the final popularity and has no rows to remove.
+      if (!previous.count) return changed;
+
+      // Keep vote changes out of the update that maintains the text indexes.
+      const popularity = await this.run(
+        `UPDATE titles SET popularity = incoming.popularity
+        FROM incoming_titles AS incoming
+        WHERE titles.source = ? AND titles.sourceId = incoming.sourceId AND titles.popularity != incoming.popularity`,
         [source]
       );
-      await this.run(
+      const removed = await this.run(
         'DELETE FROM titles WHERE source = ? AND NOT EXISTS (SELECT 1 FROM incoming_titles WHERE incoming_titles.sourceId = titles.sourceId)',
         [source]
       );
-      await this.run(
-        'INSERT OR REPLACE INTO index_metadata(key, value) VALUES (?, ?)',
-        [source, version]
-      );
-      await this.run('COMMIT');
-      this.revision++;
-      this.searchCache.clear();
-      this.importing = undefined;
-    } catch (error) {
-      await this.run('ROLLBACK').catch(() => undefined);
-      throw error;
-    }
+      return changed + popularity + removed;
+    });
   }
 
   abortImport(): void {
@@ -459,29 +461,45 @@ export class SearchIndex {
     );
     if (!count)
       throw new Error('Refusing to replace IMDb ratings with an empty import');
-    const [previous] = await this.all<{ count: number }>(
-      'SELECT count(*) AS count FROM imdb_votes'
-    );
-    if (previous.count > 1000 && count < previous.count * 0.5)
-      throw new Error(
-        'Refusing to replace IMDb ratings with an incomplete import'
+    await this.publishImport('imdb-ratings', version, async () => {
+      const [previous] = await this.all<{ count: number }>(
+        'SELECT count(*) AS count FROM imdb_votes'
       );
-    try {
-      await this.run('BEGIN IMMEDIATE');
-      await this.run(`INSERT INTO imdb_votes(sourceId, votes)
+      if (previous.count > 1000 && count < previous.count * 0.5)
+        throw new Error(
+          'Refusing to replace IMDb ratings with an incomplete import'
+        );
+      const changed = await this.run(`INSERT INTO imdb_votes(sourceId, votes)
         SELECT sourceId, votes FROM incoming_votes WHERE 1
         ON CONFLICT(sourceId) DO UPDATE SET votes = excluded.votes
         WHERE imdb_votes.votes != excluded.votes`);
-      await this.run(
+      if (!previous.count) return changed;
+      const removed = await this.run(
         'DELETE FROM imdb_votes WHERE NOT EXISTS (SELECT 1 FROM incoming_votes WHERE incoming_votes.sourceId = imdb_votes.sourceId)'
       );
+      return changed + removed;
+    });
+  }
+
+  private async publishImport(
+    source: IndexSource | 'imdb-ratings',
+    version: string,
+    update: () => Promise<number>
+  ): Promise<void> {
+    await this.run('BEGIN IMMEDIATE');
+    try {
+      const changed = await update();
       await this.run(
-        'INSERT OR REPLACE INTO index_metadata(key, value) VALUES (?, ?)',
-        ['imdb-ratings', version]
+        `INSERT INTO index_metadata(key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        WHERE index_metadata.value != excluded.value`,
+        [source, version]
       );
       await this.run('COMMIT');
-      this.revision++;
-      this.searchCache.clear();
+      if (changed) {
+        this.revision++;
+        this.searchCache.clear();
+      }
       this.importing = undefined;
     } catch (error) {
       await this.run('ROLLBACK').catch(() => undefined);
