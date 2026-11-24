@@ -12,6 +12,17 @@ import type Media from '@server/entity/Media';
 
 export type MediaType = 'tv' | 'movie' | 'person' | 'collection';
 
+/** Evidence returned only with discovery results. */
+export interface MatchExplanation {
+  description?: boolean;
+  lexical?: boolean;
+  tmdb?: 'keywords' | 'related';
+  terms?: string[];
+  seedTitle?: string;
+  basis?: 'requests' | 'library';
+  sharedGenreIds?: number[];
+}
+
 interface SearchResult {
   id: number;
   mediaType: MediaType;
@@ -24,6 +35,7 @@ interface SearchResult {
   overview: string;
   originalLanguage: string;
   mediaInfo?: Media;
+  matchExplanation?: MatchExplanation;
 }
 
 export interface MovieResult extends SearchResult {

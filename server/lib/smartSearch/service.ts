@@ -374,8 +374,10 @@ export class SmartSearchService {
     candidates: SmartMatch[],
     maxCandidates = 80,
     timeout = 6000,
-    mode: 'search' | 'similar' = 'search'
+    mode: 'search' | 'similar' = 'search',
+    signal?: AbortSignal
   ): Promise<SmartMatch[]> {
+    signal?.throwIfAborted();
     if (!this.rerankerEnabled() || !candidates.length) return candidates;
     if (this.reranker.phase !== 'ready') {
       this.clearRerankScores();
@@ -410,7 +412,10 @@ export class SmartSearchService {
       this.rerankerBusy &&
       this.rerankerDone
     ) {
-      await Promise.race([this.rerankerDone, delay(750)]);
+      await Promise.race([
+        this.rerankerDone,
+        delay(750, undefined, { signal }),
+      ]);
       if (this.rerankerBusy || generation !== this.rerankCacheGeneration)
         return candidates;
       values = readScores();
@@ -434,7 +439,8 @@ export class SmartSearchService {
         const newScores = await this.reranker.rerank(
           modelQuery,
           [...missing.values()],
-          timeout
+          timeout,
+          signal
         );
         if (
           newScores.length !== missingKeys.length ||
@@ -484,6 +490,7 @@ export class SmartSearchService {
           : [baseline, baseline, ranked];
       return fuseSmartCandidates(lists, limit).concat(candidates.slice(limit));
     } catch (error) {
+      signal?.throwIfAborted();
       this.clearRerankScores();
       this.rerankerError =
         error instanceof Error ? error.message : String(error);
@@ -899,8 +906,10 @@ export class SmartSearchService {
   private async searchDense(
     vector: Buffer,
     filters: SmartFilters,
-    limit: number
+    limit: number,
+    signal?: AbortSignal
   ): Promise<SmartMatch[]> {
+    signal?.throwIfAborted();
     const store = this.store;
     if (!store) throw new Error('Local semantic search is unavailable');
     const requestedVector = Buffer.from(vector);
@@ -977,31 +986,17 @@ export class SmartSearchService {
     };
     let lookup = await findCached();
     if (lookup.matches) return lookup.matches;
-    while (this.denseBusy) {
-      if (this.denseWaiters >= 2 || !this.denseDone)
-        throw new Error('Local semantic search is busy');
-      this.denseWaiters++;
-      try {
-        await Promise.race([this.denseDone, delay(1000)]);
-      } finally {
-        this.denseWaiters--;
+    const waited = this.denseBusy;
+    return this.runDenseScan(async () => {
+      if (waited) {
+        lookup = await findCached();
+        if (lookup.matches) return lookup.matches;
       }
-      if (this.denseBusy) throw new Error('Local semantic search is busy');
-      // The preceding scan may have populated the cache, or a writer may
-      // have changed the index while this request was waiting.
-      lookup = await findCached();
-      if (lookup.matches) return lookup.matches;
-    }
-    this.denseBusy = true;
-    let finish: () => void = () => undefined;
-    this.denseDone = new Promise<void>((resolve) => {
-      finish = resolve;
-    });
-    try {
       const matches = await store.search(
         requestedVector,
         requestedFilters,
-        limit
+        limit,
+        signal
       );
       if (
         lookup.current &&
@@ -1031,6 +1026,35 @@ export class SmartSearchService {
         }
       }
       return matches;
+    }, signal);
+  }
+
+  private async runDenseScan<T>(
+    scan: () => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T> {
+    signal?.throwIfAborted();
+    while (this.denseBusy) {
+      if (this.denseWaiters >= 2 || !this.denseDone)
+        throw new Error('Local semantic search is busy');
+      this.denseWaiters++;
+      try {
+        await Promise.race([
+          this.denseDone,
+          delay(1000, undefined, { signal }),
+        ]);
+      } finally {
+        this.denseWaiters--;
+      }
+      if (this.denseBusy) throw new Error('Local semantic search is busy');
+    }
+    this.denseBusy = true;
+    let finish: () => void = () => undefined;
+    this.denseDone = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    try {
+      return await scan();
     } finally {
       this.denseBusy = false;
       finish();
@@ -1038,7 +1062,13 @@ export class SmartSearchService {
     }
   }
 
-  async search(query: string, filters: SmartFilters, language?: string) {
+  async search(
+    query: string,
+    filters: SmartFilters,
+    language?: string,
+    signal?: AbortSignal
+  ) {
+    signal?.throwIfAborted();
     if (!this.enabled()) return [];
     const store = await this.open().catch((error) => {
       this.retrievalWarning = String(error);
@@ -1047,11 +1077,13 @@ export class SmartSearchService {
     const densePromise = (async () => {
       if (!store) return [];
       await withDeadline(this.startEngine(), 2000);
+      signal?.throwIfAborted();
       const [vector] = await this.engine.embed(
         [query.replace(/\s+/gu, ' ').trim()],
-        AbortSignal.timeout(3000)
+        signal ?? AbortSignal.timeout(3000),
+        3000
       );
-      return this.searchDense(quantize(vector), filters, 500);
+      return this.searchDense(quantize(vector), filters, 500, signal);
     })();
     const lexicalPromise = store
       ? store.searchLexical(query, filters, 500)
@@ -1062,6 +1094,7 @@ export class SmartSearchService {
     const [denseResult, lexicalResult, remoteResult] = await Promise.allSettled(
       [densePromise, lexicalPromise, remotePromise]
     );
+    signal?.throwIfAborted();
     const errors = [denseResult, lexicalResult, remoteResult].filter(
       (result) => result.status === 'rejected'
     );
@@ -1143,7 +1176,14 @@ export class SmartSearchService {
         wordCount > 0 && wordCount <= 4 && Array.from(query).length <= 60
           ? `A film or series about ${query}`
           : query;
-      const reranked = await this.rerank(rerankQuery, candidates);
+      const reranked = await this.rerank(
+        rerankQuery,
+        candidates,
+        80,
+        6000,
+        'search',
+        signal
+      );
       if (!reranked.some((item) => item.reranked)) {
         // The deeper audience-selected candidates are safe to promote only
         // after the reranker has assessed them. Keep the original retrieval
@@ -1258,22 +1298,44 @@ export class SmartSearchService {
       0.008 * ratingEvidence(doc) * relevanceStrength(similarity);
     if (seed && remote.length && this.engine.phase === 'ready') {
       try {
-        // Score a small remote candidate pool in the same vector space as the
-        // seed. This is ephemeral: it does not update or rebuild the index.
-        const embeddings = await this.engine.embed(
-          remote.map(documentText),
-          AbortSignal.timeout(1200)
-        );
-        if (embeddings.length === remote.length)
+        // A stored vector is eligible only if the embedding input is
+        // identical, including the overview language and genres.
+        const indexed = await this.store
+          ?.existing(
+            this.source.id,
+            type,
+            remote.map((doc) => doc.sourceId)
+          )
+          .catch(() => undefined);
+        const known = remote.map((doc) => {
+          const entry =
+            doc.source === this.source.id
+              ? indexed?.get(doc.sourceId)
+              : undefined;
+          return entry?.hash === documentHash(doc) ? entry.vector : undefined;
+        });
+        const missing = remote.filter((_, index) => !known[index]);
+        const embeddings = missing.length
+          ? await this.engine.embed(
+              missing.map(documentText),
+              AbortSignal.timeout(1200)
+            )
+          : [];
+        if (embeddings.length === missing.length) {
+          let next = 0;
           related = remote
             .map((doc, index) => ({
               doc,
               score: relatedScore(
                 doc,
-                cosine(seed.vector, quantize(embeddings[index]))
+                cosine(
+                  seed.vector,
+                  known[index] ?? quantize(embeddings[next++])
+                )
               ),
             }))
             .sort((a, b) => b.score - a.score);
+        }
       } catch {
         /* Local and TMDB ordering remain available if inference is busy. */
       }
@@ -1313,7 +1375,13 @@ export class SmartSearchService {
       }))
       .sort((a, b) => b.rank - a.rank)
       .slice(0, 30)
-      .map(({ item }) => item);
+      .map(({ item }) => ({
+        ...item,
+        seedTitle: seed.document.title,
+        sharedGenreIds: item.document.genreIds.filter((id) =>
+          seed.document.genreIds.includes(id)
+        ),
+      }));
   }
 
   async recommendations(
@@ -1337,14 +1405,28 @@ export class SmartSearchService {
         : Promise.resolve([]),
     }));
     const pools: SmartMatch[][] = [];
-    for (const { item, remote } of sources) {
-      const seed = await this.seed(item.type, item.id).catch(() => undefined);
-      const [local, related] = await Promise.all([
-        seed
-          ? this.searchDense(seed.vector, filters, 50).catch(() => [])
-          : Promise.resolve([]),
-        remote,
-      ]);
+    const seedsBySource = await Promise.all(
+      sources.map(({ item }) =>
+        this.seed(item.type, item.id).catch(() => undefined)
+      )
+    );
+    const vectors = seedsBySource.flatMap((seed) =>
+      seed ? [seed.vector] : []
+    );
+    const store = this.store;
+    const localPools =
+      vectors.length > 1 && store
+        ? await this.runDenseScan(() =>
+            store.searchMany(vectors, filters, 50)
+          ).catch(() => [])
+        : vectors.length === 1
+          ? [await this.searchDense(vectors[0], filters, 50).catch(() => [])]
+          : [];
+    let localIndex = 0;
+    for (const [index, { remote }] of sources.entries()) {
+      const seed = seedsBySource[index];
+      const local = seed ? (localPools[localIndex++] ?? []) : [];
+      const related = await remote;
       const matches = fuseSmartCandidates(
         [
           local.map((match) => ({
@@ -1362,12 +1444,22 @@ export class SmartSearchService {
         50
       );
       pools.push(
-        matches.filter(
-          (match) =>
-            !exclude.has(
-              `${match.document.mediaType}:${match.document.sourceId}`
-            )
-        )
+        matches
+          .filter(
+            (match) =>
+              !exclude.has(
+                `${match.document.mediaType}:${match.document.sourceId}`
+              )
+          )
+          .map((match) => ({
+            ...match,
+            seedTitle: seed?.document.title,
+            sharedGenreIds: seed
+              ? match.document.genreIds.filter((id) =>
+                  seed.document.genreIds.includes(id)
+                )
+              : undefined,
+          }))
       );
     }
     return balanceRecommendationPools(pools);

@@ -13,7 +13,7 @@ import {
   relatedPrior,
   storyMatchPenalty,
 } from './service';
-import { SmartStore } from './store';
+import { SmartStore, documentHash } from './store';
 import type { MetadataSource, SmartDocument } from './types';
 import { quantize } from './vectors';
 
@@ -1797,7 +1797,7 @@ it('keeps a stronger obscure similar title ahead of a weaker popular one', async
   }
 });
 
-it('uses ephemeral description similarity to avoid promoting unrelated remote recommendations', async () => {
+it('reuses indexed vectors only for identical remote descriptions and reranks the rest', async () => {
   const settings = getSettings().main;
   const original = settings.smartSearchRerank;
   settings.smartSearchRerank = false;
@@ -1814,6 +1814,7 @@ it('uses ephemeral description similarity to avoid promoting unrelated remote re
     title: 'Match',
     overview: 'Related',
   };
+  const embedded: string[] = [];
   const engine = {
     phase: 'ready' as const,
     downloadBytes: 0,
@@ -1821,6 +1822,7 @@ it('uses ephemeral description similarity to avoid promoting unrelated remote re
     async start() {},
     stop() {},
     async embed(texts: string[]) {
+      embedded.push(...texts);
       return texts.map((text) =>
         text.includes('Unrelated') ? [0, 1] : [1, 0]
       );
@@ -1843,9 +1845,25 @@ it('uses ephemeral description similarity to avoid promoting unrelated remote re
     store: {
       find: () => Promise<{ document: SmartDocument; vector: Buffer }>;
       search: () => Promise<never[]>;
+      existing: SmartStore['existing'];
     };
   };
   internal.store = {
+    async existing() {
+      return new Map([
+        [
+          remoteMatch.sourceId,
+          { hash: documentHash(remoteMatch), vector: quantize([1, 0]) },
+        ],
+        [
+          remoteNoise.sourceId,
+          {
+            hash: documentHash({ ...remoteNoise, overview: 'Old synopsis' }),
+            vector: quantize([1, 0]),
+          },
+        ],
+      ]);
+    },
     async find() {
       return { document: seed, vector: quantize([1, 0]) };
     },
@@ -1859,6 +1877,8 @@ it('uses ephemeral description similarity to avoid promoting unrelated remote re
       result.map((item) => item.document.sourceId),
       ['3', '2']
     );
+    assert.equal(embedded.length, 1);
+    assert.match(embedded[0], /Unrelated/);
   } finally {
     settings.smartSearchRerank = original;
   }

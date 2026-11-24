@@ -639,3 +639,36 @@ it('resumes if lexical indexing is re-enabled while a paused batch is finalizing
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+it('returns the same filtered rankings for separate and batched query vectors', async () => {
+  const store = new SmartStore(':memory:');
+  try {
+    await store.initialize();
+    const vectors = [
+      [1, 0],
+      [0, 1],
+      [1, 1],
+    ].map(quantize);
+    for (let index = 0; index < 12; index++) {
+      await store.upsert(
+        doc(String(index), {
+          originalLanguage: index % 2 ? 'en' : 'fr',
+          voteCount: index * 139,
+        }),
+        vectors[index % vectors.length]
+      );
+    }
+    const filters = { language: 'en' };
+    const independent = await Promise.all(
+      vectors.map((vector) => store.search(vector, filters, 3))
+    );
+    const batch = await store.searchMany(vectors, filters, 3);
+    assert.deepEqual(batch, independent);
+    await assert.rejects(
+      store.searchMany(vectors, filters, 3, AbortSignal.abort()),
+      { name: 'AbortError' }
+    );
+  } finally {
+    await store.close();
+  }
+});

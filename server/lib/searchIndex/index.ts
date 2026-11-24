@@ -1,5 +1,5 @@
 import sqlite3 from 'sqlite3';
-import { normalizeTitle, titleRank, titleSimilarity } from './ranking';
+import { normalizeTitle, prepareTitleSimilarity, titleRank } from './ranking';
 
 export { normalizeTitle } from './ranking';
 
@@ -449,27 +449,26 @@ export class SearchIndex {
         )
       );
     }
+    const similarity = prepareTitleSimilarity(normalized);
     return candidates
       .map(({ searchTitle, searchOriginalTitle, ...candidate }) => {
-        const titleScore = titleSimilarity(normalized, searchTitle);
+        const titleScore = similarity(searchTitle);
+        const score =
+          searchOriginalTitle === searchTitle
+            ? titleScore
+            : Math.max(titleScore, similarity(searchOriginalTitle));
         return {
-          ...candidate,
-          score:
-            searchOriginalTitle === searchTitle
-              ? titleScore
-              : Math.max(
-                  titleScore,
-                  titleSimilarity(normalized, searchOriginalTitle)
-                ),
+          match: { ...candidate, score },
+          rank: titleRank(score, candidate.popularity),
         };
       })
-      .filter((candidate) => candidate.score >= (shortNonLatin ? 0.75 : 0.78))
+      .filter(({ match }) => match.score >= (shortNonLatin ? 0.75 : 0.78))
       .sort(
         (a, b) =>
-          titleRank(b.score, b.popularity) - titleRank(a.score, a.popularity) ||
-          a.sourceId.localeCompare(b.sourceId)
+          b.rank - a.rank || a.match.sourceId.localeCompare(b.match.sourceId)
       )
-      .slice(0, limit);
+      .slice(0, limit)
+      .map(({ match }) => match);
   }
 
   async close(): Promise<void> {

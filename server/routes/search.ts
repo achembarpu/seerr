@@ -7,6 +7,10 @@ import { MediaRequest } from '@server/entity/MediaRequest';
 import type { User } from '@server/entity/User';
 import { findSearchProvider } from '@server/lib/search';
 import searchIndex from '@server/lib/searchIndex/service';
+import {
+  explainMatch,
+  explanationTerms,
+} from '@server/lib/smartSearch/explanation';
 import smartSearch from '@server/lib/smartSearch/service';
 import type { SmartMatch } from '@server/lib/smartSearch/store';
 import type {
@@ -76,13 +80,22 @@ const attachMediaInfo = async (
 const smartCards = (
   matches: SmartMatch[],
   user: User | undefined,
-  includeActiveRequest = false
-) =>
-  attachMediaInfo(
-    matches.map(({ document }) => document.card as unknown as MediaCard),
+  context: {
+    query?: string;
+    basis?: 'requests' | 'library';
+    related?: boolean;
+  } = {}
+) => {
+  const terms = context.query ? explanationTerms(context.query) : [];
+  return attachMediaInfo(
+    matches.map((match) => ({
+      ...(match.document.card as unknown as MediaCard),
+      matchExplanation: explainMatch(match, terms, context.basis),
+    })),
     user,
-    includeActiveRequest
+    context.related
   );
+};
 
 // Preserve localized, resolved cards across overlapping queries. User-specific
 // request, watchlist and availability status is always attached afterwards.
@@ -92,6 +105,9 @@ const titleCards = new LRUCache<string, MediaCard | false>({
 });
 
 searchRoutes.get('/smart', async (req, res, next) => {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  res.once('close', abort);
   try {
     const query =
       typeof req.query.query === 'string' ? req.query.query.trim() : '';
@@ -105,21 +121,24 @@ searchRoutes.get('/smart', async (req, res, next) => {
     const matches = await smartSearch.search(
       query.slice(0, 500),
       smartFilters(req.query),
-      (req.query.language as string) ?? req.locale
+      (req.query.language as string) ?? req.locale,
+      controller.signal
     );
-    const results = (await smartCards(matches, req.user)).map(
-      (card, index) => ({
-        ...card,
-        matchScore: matches[index].score,
-        searchMethods: matches[index].methods,
-        reranked: matches[index].reranked ?? false,
-      })
-    );
+    const results = (
+      await smartCards(matches, req.user, { query: query.slice(0, 500) })
+    ).map((card, index) => ({
+      ...card,
+      matchScore: matches[index].score,
+      searchMethods: matches[index].methods,
+      reranked: matches[index].reranked ?? false,
+    }));
     return res
       .status(200)
       .json({ results, enabled: true, ready: smartSearch.status().count > 0 });
   } catch (error) {
-    return next(error);
+    if (!controller.signal.aborted) return next(error);
+  } finally {
+    res.off('close', abort);
   }
 });
 
@@ -181,7 +200,10 @@ searchRoutes.get('/smart/recommendations', async (req, res, next) => {
         : [];
       basis = matches.length ? 'library' : 'none';
     }
-    const results = await smartCards(matches, req.user, true);
+    const results = await smartCards(matches, req.user, {
+      related: true,
+      basis: basis === 'none' ? undefined : basis,
+    });
     return res.status(200).json({
       page: 1,
       totalPages: 1,
@@ -203,7 +225,7 @@ searchRoutes.get('/smart/similar', async (req, res, next) => {
       smartFilters(req.query),
       (req.query.language as string) ?? req.locale
     );
-    const results = await smartCards(matches, req.user, true);
+    const results = await smartCards(matches, req.user, { related: true });
     return res
       .status(200)
       .json({ page: 1, totalPages: 1, totalResults: results.length, results });

@@ -9,6 +9,7 @@ import { Permission, useUser } from '@app/hooks/useUser';
 import defineMessages from '@app/utils/defineMessages';
 import { ArrowPathIcon } from '@heroicons/react/24/outline';
 import { MediaStatus } from '@server/constants/media';
+import axios from 'axios';
 import { useRouter } from 'next/router';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
@@ -135,23 +136,40 @@ const SearchResults = ({
     genre: filters.genre,
   }))
     if (value) params.set(key, value);
-  const {
-    data: smart,
-    error: smartError,
-    isValidating: smartLoading,
-  } = useSWR<{
-    ready: boolean;
-    results: SearchItem[];
-  }>(
-    searchDescriptions
-      ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
-      : null,
-    {
-      revalidateOnFocus: false,
-      revalidateIfStale: false,
-      shouldRetryOnError: false,
-    }
-  );
+  const descriptionKey = searchDescriptions
+    ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
+    : null;
+  const [descriptionResponse, setDescriptionResponse] = useState<{
+    key: string;
+    data?: { ready: boolean; results: SearchItem[] };
+    error?: true;
+  }>();
+  useEffect(() => {
+    if (!descriptionKey) return;
+    const controller = new AbortController();
+    axios
+      .get<{ ready: boolean; results: SearchItem[] }>(descriptionKey, {
+        signal: controller.signal,
+      })
+      .then(
+        ({ data }) => {
+          if (!controller.signal.aborted)
+            setDescriptionResponse({ key: descriptionKey, data });
+        },
+        () => {
+          if (!controller.signal.aborted)
+            setDescriptionResponse({ key: descriptionKey, error: true });
+        }
+      );
+    return () => controller.abort();
+  }, [descriptionKey]);
+  const latest =
+    descriptionResponse?.key === descriptionKey
+      ? descriptionResponse
+      : undefined;
+  const smart = latest?.data;
+  const smartError = latest?.error;
+  const smartLoading = !!descriptionKey && !latest;
 
   const descriptionsFirst = canSearchDescriptions && !ranked.confident;
   const descriptionHasMatches = !!smart?.results.length;

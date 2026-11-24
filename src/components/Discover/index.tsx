@@ -53,6 +53,12 @@ const messages = defineMessages('components.Discover', {
   createnewslider: 'Create New Slider',
   requestRecommendations: 'Based on your requests',
   libraryRecommendations: 'From your library',
+  noRecommendationSeeds:
+    'Recommendations will appear as Seerr indexes titles from your library and requests.',
+  noVisibleRecommendations:
+    'No recommendations match your visibility settings.',
+  recommendationsUnavailable:
+    'Recommendations couldn’t load. Please try again later.',
 });
 
 const Discover = () => {
@@ -245,11 +251,22 @@ const Discover = () => {
                     intl.formatMessage(
                       basis === 'requests'
                         ? messages.requestRecommendations
-                        : messages.libraryRecommendations
+                        : basis === 'library'
+                          ? messages.libraryRecommendations
+                          : sliderTitles.smartRecommendations
                     )
                   }
                   url="/api/v1/search/smart/recommendations"
-                  hideWhenEmpty
+                  emptyMessage={(basis) =>
+                    intl.formatMessage(
+                      basis === 'none'
+                        ? messages.noRecommendationSeeds
+                        : messages.noVisibleRecommendations
+                    )
+                  }
+                  errorMessage={intl.formatMessage(
+                    messages.recommendationsUnavailable
+                  )}
                 />
               );
             }

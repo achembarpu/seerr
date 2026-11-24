@@ -32,13 +32,12 @@ export const prepareCosine = (left: Uint8Array) => {
   const query = new Int8Array(left.buffer, left.byteOffset, left.byteLength);
   let queryNorm = 0;
   for (let i = 0; i < query.length; i++) queryNorm += query[i] * query[i];
-  return (right: Uint8Array): number => {
+  return (right: Uint8Array | Int8Array): number => {
     if (query.length !== right.length || !query.length || !queryNorm) return 0;
-    const candidate = new Int8Array(
-      right.buffer,
-      right.byteOffset,
-      right.byteLength
-    );
+    const candidate =
+      right instanceof Int8Array
+        ? right
+        : new Int8Array(right.buffer, right.byteOffset, right.byteLength);
     let dot = 0;
     let candidateNorm = 0;
     for (let i = 0; i < query.length; i++) {

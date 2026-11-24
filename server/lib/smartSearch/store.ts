@@ -8,6 +8,8 @@ export interface SmartMatch {
   score: number;
   reranked?: boolean;
   relevanceScore?: number;
+  seedTitle?: string;
+  sharedGenreIds?: number[];
   methods?: (
     | 'semantic'
     | 'lexical'
@@ -68,6 +70,11 @@ type Row = {
   hash: string;
   voteCount: number;
 };
+const denseVoteBonuses = Array.from(
+  { length: 1001 },
+  (_, votes) => 0.015 * (Math.log1p(votes) / Math.log(1001))
+);
+
 export class SmartStore {
   private db: sqlite3.Database;
   private lexicalTask?: Promise<void>;
@@ -466,10 +473,22 @@ export class SmartStore {
   async search(
     vector: Buffer,
     filters: SmartFilters = {},
-    limit = 30
+    limit = 30,
+    signal?: AbortSignal
   ): Promise<SmartMatch[]> {
+    return (await this.searchMany([vector], filters, limit, signal))[0];
+  }
+
+  async searchMany(
+    vectors: readonly Buffer[],
+    filters: SmartFilters = {},
+    limit = 30,
+    signal?: AbortSignal
+  ): Promise<SmartMatch[][]> {
+    signal?.throwIfAborted();
     if (this.closing) throw new Error('Search index is closing');
-    if (limit <= 0) return [];
+    limit = Math.floor(limit);
+    if (!(limit > 0) || !vectors.length) return vectors.map(() => []);
     // The writer continues indexing on the main connection. A separate,
     // read-only transaction keeps the vector and final document in the same
     // snapshot even when a title is updated or removed during the scan.
@@ -530,41 +549,55 @@ export class SmartStore {
         params.push(filters.genre);
       }
       let after = 0;
-      const scoreVector = prepareCosine(vector);
-      const best: {
-        id: number;
-        score: number;
-        rank: number;
-        document?: string;
-      }[] = [];
+      const queries = vectors.map((vector) => ({
+        score: prepareCosine(vector),
+        best: [] as {
+          id: number;
+          score: number;
+          rank: number;
+          document?: string;
+        }[],
+      }));
       for (;;) {
+        signal?.throwIfAborted();
         const rows = await this.all<
           Pick<Row, 'id' | 'vector' | 'voteCount'> & { document?: string }
         >(
-          `SELECT id, vector, voteCount${transient ? ', document' : ''} FROM smart_documents NOT INDEXED WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 512`,
+          `SELECT id, vector, voteCount${transient ? ', document' : ''} FROM smart_documents NOT INDEXED WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 1024`,
           [after, ...params],
           snapshot
         );
+        signal?.throwIfAborted();
         if (!rows.length) break;
         for (const row of rows) {
-          const score = scoreVector(row.vector);
-          // A small, capped audience-evidence bonus breaks close semantic ties
-          // without removing unrated or less well-known titles.
-          const rank =
-            score +
-            0.015 *
-              Math.min(
-                1,
-                Math.log1p(Math.max(0, row.voteCount)) / Math.log(1001)
-              );
-          if (best.length < limit || rank > best[best.length - 1].rank) {
-            best.push({
+          // This bonus is independent of the query. Keep the exact order
+          // when scanning several independent seeds in the same transaction.
+          const votes = Math.max(0, row.voteCount);
+          const bonus =
+            denseVoteBonuses[votes] ??
+            0.015 * Math.min(1, Math.log1p(votes) / Math.log(1001));
+          const candidate = new Int8Array(
+            row.vector.buffer,
+            row.vector.byteOffset,
+            row.vector.byteLength
+          );
+          for (const { score: similarity, best } of queries) {
+            const score = similarity(candidate);
+            const rank = score + bonus;
+            if (best.length === limit && rank <= best[limit - 1].rank) continue;
+            let low = 0;
+            let high = best.length;
+            while (low < high) {
+              const middle = (low + high) >>> 1;
+              if (rank > best[middle].rank) high = middle;
+              else low = middle + 1;
+            }
+            best.splice(low, 0, {
               id: row.id,
               score,
               rank,
               document: row.document,
             });
-            best.sort((a, b) => b.rank - a.rank);
             if (best.length > limit) best.pop();
           }
         }
@@ -574,24 +607,31 @@ export class SmartStore {
       // Fetch descriptions only for the final shortlist; reading each large JSON
       // document during the vector scan adds substantial SQLite and Node work.
       if (transient)
-        return best.map(({ document, score }) => ({
-          document: JSON.parse(document!) as SmartDocument,
-          score,
-        }));
+        return queries.map(({ best }) =>
+          best.map(({ document, score }) => ({
+            document: JSON.parse(document!) as SmartDocument,
+            score,
+          }))
+        );
       const documents = new Map<number, SmartDocument>();
-      for (let start = 0; start < best.length; start += 500) {
-        const ids = best.slice(start, start + 500).map((item) => item.id);
+      const ids = [
+        ...new Set(queries.flatMap(({ best }) => best.map(({ id }) => id))),
+      ];
+      for (let start = 0; start < ids.length; start += 500) {
+        const batch = ids.slice(start, start + 500);
         const rows = await this.all<Pick<Row, 'id' | 'document'>>(
-          `SELECT id, document FROM smart_documents WHERE id IN (${ids.map(() => '?').join(',')})`,
-          ids,
+          `SELECT id, document FROM smart_documents WHERE id IN (${batch.map(() => '?').join(',')})`,
+          batch,
           snapshot
         );
         rows.forEach((row) => documents.set(row.id, JSON.parse(row.document)));
       }
-      return best.flatMap(({ id, score }) => {
-        const document = documents.get(id);
-        return document ? [{ document, score }] : [];
-      });
+      return queries.map(({ best }) =>
+        best.flatMap(({ id, score }) => {
+          const document = documents.get(id);
+          return document ? [{ document, score }] : [];
+        })
+      );
     } finally {
       try {
         if (!transient && snapshot)

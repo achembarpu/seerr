@@ -33,6 +33,8 @@ interface MediaSliderProps {
   maxItems?: number;
   extraParams?: string;
   onNewTitles?: (titleCount: number) => void;
+  emptyMessage?: (basis: MixedResult['basis']) => string;
+  errorMessage?: string;
   titleForBasis?: (basis: MixedResult['basis']) => string;
 }
 
@@ -46,6 +48,8 @@ const MediaSlider = ({
   maxItems = 20,
   onNewTitles,
   titleForBasis,
+  emptyMessage,
+  errorMessage,
 }: MediaSliderProps) => {
   const settings = useSettings();
   const { hasPermission } = useUser();
@@ -138,6 +142,7 @@ const MediaSlider = ({
             image={title.posterPath}
             status={title.mediaInfo?.status}
             summary={title.overview}
+            matchExplanation={title.matchExplanation}
             title={title.title}
             userScore={title.voteAverage}
             year={title.releaseDate}
@@ -154,6 +159,7 @@ const MediaSlider = ({
             image={title.posterPath}
             status={title.mediaInfo?.status}
             summary={title.overview}
+            matchExplanation={title.matchExplanation}
             title={title.name}
             userScore={title.voteAverage}
             year={title.firstAirDate}
@@ -199,12 +205,25 @@ const MediaSlider = ({
           </div>
         )}
       </div>
-      <Slider
-        sliderKey={sliderKey}
-        isLoading={!data && !error}
-        isEmpty={false}
-        items={finalTitles}
-      />
+      <div
+        className={
+          emptyMessage ? 'min-h-[15.5rem] md:min-h-[18.5rem]' : undefined
+        }
+      >
+        {error && !data && errorMessage ? (
+          <p role="status" className="py-6 text-sm text-gray-400">
+            {errorMessage}
+          </p>
+        ) : (
+          <Slider
+            sliderKey={sliderKey}
+            isLoading={!data && !error}
+            isEmpty={!!emptyMessage && !!data && finalTitles.length === 0}
+            emptyMessage={emptyMessage?.(data?.[0]?.basis)}
+            items={finalTitles}
+          />
+        )}
+      </div>
     </>
   );
 };

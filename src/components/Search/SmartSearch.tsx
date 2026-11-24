@@ -1,6 +1,7 @@
 import Button from '@app/components/Common/Button';
 import SlideOver from '@app/components/Common/SlideOver';
 import LanguageSelector from '@app/components/LanguageSelector';
+import { genres } from '@app/i18n/mediaGenres';
 import defineMessages from '@app/utils/defineMessages';
 import { FunnelIcon, XCircleIcon } from '@heroicons/react/24/solid';
 import { useState } from 'react';
@@ -25,35 +26,6 @@ const messages = defineMessages('components.Search.SmartSearch', {
   genre: 'Genre',
   anyGenre: 'Any genre',
 });
-const genres = [
-  [28, 'Action'],
-  [12, 'Adventure'],
-  [16, 'Animation'],
-  [35, 'Comedy'],
-  [80, 'Crime'],
-  [99, 'Documentary'],
-  [18, 'Drama'],
-  [10751, 'Family'],
-  [14, 'Fantasy'],
-  [36, 'History'],
-  [27, 'Horror'],
-  [10402, 'Music'],
-  [9648, 'Mystery'],
-  [10749, 'Romance'],
-  [878, 'Science fiction'],
-  [53, 'Thriller'],
-  [10752, 'War'],
-  [37, 'Western'],
-  [10759, 'Action and adventure (TV)'],
-  [10762, 'Kids (TV)'],
-  [10763, 'News (TV)'],
-  [10764, 'Reality (TV)'],
-  [10765, 'Science fiction and fantasy (TV)'],
-  [10766, 'Soap (TV)'],
-  [10767, 'Talk (TV)'],
-  [10768, 'War and politics (TV)'],
-] as const;
-
 export interface SearchFilters {
   type: string;
   language: string;

@@ -315,7 +315,11 @@ export class EmbeddingEngine {
     }
   }
 
-  async embed(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+  async embed(
+    texts: string[],
+    signal?: AbortSignal,
+    timeout = 120000
+  ): Promise<number[][]> {
     if (this.phase !== 'ready') throw new Error('Embedding model is not ready');
     let response;
     try {
@@ -325,7 +329,7 @@ export class EmbeddingEngine {
         `${this.baseUrl}/v1/embeddings`,
         { input: texts },
         {
-          timeout: 120000,
+          timeout,
           signal,
           headers: { Authorization: `Bearer ${this.externalKey ?? this.key}` },
           proxy: false,
@@ -334,7 +338,7 @@ export class EmbeddingEngine {
     } catch (error) {
       // A host service may have restarted with another model. Force its model
       // identity to be checked again before accepting another embedding.
-      if (this.externalKey) {
+      if (this.externalKey && !signal?.aborted) {
         this.externalKey = undefined;
         this.activeDevice = undefined;
         this.phase = 'idle';
@@ -359,7 +363,8 @@ export class EmbeddingEngine {
   async rerank(
     query: string,
     documents: string[],
-    timeout = 6000
+    timeout = 6000,
+    signal?: AbortSignal
   ): Promise<number[]> {
     if (this.phase !== 'ready') throw new Error('Reranker is not ready');
     if (!documents.length) return [];
@@ -370,6 +375,7 @@ export class EmbeddingEngine {
       { model: rerankerName, query, documents },
       {
         timeout,
+        signal,
         headers: { Authorization: `Bearer ${this.key}` },
         proxy: false,
       }

@@ -6,6 +6,7 @@ import StatusBadgeMini from '@app/components/Common/StatusBadgeMini';
 import Tooltip from '@app/components/Common/Tooltip';
 import RequestModal from '@app/components/RequestModal';
 import ErrorCard from '@app/components/TitleCard/ErrorCard';
+import MatchReason from '@app/components/TitleCard/MatchReason';
 import Placeholder from '@app/components/TitleCard/Placeholder';
 import { useIsTouch } from '@app/hooks/useIsTouch';
 import useToasts from '@app/hooks/useToasts';
@@ -23,7 +24,7 @@ import {
 } from '@heroicons/react/24/outline';
 import { MediaStatus } from '@server/constants/media';
 import type { Watchlist } from '@server/entity/Watchlist';
-import type { MediaType } from '@server/models/Search';
+import type { MatchExplanation, MediaType } from '@server/models/Search';
 import axios from 'axios';
 import Link from 'next/link';
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
@@ -43,6 +44,7 @@ interface TitleCardProps {
   inProgress?: boolean;
   isAddedToWatchlist?: number | boolean;
   mutateParent?: () => void;
+  matchExplanation?: MatchExplanation;
 }
 
 const messages = defineMessages('components.TitleCard', {
@@ -67,6 +69,7 @@ const TitleCard = ({
   inProgress = false,
   canExpand = false,
   mutateParent,
+  matchExplanation,
 }: TitleCardProps) => {
   const isTouch = useIsTouch();
   const intl = useIntl();
@@ -579,6 +582,9 @@ const TitleCard = ({
           </Transition>
         </div>
       </div>
+      {matchExplanation && (
+        <MatchReason explanation={matchExplanation} title={title} />
+      )}
     </div>
   );
 };
