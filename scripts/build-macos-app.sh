@@ -54,8 +54,10 @@ if [[ -n ${SEERR_MACOS_LLAMA_BINARY:-} ]]; then
 else
   git clone --filter=blob:none --no-checkout https://github.com/ggml-org/llama.cpp.git "$work/llama"
   git -C "$work/llama" checkout --detach "$revision"
+  git -C "$work/llama" apply "$root/native/search/llama-rerank-prefix.patch"
   cmake -S "$work/llama" -B "$work/llama-build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET=13.5 -DGGML_NATIVE=OFF -DGGML_METAL=ON -DGGML_OPENMP=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF
+    -DCMAKE_OSX_DEPLOYMENT_TARGET=13.5 -DGGML_NATIVE=OFF -DGGML_METAL=ON -DGGML_OPENMP=OFF -DLLAMA_CURL=OFF -DLLAMA_OPENSSL=OFF \
+    -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_USE_PREBUILT_UI=OFF -DLLAMA_BUILD_UI=OFF
   cmake --build "$work/llama-build" --target llama-server -j 2
   llama="$work/llama-build/bin/llama-server"
 fi

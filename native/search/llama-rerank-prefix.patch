@@ -1,0 +1,68 @@
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -527,6 +527,14 @@
+             return true;
+         }
+         return false;
++    }
++
++    // Causal rank pooling reads the final token, so its text prefix can use the KV cache.
++    bool can_reuse_rerank_prefix() const {
++        return task->type == SERVER_TASK_TYPE_RERANK &&
++               llama_get_memory(ctx_tgt) && llama_get_causal_attn(ctx_tgt) &&
++               llama_pooling_type(ctx_tgt) == LLAMA_POOLING_TYPE_RANK &&
++               !task->tokens.has_mtmd;
+     }
+
+     bool can_batch_with(server_slot & other_slot) const {
+@@ -656,7 +664,7 @@
+         prompt.tokens.insert(spec_draft);
+     }
+
+-    void release() {
++    void release(bool keep_stateless_prompt = false) {
+         if (is_processing()) {
+             GGML_ASSERT(task);
+
+@@ -667,8 +675,8 @@
+             state = SLOT_STATE_IDLE;
+
+             // do not keep context of the child slots - the parent's context is enough
+-            // nor of the stateless slots - no task ever reuses it
+-            if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME) {
++            // nor of the stateless slots unless the completed prompt can be reused
++            if (task->is_child() || (task->is_stateless() && !keep_stateless_prompt) || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME) {
+                 prompt_clear();
+             }
+
+@@ -4119,7 +4127,8 @@
+                                 return;
+                             }
+
+-                            if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
++                            if (slot.task->params.cache_prompt &&
++                                (!slot.task->is_stateless() || (slots.size() == 1 && slot.can_reuse_rerank_prefix()))) {
+                                 // reuse any previously computed tokens that are common with the new prompt
+                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+@@ -4863,7 +4872,8 @@
+
+                 if (slot.task->type == SERVER_TASK_TYPE_RERANK) {
+                     send_rerank(slot, batch.view);
+-                    slot.release();
++                    // A dedicated reranker can keep the previous prompt in its active slot.
++                    slot.release(slots.size() == 1 && slot.task->params.cache_prompt && slot.can_reuse_rerank_prefix());
+                     slot.i_batch = -1;
+                     return;
+                 }
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -341,7 +341,7 @@
+         return id_parent != -1;
+     }
+
+-    // embedding and rerank tasks always process their whole prompt, their state is never reused
++    // Embedding and rerank tasks do not require retained state for correctness.
+     bool is_stateless() const {
+         return type == SERVER_TASK_TYPE_EMBEDDING || type == SERVER_TASK_TYPE_RERANK;
+     }
