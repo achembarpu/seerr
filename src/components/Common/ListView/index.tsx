@@ -12,7 +12,6 @@ import type {
   PersonResult,
   TvResult,
 } from '@server/models/Search';
-import type { Ref } from 'react';
 import { useIntl } from 'react-intl';
 
 type ListViewProps = {
@@ -21,10 +20,10 @@ type ListViewProps = {
   isEmpty?: boolean;
   isLoading?: boolean;
   isReachingEnd?: boolean;
-  onScrollBottom: () => void;
+  onScrollBottom?: () => void;
   mutateParent?: () => void;
-  /** Opt in to stable identities and a grid ref for search-result reordering. */
-  reorderGridRef?: Ref<HTMLUListElement>;
+  stableItemKeys?: boolean;
+  placeholderCount?: number;
 };
 
 const ListView = ({
@@ -35,11 +34,15 @@ const ListView = ({
   isReachingEnd,
   plexItems,
   mutateParent,
-  reorderGridRef,
+  stableItemKeys,
+  placeholderCount = 20,
 }: ListViewProps) => {
   const intl = useIntl();
   const { hasPermission } = useUser();
-  useVerticalScroll(onScrollBottom, !isLoading && !isEmpty && !isReachingEnd);
+  useVerticalScroll(
+    onScrollBottom ?? (() => undefined),
+    !!onScrollBottom && !isLoading && !isEmpty && !isReachingEnd
+  );
 
   const blocklistVisibility = hasPermission(
     [Permission.MANAGE_BLOCKLIST, Permission.VIEW_BLOCKLIST],
@@ -53,7 +56,7 @@ const ListView = ({
           {intl.formatMessage(globalMessages.noresults)}
         </div>
       )}
-      <ul className="cards-vertical" ref={reorderGridRef}>
+      <ul className="cards-vertical">
         {plexItems?.map((title, index) => {
           return (
             <li key={`${title.ratingKey}-${index}`}>
@@ -151,17 +154,14 @@ const ListView = ({
 
             const resultKey = `${title.mediaType}:${title.id}`;
             return (
-              <li
-                key={reorderGridRef ? resultKey : `${title.id}-${index}`}
-                data-result-key={reorderGridRef ? resultKey : undefined}
-              >
+              <li key={stableItemKeys ? resultKey : `${title.id}-${index}`}>
                 {titleCard}
               </li>
             );
           })}
         {isLoading &&
           !isReachingEnd &&
-          [...Array(20)].map((_item, i) => (
+          [...Array(placeholderCount)].map((_item, i) => (
             <li key={`placeholder-${i}`}>
               <TitleCard.Placeholder canExpand />
             </li>

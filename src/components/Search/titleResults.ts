@@ -9,9 +9,7 @@ import type {
 } from '@server/models/Search';
 import type { SearchFilters } from './SmartSearch';
 
-export type SearchMethod = 'title' | 'approximate' | 'semantic';
 export type SearchItem = (MovieResult | TvResult | PersonResult) & {
-  matchMethods?: SearchMethod[];
   matchScore?: number;
 };
 
@@ -88,86 +86,68 @@ export const matchesFilters = (
   );
 };
 
-/** Combine sources by media type and TMDB ID, retaining every match reason. */
-export const mergeResults = (
+export const resultKey = (item: SearchItem) => `${item.mediaType}:${item.id}`;
+
+export const isDirectLookup = (query: string) =>
+  /(?:tmdb:|tvdb:)\d+|imdb:(?:tt|nm)\d+|year:\d{4}/i.test(query);
+
+/** Rank title and alias evidence independently of the description search. */
+export const rankTitleResults = (
   query: string,
   regular: SearchItem[],
   approximate: SearchItem[],
-  semantic: SearchItem[],
   filters: SearchFilters
-): SearchItem[] => {
+) => {
   const normalized = normalizeTitle(query);
-  const merged = new Map<
+  const entries = new Map<
     string,
-    { item: SearchItem; rank: number; titleScore: number; order: number }
+    { item: SearchItem; rank: number; evidence: number }
   >();
-  let order = 0;
-  const decisiveTitle = [...regular, ...approximate].some(
-    (item) =>
-      matchesFilters(item, filters) &&
-      (Math.max(titleScore(normalized, item), item.matchScore ?? 0) >= 0.94 ||
-        compactScriptTitleScore(normalized, item) >= 0.75)
-  );
-  let extraSemantic = 0;
-  for (const [method, items] of [
-    ['title', regular],
-    ['approximate', approximate],
-    ['semantic', semantic],
-  ] as const) {
-    items.forEach((item, position) => {
+  for (const source of [regular, approximate]) {
+    source.forEach((item, position) => {
       if (!matchesFilters(item, filters)) return;
-      const key = `${item.mediaType}:${item.id}`;
-      const score = Math.max(
+      const key = resultKey(item);
+      const existing = entries.get(key);
+      const compact = compactScriptTitleScore(normalized, item);
+      const evidence = Math.max(
         titleScore(normalized, item),
-        method === 'approximate' ? (item.matchScore ?? 0) : 0
+        item.matchScore ?? 0,
+        compact >= 0.75 ? 0.94 + (compact - 0.75) * 0.2 : 0
       );
-      // Source scores use different scales. Fuse positions instead of assuming
-      // that a weak fuzzy title is always better than a description match.
-      // Strong title evidence remains a separate signal for title lookups.
-      const weight =
-        method === 'semantic'
-          ? 1.5
-          : semantic.length && !decisiveTitle
-            ? 0.3
-            : 1;
-      const contribution = weight / (position + 3);
-      const compactScore =
-        method === 'approximate'
-          ? compactScriptTitleScore(normalized, item)
-          : 0;
-      const titleEvidence =
-        compactScore >= 0.75
-          ? Math.max(score, 0.94 + (compactScore - 0.75) * 0.2)
-          : score;
-      const existing = merged.get(key);
-      if (
-        method === 'semantic' &&
-        !existing &&
-        decisiveTitle &&
-        extraSemantic++ >= 5
-      )
-        return;
-      if (existing) {
-        if (!existing.item.matchMethods?.includes(method)) {
-          existing.item.matchMethods?.push(method);
-          existing.rank += contribution;
-        }
-        existing.titleScore = Math.max(existing.titleScore, titleEvidence);
-      } else {
-        merged.set(key, {
-          item: { ...item, matchMethods: [method] },
-          rank: contribution,
-          titleScore: titleEvidence,
-          order: order++,
-        });
-      }
+      entries.set(key, {
+        // The regular result includes current localized TMDB metadata.
+        item: existing?.item ?? item,
+        rank: (existing?.rank ?? 0) + 1 / (position + 3),
+        evidence: Math.max(existing?.evidence ?? 0, evidence),
+      });
     });
   }
-  return [...merged.values()]
-    .sort((a, b) => {
-      const aTitle = a.titleScore >= 0.94 ? 3 + a.titleScore : 0;
-      const bTitle = b.titleScore >= 0.94 ? 3 + b.titleScore : 0;
-      return bTitle - aTitle || b.rank - a.rank || a.order - b.order;
-    })
-    .map(({ item }) => item);
+  const ranked = [...entries.values()].sort(
+    (a, b) =>
+      (b.evidence >= 0.94 ? b.evidence : 0) -
+        (a.evidence >= 0.94 ? a.evidence : 0) || b.rank - a.rank
+  );
+  return {
+    all: ranked.map(({ item }) => item),
+    credible: ranked
+      .filter(({ evidence }) => evidence >= 0.9)
+      .map(({ item }) => item),
+    confident: ranked.some(({ item, evidence }) =>
+      item.mediaType === 'person' ? evidence === 1 : evidence >= 0.94
+    ),
+  };
+};
+
+export const descriptionResults = (
+  matches: SearchItem[],
+  titleItems: SearchItem[],
+  filters: SearchFilters
+) => {
+  const seen = new Set(titleItems.map(resultKey));
+  return matches.filter((item) => {
+    const key = resultKey(item);
+    if (seen.has(key) || !matchesFilters(item, filters)) return false;
+    seen.add(key);
+    return true;
+  });
 };

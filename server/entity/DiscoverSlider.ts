@@ -1,11 +1,11 @@
-import type { DiscoverSliderType } from '@server/constants/discover';
-import { defaultSliders } from '@server/constants/discover';
+import { defaultSliders, DiscoverSliderType } from '@server/constants/discover';
 import { getRepository } from '@server/datasource';
 import logger from '@server/logger';
 import { DbAwareColumn, resolveDbType } from '@server/utils/DbColumnHelper';
 import {
   Column,
   Entity,
+  MoreThanOrEqual,
   PrimaryGeneratedColumn,
   UpdateDateColumn,
 } from 'typeorm';
@@ -15,21 +15,31 @@ class DiscoverSlider {
   public static async bootstrapSliders(): Promise<void> {
     const sliderRepository = getRepository(DiscoverSlider);
 
-    for (const slider of defaultSliders) {
-      const existingSlider = await sliderRepository.findOne({
-        where: {
-          type: slider.type,
-        },
-      });
+    await sliderRepository.manager.transaction(async (manager) => {
+      const sliders = manager.getRepository(DiscoverSlider);
+      for (const defaults of defaultSliders) {
+        const existing = await sliders.findOneBy({ type: defaults.type });
+        if (existing) continue;
 
-      if (!existingSlider) {
+        const slider = new DiscoverSlider(defaults);
+        if (slider.type === DiscoverSliderType.SMART_RECOMMENDATIONS) {
+          const trending = await sliders.findOneBy({
+            type: DiscoverSliderType.TRENDING,
+          });
+          if (trending) slider.order = trending.order + 1;
+          await sliders.increment(
+            { order: MoreThanOrEqual(slider.order) },
+            'order',
+            1
+          );
+        }
         logger.info('Creating built-in discovery slider', {
           label: 'Discover Slider',
           slider,
         });
-        await sliderRepository.save(new DiscoverSlider(slider));
+        await sliders.save(slider);
       }
-    }
+    });
   }
 
   @PrimaryGeneratedColumn()

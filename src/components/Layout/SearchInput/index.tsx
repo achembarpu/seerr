@@ -10,7 +10,8 @@ const messages = defineMessages('components.Layout.SearchInput', {
 
 const SearchInput = () => {
   const intl = useIntl();
-  const { searchValue, setSearchValue, setIsOpen, clear } = useSearchInput();
+  const { searchValue, setSearchValue, setIsOpen, clear, setComposing } =
+    useSearchInput();
   return (
     <div className="flex flex-1">
       <div className="flex w-full">
@@ -30,6 +31,8 @@ const SearchInput = () => {
             autoComplete="off"
             value={searchValue}
             onChange={(e) => setSearchValue(e.target.value)}
+            onCompositionStart={() => setComposing(true)}
+            onCompositionEnd={() => setComposing(false)}
             onFocus={() => setIsOpen(true)}
             onBlur={() => {
               if (searchValue === '') {

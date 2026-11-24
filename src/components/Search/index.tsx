@@ -1,72 +1,132 @@
 import Alert from '@app/components/Common/Alert';
+import Button from '@app/components/Common/Button';
 import Header from '@app/components/Common/Header';
 import ListView from '@app/components/Common/ListView';
 import PageTitle from '@app/components/Common/PageTitle';
 import useDiscover from '@app/hooks/useDiscover';
 import useSettings from '@app/hooks/useSettings';
+import { Permission, useUser } from '@app/hooks/useUser';
 import defineMessages from '@app/utils/defineMessages';
 import { ArrowPathIcon } from '@heroicons/react/24/outline';
-import type {
-  MovieResult,
-  PersonResult,
-  TvResult,
-} from '@server/models/Search';
+import { MediaStatus } from '@server/constants/media';
 import { useRouter } from 'next/router';
 import { useEffect, useState } from 'react';
 import { useIntl } from 'react-intl';
 import useSWR from 'swr';
-import SmartSearch, { emptySearchFilters } from './SmartSearch';
-import { mergeResults, type SearchItem } from './mergeResults';
+import SmartSearch, {
+  emptySearchFilters,
+  type SearchFilters,
+} from './SmartSearch';
 import { serializeSmartSearchParams } from './smartSearchQuery';
-import { useSearchReorderAnimation } from './useSearchReorderAnimation';
+import {
+  descriptionResults,
+  isDirectLookup,
+  rankTitleResults,
+  type SearchItem,
+} from './titleResults';
 
 const messages = defineMessages('components.Search', {
   search: 'Search',
   searchresults: 'Search Results',
-  searchUnavailable: 'Some search results are temporarily unavailable.',
+  titleMatches: 'Title matches',
+  descriptionMatches: 'Matches by description',
+  searchDescriptions: 'Search descriptions',
+  hideDescriptions: 'Hide description matches',
+  moreTitles: 'Load more title matches',
+  noTitleMatches: 'No matching titles.',
+  noDescriptionMatches: 'No additional matches by description.',
+  titleUnavailable: 'Some title matches are temporarily unavailable.',
+  descriptionUnavailable: 'Description search is temporarily unavailable.',
   smartLoading: 'Description search is still starting or indexing.',
-  smartSearching: 'Searching descriptions. Results may change.',
+  smartSearching: 'Searching descriptions…',
   imdbAttribution:
     'Information courtesy of IMDb (https://www.imdb.com). Used with permission.',
 });
 
-const Search = () => {
+const SearchResults = ({
+  query,
+  filters,
+}: {
+  query: string;
+  filters: SearchFilters;
+}) => {
   const intl = useIntl();
-  const router = useRouter();
   const settings = useSettings();
-  const [filters, setFilters] = useState(emptySearchFilters);
-  const query =
-    typeof router.query.query === 'string' ? router.query.query : '';
-  const [debouncedQuery, setDebouncedQuery] = useState(query);
+  const { hasPermission } = useUser();
+  const [requestedDescriptions, setRequestedDescriptions] = useState(false);
+  const [settled, setSettled] = useState(false);
+  const [titleDeadline, setTitleDeadline] = useState(false);
+  const directLookup = isDirectLookup(query);
+  const canSearchDescriptions =
+    settings.currentSettings.smartSearch &&
+    !directLookup &&
+    filters.type !== 'person';
   useEffect(() => {
-    const timer = setTimeout(() => setDebouncedQuery(query), 500);
-    return () => clearTimeout(timer);
-  }, [query]);
+    if (!canSearchDescriptions) return;
+    const settle = setTimeout(() => setSettled(true), 400);
+    const deadline = setTimeout(() => setTitleDeadline(true), 900);
+    return () => {
+      clearTimeout(settle);
+      clearTimeout(deadline);
+    };
+  }, [canSearchDescriptions]);
+
   const {
+    firstResultData,
     isLoadingInitialData,
     isLoadingMore,
     isReachingEnd,
     titles,
     fetchMore,
     error,
-  } = useDiscover<MovieResult | TvResult | PersonResult>(
+  } = useDiscover<SearchItem>(
     '/api/v1/search',
-    { query: router.query.query },
-    { hideAvailable: false, hideBlocklisted: false, hideRequested: false }
+    { query },
+    {
+      hideAvailable: false,
+      hideBlocklisted: false,
+      hideRequested: false,
+      initialSize: 1,
+    }
   );
   const {
-    data: suggestions,
-    error: suggestionError,
-    isLoading: suggestionsLoading,
-  } = useSWR<{ results: SearchItem[] }>(
-    Array.from(debouncedQuery.trim()).length >= 2 && debouncedQuery === query
-      ? `/api/v1/search/suggestions?query=${encodeURIComponent(debouncedQuery)}`
+    data: fuzzy,
+    error: fuzzyError,
+    isLoading: fuzzyLoading,
+  } = useSWR<{
+    results: SearchItem[];
+  }>(
+    !directLookup && filters.type !== 'person' && Array.from(query).length >= 2
+      ? `/api/v1/search/suggestions?query=${encodeURIComponent(query)}`
       : null,
-    { revalidateOnFocus: false }
+    { revalidateOnFocus: false, shouldRetryOnError: false }
   );
-  const params = new URLSearchParams({ query: debouncedQuery });
+  const canViewBlocklisted = hasPermission(
+    [Permission.MANAGE_BLOCKLIST, Permission.VIEW_BLOCKLIST],
+    { type: 'or' }
+  );
+  const visible = (items: SearchItem[]) =>
+    items.filter(
+      (item) =>
+        canViewBlocklisted ||
+        item.mediaType === 'person' ||
+        item.mediaInfo?.status !== MediaStatus.BLOCKLISTED
+    );
+  const ranked = rankTitleResults(
+    query,
+    visible(titles),
+    visible(fuzzy?.results ?? []),
+    filters
+  );
+  const titlesLoading =
+    (isLoadingInitialData && !firstResultData) || fuzzyLoading;
+  const searchDescriptions =
+    canSearchDescriptions &&
+    (requestedDescriptions ||
+      (!ranked.confident && settled && (!titlesLoading || titleDeadline)));
+  const params = new URLSearchParams({ query });
   for (const [key, value] of Object.entries({
-    mediaType: filters.type === 'person' ? '' : filters.type,
+    mediaType: filters.type,
     originalLanguage: filters.language,
     yearFrom: filters.yearFrom,
     yearTo: filters.yearTo,
@@ -75,87 +135,151 @@ const Search = () => {
     genre: filters.genre,
   }))
     if (value) params.set(key, value);
-  const smartSearchKey =
-    settings.currentSettings.smartSearch &&
-    debouncedQuery.trim() &&
-    debouncedQuery === query &&
-    filters.type !== 'person'
-      ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
-      : null;
   const {
     data: smart,
     error: smartError,
-    isLoading: smartLoading,
-    isValidating: smartValidating,
-  } = useSWR<{ ready: boolean; results: SearchItem[] }>(smartSearchKey, {
-    revalidateOnFocus: false,
-  });
-  const smartSearching = !!smartSearchKey && smartValidating;
-  const items = mergeResults(
-    query,
-    titles,
-    suggestions?.results ?? [],
-    smart?.results ?? [],
+    isValidating: smartLoading,
+  } = useSWR<{
+    ready: boolean;
+    results: SearchItem[];
+  }>(
+    searchDescriptions
+      ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
+      : null,
+    {
+      revalidateOnFocus: false,
+      revalidateIfStale: false,
+      shouldRetryOnError: false,
+    }
+  );
+
+  const descriptionsFirst = canSearchDescriptions && !ranked.confident;
+  const descriptionHasMatches = !!smart?.results.length;
+  const shownTitles =
+    descriptionsFirst && (!smart || descriptionHasMatches) && !smartError
+      ? ranked.credible
+      : ranked.all;
+  const descriptions = descriptionResults(
+    visible(smart?.results ?? []),
+    shownTitles,
     filters
   );
-  const reorderGridRef = useSearchReorderAnimation({
-    context: `${query}\u0000${JSON.stringify(filters)}`,
-    order: items.map((item) => `${item.mediaType}:${item.id}`).join('|'),
-    regularResults: titles
-      .map((item) => `${item.mediaType}:${item.id}`)
-      .join('|'),
-    suggestions,
-    smartResults: smart,
-    paginating: isLoadingMore,
-  });
-  const loading =
-    isLoadingInitialData ||
-    suggestionsLoading ||
-    smartLoading ||
-    debouncedQuery !== query;
-  return (
-    <>
-      <PageTitle title={intl.formatMessage(messages.search)} />
-      <div className="mb-5 mt-1 flex flex-wrap items-end justify-between gap-x-4 gap-y-2">
-        <Header>{intl.formatMessage(messages.searchresults)}</Header>
-        {smartSearching && (
-          <div
-            role="status"
-            aria-live="polite"
-            className="mb-4 inline-flex items-center gap-2 rounded-full bg-indigo-500/10 px-3 py-1 text-sm text-indigo-200 ring-1 ring-inset ring-indigo-500/20 md:mb-0"
+  const titleSection = (!descriptionsFirst ||
+    !descriptions.length ||
+    !!shownTitles.length) && (
+    <section key="titles" aria-labelledby="title-matches">
+      <div className="slider-header flex-wrap items-center justify-between gap-2">
+        <h3 id="title-matches" className="slider-title">
+          {intl.formatMessage(messages.titleMatches)}
+        </h3>
+        {canSearchDescriptions && ranked.confident && (
+          <Button
+            buttonType="ghost"
+            buttonSize="sm"
+            aria-expanded={requestedDescriptions}
+            onClick={() => setRequestedDescriptions(!requestedDescriptions)}
           >
-            <ArrowPathIcon
-              className="h-4 w-4 animate-spin motion-reduce:animate-none"
-              aria-hidden="true"
-            />
-            <span>{intl.formatMessage(messages.smartSearching)}</span>
-          </div>
+            {intl.formatMessage(
+              requestedDescriptions
+                ? messages.hideDescriptions
+                : messages.searchDescriptions
+            )}
+          </Button>
         )}
       </div>
-      <SmartSearch filters={filters} setFilters={setFilters} />
-      {(error || suggestionError || smartError) && (
+      {(error || fuzzyError) && (
         <Alert type="warning">
-          {intl.formatMessage(messages.searchUnavailable)}
+          {intl.formatMessage(messages.titleUnavailable)}
         </Alert>
       )}
-      {smart && !smart.ready && (
-        <p className="mb-3 text-sm text-gray-400">
-          {intl.formatMessage(messages.smartLoading)}
+      {!shownTitles.length && !titlesLoading && (
+        <p className="text-sm text-gray-400">
+          {intl.formatMessage(messages.noTitleMatches)}
         </p>
       )}
       <ListView
-        reorderGridRef={reorderGridRef}
-        items={items}
-        isEmpty={!loading && items.length === 0}
-        isLoading={loading || isLoadingMore}
-        isReachingEnd={isReachingEnd && !loading}
-        onScrollBottom={fetchMore}
+        items={shownTitles}
+        stableItemKeys
+        placeholderCount={6}
+        isLoading={!shownTitles.length && titlesLoading}
       />
-      {!!suggestions?.results.length && (
-        <p className="mt-4 text-sm text-gray-400">
+      {!isReachingEnd && firstResultData && (
+        <Button
+          className="mt-4"
+          buttonType="ghost"
+          buttonSize="sm"
+          disabled={isLoadingMore}
+          onClick={fetchMore}
+        >
+          {intl.formatMessage(messages.moreTitles)}
+        </Button>
+      )}
+      {!!fuzzy?.results.length && (
+        <p className="mt-4 text-xs text-gray-400">
           {intl.formatMessage(messages.imdbAttribution)}
         </p>
       )}
+    </section>
+  );
+  const descriptionSection = searchDescriptions && (
+    <section key="descriptions" aria-labelledby="description-matches">
+      <div className="slider-header">
+        <h3 id="description-matches" className="slider-title">
+          {intl.formatMessage(messages.descriptionMatches)}
+        </h3>
+      </div>
+      {smartLoading && (
+        <p
+          role="status"
+          className="flex items-center gap-2 text-sm text-gray-400"
+        >
+          <ArrowPathIcon
+            className="h-4 w-4 animate-spin motion-reduce:animate-none"
+            aria-hidden="true"
+          />
+          {intl.formatMessage(messages.smartSearching)}
+        </p>
+      )}
+      {smartError && (
+        <Alert type="warning">
+          {intl.formatMessage(messages.descriptionUnavailable)}
+        </Alert>
+      )}
+      {smart && !descriptions.length && (
+        <p role="status" className="text-sm text-gray-400">
+          {intl.formatMessage(
+            smart.ready ? messages.noDescriptionMatches : messages.smartLoading
+          )}
+        </p>
+      )}
+      {!!descriptions.length && (
+        <ListView items={descriptions} stableItemKeys />
+      )}
+    </section>
+  );
+  return (
+    <div className="space-y-8">
+      {descriptionsFirst
+        ? [descriptionSection, titleSection]
+        : [titleSection, descriptionSection]}
+    </div>
+  );
+};
+
+const Search = () => {
+  const intl = useIntl();
+  const router = useRouter();
+  const [filters, setFilters] = useState(emptySearchFilters);
+  const query =
+    typeof router.query.query === 'string' ? router.query.query.trim() : '';
+  return (
+    <>
+      <PageTitle title={intl.formatMessage(messages.search)} />
+      <div className="mb-5 mt-1">
+        <Header>{intl.formatMessage(messages.searchresults)}</Header>
+      </div>
+      <SmartSearch filters={filters} setFilters={setFilters} />
+      {query && <SearchResults key={query} query={query} filters={filters} />}
     </>
   );
 };

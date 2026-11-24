@@ -1,9 +1,5 @@
 import TheMovieDb from '@server/api/themoviedb';
-import type {
-  TmdbMovieResult,
-  TmdbSearchMultiResponse,
-  TmdbTvResult,
-} from '@server/api/themoviedb/interfaces';
+import type { TmdbSearchMultiResponse } from '@server/api/themoviedb/interfaces';
 import { MediaStatus } from '@server/constants/media';
 import { getRepository } from '@server/datasource';
 import Media from '@server/entity/Media';
@@ -21,10 +17,13 @@ import logger from '@server/logger';
 import type { MovieResult, TvResult } from '@server/models/Search';
 import {
   mapMovieDetailsToResult,
+  mapMovieResult,
   mapSearchResults,
   mapTvDetailsToResult,
+  mapTvResult,
 } from '@server/models/Search';
 import { Router } from 'express';
+import { LRUCache } from 'lru-cache';
 
 const searchRoutes = Router();
 
@@ -54,13 +53,17 @@ const smartFilters = (query: Record<string, unknown>): SmartFilters => {
   };
 };
 
-const smartCards = async (matches: SmartMatch[], user: User | undefined) => {
-  const cards = matches.map(
-    (match) => match.document.card as unknown as MovieResult | TvResult
-  );
+type MediaCard = MovieResult | TvResult;
+
+const attachMediaInfo = async (
+  cards: MediaCard[],
+  user: User | undefined,
+  includeActiveRequest = false
+) => {
   const related = await Media.getRelatedMedia(
     user,
-    cards.map((card) => ({ tmdbId: card.id, mediaType: card.mediaType }))
+    cards.map((card) => ({ tmdbId: card.id, mediaType: card.mediaType })),
+    { includeActiveRequest }
   );
   return cards.map((card) => ({
     ...card,
@@ -69,6 +72,24 @@ const smartCards = async (matches: SmartMatch[], user: User | undefined) => {
     ),
   }));
 };
+
+const smartCards = (
+  matches: SmartMatch[],
+  user: User | undefined,
+  includeActiveRequest = false
+) =>
+  attachMediaInfo(
+    matches.map(({ document }) => document.card as unknown as MediaCard),
+    user,
+    includeActiveRequest
+  );
+
+// Preserve localized, resolved cards across overlapping queries. User-specific
+// request, watchlist and availability status is always attached afterwards.
+const titleCards = new LRUCache<string, MediaCard | false>({
+  max: 2048,
+  ttl: 60 * 60 * 1000,
+});
 
 searchRoutes.get('/smart', async (req, res, next) => {
   try {
@@ -160,7 +181,7 @@ searchRoutes.get('/smart/recommendations', async (req, res, next) => {
         : [];
       basis = matches.length ? 'library' : 'none';
     }
-    const results = await smartCards(matches, req.user);
+    const results = await smartCards(matches, req.user, true);
     return res.status(200).json({
       page: 1,
       totalPages: 1,
@@ -182,7 +203,7 @@ searchRoutes.get('/smart/similar', async (req, res, next) => {
       smartFilters(req.query),
       (req.query.language as string) ?? req.locale
     );
-    const results = await smartCards(matches, req.user);
+    const results = await smartCards(matches, req.user, true);
     return res
       .status(200)
       .json({ page: 1, totalPages: 1, totalResults: results.length, results });
@@ -204,75 +225,97 @@ searchRoutes.get('/suggestions', async (req, res) => {
     const matches = await searchIndex.search(query, 40);
     const tmdb = new TheMovieDb();
     const language = (req.query.language as string) ?? req.locale;
-    const seen = new Set<string>();
-    const results: (TmdbMovieResult | TmdbTvResult)[] = [];
+    const localCards = new Map<string, MediaCard>();
+    await Promise.all(
+      (['movie', 'tv'] as const).map(async (type) => {
+        const ids = matches
+          .filter(
+            (match) => match.source !== 'imdb' && match.mediaType === type
+          )
+          .map((match) => match.sourceId);
+        if (!ids.length) return;
+        const indexed = await smartSearch
+          .indexedTitleCards(type, ids, language ?? 'en')
+          .catch(() => []);
+        for (const { sourceId, card } of indexed)
+          localCards.set(`${type}:${sourceId}`, card as unknown as MediaCard);
+      })
+    );
+
+    const results: MediaCard[] = [];
     const scores: number[] = [];
-    // Resolve in small batches and keep going past missing or duplicate IDs.
+    const seen = new Set<string>();
+    // Most requests resolve in one wave. Keep scanning past invalid mappings
+    // and duplicates, preserving fuzzy rank regardless of response order.
     for (
       let offset = 0;
       offset < matches.length && results.length < 15;
-      offset += 10
+      offset += 20
     ) {
-      const batch = matches.slice(offset, offset + 10);
+      const batch = matches.slice(offset, offset + 20);
       const resolved = await Promise.allSettled(
-        batch.map(
-          async (
-            match
-          ): Promise<TmdbMovieResult | TmdbTvResult | undefined> => {
-            if (match.source === 'imdb') {
-              const result = await tmdb.getByExternalId({
-                externalId: match.sourceId,
-                type: 'imdb',
-                language,
-              });
-              const item =
-                match.mediaType === 'movie'
-                  ? result.movie_results[0]
-                  : result.tv_results[0];
-              return item
-                ? ({ ...item, media_type: match.mediaType } as
-                    | TmdbMovieResult
-                    | TmdbTvResult)
-                : undefined;
-            }
-            return match.mediaType === 'movie'
-              ? mapMovieDetailsToResult(
-                  await tmdb.getMovieSearchDetails({
-                    movieId: Number(match.sourceId),
-                    language,
-                  })
-                )
-              : mapTvDetailsToResult(
-                  await tmdb.getTvSearchDetails({
-                    tvId: Number(match.sourceId),
-                    language,
-                  })
-                );
+        batch.map(async (match): Promise<MediaCard | false> => {
+          const { source, mediaType, sourceId } = match;
+          const id = `${mediaType}:${sourceId}`;
+          const key = JSON.stringify([language, source, id]);
+          const cached = titleCards.get(key);
+          if (cached !== undefined) return cached;
+          const local = source !== 'imdb' ? localCards.get(id) : undefined;
+          // The indexed card is already current enough for search and needs no
+          // per-title request. Don't cache it independently of the index.
+          if (local) return local;
+          let card: MediaCard | false;
+          if (source === 'imdb') {
+            const result = await tmdb.getByExternalId({
+              externalId: sourceId,
+              type: 'imdb',
+              language,
+            });
+            card =
+              mediaType === 'movie'
+                ? !!result.movie_results[0] &&
+                  mapMovieResult(result.movie_results[0])
+                : !!result.tv_results[0] && mapTvResult(result.tv_results[0]);
+          } else {
+            card =
+              mediaType === 'movie'
+                ? mapMovieResult(
+                    mapMovieDetailsToResult(
+                      await tmdb.getMovieSearchDetails({
+                        movieId: Number(sourceId),
+                        language,
+                      })
+                    )
+                  )
+                : mapTvResult(
+                    mapTvDetailsToResult(
+                      await tmdb.getTvSearchDetails({
+                        tvId: Number(sourceId),
+                        language,
+                      })
+                    )
+                  );
           }
-        )
+          titleCards.set(key, card, card ? undefined : { ttl: 5 * 60 * 1000 });
+          return card;
+        })
       );
-      for (let i = 0; i < resolved.length; i++) {
-        const value = resolved[i];
+      for (const [index, value] of resolved.entries()) {
         if (value.status !== 'fulfilled' || !value.value) continue;
-        const result = value.value;
-        const key = `${result.media_type}:${result.id}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          results.push(result);
-          scores.push(batch[i].score);
-        }
+        const card = value.value;
+        const key = `${card.mediaType}:${card.id}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        results.push(card);
+        scores.push(batch[index].score);
+        if (results.length === 15) break;
       }
     }
-    const media = await Media.getRelatedMedia(
-      req.user,
-      results.map((result) => ({
-        tmdbId: result.id,
-        mediaType: result.media_type,
-      }))
-    );
+
+    const cards = await attachMediaInfo(results, req.user);
     return res.status(200).json({
-      results: mapSearchResults(results, media).map((result, index) => ({
-        ...result,
+      results: cards.map((card, index) => ({
+        ...card,
         matchScore: scores[index],
       })),
     });

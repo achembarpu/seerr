@@ -135,6 +135,8 @@ const DiscoverSliderEdit = ({
         return intl.formatMessage(sliderTitles.plexwatchlist);
       case DiscoverSliderType.TRENDING:
         return intl.formatMessage(sliderTitles.trending);
+      case DiscoverSliderType.SMART_RECOMMENDATIONS:
+        return intl.formatMessage(sliderTitles.smartRecommendations);
       case DiscoverSliderType.POPULAR_MOVIES:
         return intl.formatMessage(sliderTitles.popularmovies);
       case DiscoverSliderType.MOVIE_GENRES:

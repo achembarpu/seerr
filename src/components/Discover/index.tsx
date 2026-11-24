@@ -51,12 +51,8 @@ const messages = defineMessages('components.Discover', {
   customizediscover: 'Customize Discover',
   stopediting: 'Stop Editing',
   createnewslider: 'Create New Slider',
-  smartRecommendations: 'Recommendations',
-  smartRecommendationsError: 'Unable to load recommendations right now.',
-  requestRecommendations: 'Recommended from your requests',
-  libraryRecommendations: 'Recommended from your library',
-  noSmartRecommendations:
-    'Recommendations will appear as your library and search index grow. Check your visibility settings if expected titles are missing.',
+  requestRecommendations: 'Based on your requests',
+  libraryRecommendations: 'From your library',
 });
 
 const Discover = () => {
@@ -216,25 +212,6 @@ const Discover = () => {
           </Transition>
         </>
       )}
-      {!isEditing && settings.currentSettings.smartSearch && (
-        <MediaSlider
-          sliderKey="smart-recommendations"
-          title={intl.formatMessage(messages.smartRecommendations)}
-          titleForBasis={(basis) =>
-            intl.formatMessage(
-              basis === 'requests'
-                ? messages.requestRecommendations
-                : basis === 'library'
-                  ? messages.libraryRecommendations
-                  : messages.smartRecommendations
-            )
-          }
-          emptyMessage={intl.formatMessage(messages.noSmartRecommendations)}
-          errorMessage={intl.formatMessage(messages.smartRecommendationsError)}
-          url="/api/v1/search/smart/recommendations"
-          hideWhenEmpty
-        />
-      )}
       {(isEditing ? sliders : discoverData)?.map((slider, index) => {
         let sliderComponent: React.ReactNode;
 
@@ -257,6 +234,25 @@ const Discover = () => {
                 linkUrl="/discover/trending"
               />
             );
+            break;
+          case DiscoverSliderType.SMART_RECOMMENDATIONS:
+            if (settings.currentSettings.smartSearch) {
+              sliderComponent = (
+                <MediaSlider
+                  sliderKey="smart-recommendations"
+                  title={intl.formatMessage(sliderTitles.smartRecommendations)}
+                  titleForBasis={(basis) =>
+                    intl.formatMessage(
+                      basis === 'requests'
+                        ? messages.requestRecommendations
+                        : messages.libraryRecommendations
+                    )
+                  }
+                  url="/api/v1/search/smart/recommendations"
+                  hideWhenEmpty
+                />
+              );
+            }
             break;
           case DiscoverSliderType.POPULAR_MOVIES:
             sliderComponent = (

@@ -12,7 +12,7 @@ import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 
 const messages = defineMessages('components.MovieDetails', {
-  similar: 'Similar Titles',
+  moreLikeThis: 'More like this',
 });
 
 const MovieSimilar = () => {
@@ -29,7 +29,11 @@ const MovieSimilar = () => {
     titles,
     fetchMore,
     error,
-  } = useDiscover<MovieResult>(`/api/v1/movie/${router.query.movieId}/similar`);
+  } = useDiscover<MovieResult>(
+    '/api/v1/search/smart/similar',
+    { mediaType: 'movie', id: router.query.movieId },
+    { initialSize: 1 }
+  );
 
   if (error) {
     return <ErrorPage statusCode={500} />;
@@ -38,7 +42,7 @@ const MovieSimilar = () => {
   return (
     <>
       <PageTitle
-        title={[intl.formatMessage(messages.similar), movieData?.title]}
+        title={[intl.formatMessage(messages.moreLikeThis), movieData?.title]}
       />
       <div className="mb-5 mt-1">
         <Header
@@ -48,7 +52,7 @@ const MovieSimilar = () => {
             </Link>
           }
         >
-          {intl.formatMessage(messages.similar)}
+          {intl.formatMessage(messages.moreLikeThis)}
         </Header>
       </div>
       <ListView

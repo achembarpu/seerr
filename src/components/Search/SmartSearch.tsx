@@ -7,10 +7,6 @@ import { useState } from 'react';
 import { useIntl } from 'react-intl';
 
 const messages = defineMessages('components.Search.SmartSearch', {
-  open: 'Smart search',
-  close: 'Close smart search',
-  title: 'Smart discovery',
-  tip: 'Find movies and series by their description. Results improve as the local index builds.',
   type: 'Type',
   allResults: 'All results',
   person: 'People',
@@ -28,10 +24,6 @@ const messages = defineMessages('components.Search.SmartSearch', {
   votes: 'Minimum votes',
   genre: 'Genre',
   anyGenre: 'Any genre',
-  loading: 'The smart index is still starting or downloading.',
-  error: 'Unable to search the local index.',
-  recommendations: 'Recommended from your requests',
-  recommendationsTip: 'Based on your recent requests and your filters.',
 });
 const genres = [
   [28, 'Action'],

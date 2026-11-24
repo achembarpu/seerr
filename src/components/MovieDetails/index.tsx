@@ -1158,7 +1158,8 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
       )}
       <MediaSlider
         sliderKey="more-like-this"
-        maxItems={30}
+        maxItems={12}
+        linkUrl={`/movie/${data.id}/similar`}
         title={intl.formatMessage(messages.moreLikeThis)}
         url="/api/v1/search/smart/similar"
         extraParams={`mediaType=movie&id=${router.query.movieId}`}

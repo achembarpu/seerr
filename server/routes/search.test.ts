@@ -2,6 +2,7 @@ import TheMovieDb from '@server/api/themoviedb';
 import type { TmdbExternalIdResponse } from '@server/api/themoviedb/interfaces';
 import Media from '@server/entity/Media';
 import searchIndex from '@server/lib/searchIndex/service';
+import smartSearch from '@server/lib/smartSearch/service';
 import express from 'express';
 import assert from 'node:assert/strict';
 import { after, describe, it, mock } from 'node:test';
@@ -10,26 +11,30 @@ import searchRoutes from './search';
 
 const app = express();
 app.use('/search', searchRoutes);
-const indexMock = mock.method(searchIndex, 'search', async () => [
-  {
-    source: 'imdb' as const,
-    sourceId: 'tt10687070',
-    mediaType: 'movie' as const,
-    title: 'Mandela',
-    originalTitle: 'Mandela',
-    popularity: 100,
-    score: 0.9,
-  },
-  {
-    source: 'imdb' as const,
-    sourceId: 'tt2',
-    mediaType: 'movie' as const,
-    title: 'Mandela',
-    originalTitle: 'Mandela',
-    popularity: 10,
-    score: 0.9,
-  },
-]);
+const indexMock = mock.method(
+  searchIndex,
+  'search',
+  async (): ReturnType<typeof searchIndex.search> => [
+    {
+      source: 'imdb' as const,
+      sourceId: 'tt10687070',
+      mediaType: 'movie' as const,
+      title: 'Mandela',
+      originalTitle: 'Mandela',
+      popularity: 100,
+      score: 0.9,
+    },
+    {
+      source: 'imdb' as const,
+      sourceId: 'tt2',
+      mediaType: 'movie' as const,
+      title: 'Mandela',
+      originalTitle: 'Mandela',
+      popularity: 10,
+      score: 0.9,
+    },
+  ]
+);
 const findMock = mock.method(
   TheMovieDb.prototype,
   'getByExternalId',
@@ -74,6 +79,66 @@ describe('local title suggestions', () => {
     assert.equal(response.body.results[0].mediaType, 'movie');
     assert.equal(response.body.results[0].matchScore, 0.9);
   });
+  it('reuses localized cards but still looks up current media status', async () => {
+    const resolveCount = findMock.mock.callCount();
+    const mediaCount = mediaMock.mock.callCount();
+    for (const query of ['mandel', 'mandella']) {
+      await request(app)
+        .get('/search/suggestions')
+        .query({ query, language: 'fr' })
+        .expect(200);
+    }
+    assert.equal(findMock.mock.callCount() - resolveCount, 2);
+    assert.equal(mediaMock.mock.callCount() - mediaCount, 2);
+    await request(app)
+      .get('/search/suggestions')
+      .query({ query: 'mandel', language: 'ta' })
+      .expect(200);
+    assert.equal(findMock.mock.callCount() - resolveCount, 4);
+  });
+
+  it('uses the indexed card for TMDB title matches when available', async () => {
+    const previous = indexMock.mock.calls.length;
+    const card = { id: 806067, mediaType: 'movie', title: 'Mandela' };
+    const indexedCards = mock.method(
+      smartSearch,
+      'indexedTitleCards',
+      async () => [{ sourceId: '806067', card }]
+    );
+    const remote = mock.method(
+      TheMovieDb.prototype,
+      'getMovieSearchDetails',
+      async () => {
+        throw new Error('unexpected remote lookup');
+      }
+    );
+    indexMock.mock.mockImplementationOnce(
+      async () => [
+        {
+          source: 'tmdb-movie' as const,
+          sourceId: '806067',
+          mediaType: 'movie' as const,
+          title: 'Mandela',
+          originalTitle: 'Mandela',
+          popularity: 100,
+          score: 0.9,
+        },
+      ],
+      previous
+    );
+    try {
+      const response = await request(app)
+        .get('/search/suggestions')
+        .query({ query: 'mandel', language: 'en' })
+        .expect(200);
+      assert.deepEqual(response.body.results, [{ ...card, matchScore: 0.9 }]);
+      assert.equal(remote.mock.callCount(), 0);
+    } finally {
+      indexedCards.mock.restore();
+      remote.mock.restore();
+    }
+  });
+
   it('accepts two-character titles in scripts that use short words', async () => {
     const calls = indexMock.mock.callCount();
     await request(app)

@@ -12,7 +12,7 @@ import { useIntl } from 'react-intl';
 import useSWR from 'swr';
 
 const messages = defineMessages('components.TvDetails', {
-  similar: 'Similar Series',
+  moreLikeThis: 'More like this',
 });
 
 const TvSimilar = () => {
@@ -27,7 +27,11 @@ const TvSimilar = () => {
     titles,
     fetchMore,
     error,
-  } = useDiscover<TvResult>(`/api/v1/tv/${router.query.tvId}/similar`);
+  } = useDiscover<TvResult>(
+    '/api/v1/search/smart/similar',
+    { mediaType: 'tv', id: router.query.tvId },
+    { initialSize: 1 }
+  );
 
   if (error) {
     return <ErrorPage statusCode={500} />;
@@ -35,7 +39,9 @@ const TvSimilar = () => {
 
   return (
     <>
-      <PageTitle title={[intl.formatMessage(messages.similar), tvData?.name]} />
+      <PageTitle
+        title={[intl.formatMessage(messages.moreLikeThis), tvData?.name]}
+      />
       <div className="mb-5 mt-1">
         <Header
           subtext={
@@ -44,7 +50,7 @@ const TvSimilar = () => {
             </Link>
           }
         >
-          {intl.formatMessage(messages.similar)}
+          {intl.formatMessage(messages.moreLikeThis)}
         </Header>
       </div>
       <ListView

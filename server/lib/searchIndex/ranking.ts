@@ -42,6 +42,17 @@ export const titleSimilarity = (query: string, title: string): number => {
     return 0.98;
   let score = jaro(foldedQuery, foldedTitle).similarity;
   if (foldedTitle.includes(foldedQuery)) score = Math.max(score, 0.9);
+  if (foldedQuery.includes(' ') && foldedQuery.length >= 7) {
+    // A misspelling in the main title should still match a longer subtitle.
+    const wordCount = foldedQuery.split(' ').length;
+    const words = foldedTitle.split(' ', wordCount + 1);
+    if (words.length > wordCount) {
+      const prefix = words.slice(0, wordCount).join(' ');
+      const prefixScore = jaro(foldedQuery, prefix).similarity;
+      if (prefixScore >= 0.94)
+        score = Math.max(score, Math.min(prefixScore, 0.99));
+    }
+  }
   if (!foldedQuery.includes(' ')) {
     for (const word of foldedTitle.split(' ')) {
       if (Array.from(word).length < Array.from(foldedQuery).length * 0.6)

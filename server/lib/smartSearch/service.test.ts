@@ -6,7 +6,13 @@ import { describe, it, mock } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import os from 'os';
 import path from 'path';
-import { SmartSearchService, ratingEvidence, relatedPrior } from './service';
+import {
+  SmartSearchService,
+  balanceRecommendationPools,
+  ratingEvidence,
+  relatedPrior,
+  storyMatchPenalty,
+} from './service';
 import { SmartStore } from './store';
 import type { MetadataSource, SmartDocument } from './types';
 import { quantize } from './vectors';
@@ -32,6 +38,47 @@ const waitFor = async (condition: () => boolean) => {
   }
   throw new Error('Timed out waiting for indexing');
 };
+
+it('gives different seeds visible recommendations without repeating shared matches', () => {
+  const shared = {
+    document: { ...document, sourceId: 'shared' },
+    score: 0.029,
+  };
+  const pools = [
+    [
+      shared,
+      ...Array.from({ length: 12 }, (_, i) => ({
+        document: { ...document, sourceId: `movie-${i}` },
+        score: 0.025 - i / 1000,
+      })),
+    ],
+    [
+      shared,
+      {
+        document: { ...document, sourceId: 'series', mediaType: 'tv' as const },
+        score: 0.02,
+      },
+    ],
+  ];
+  const ranked = balanceRecommendationPools(pools).map(
+    (item) => item.document.sourceId
+  );
+  assert.deepEqual(ranked.slice(0, 3), ['shared', 'series', 'movie-0']);
+  assert.equal(ranked.length, new Set(ranked).size);
+});
+
+it('discounts a shared setting when known genres or plot evidence do not support the match', () => {
+  const seed = { ...document, genreIds: [18, 27] };
+  const description =
+    'A barber keeps a terrible secret in the shop until a customer starts to uncover the truth.';
+  const horror = { ...document, genreIds: [18, 27], overview: description };
+  const drama = { ...horror, genreIds: [18] };
+  const sparse = { ...horror, overview: 'A story about a barber.' };
+  assert.equal(storyMatchPenalty(seed, horror), 0);
+  assert.ok(storyMatchPenalty(seed, drama) > storyMatchPenalty(seed, horror));
+  assert.ok(storyMatchPenalty(seed, sparse) > storyMatchPenalty(seed, horror));
+  assert.equal(storyMatchPenalty(seed, { ...horror, genreIds: [] }), 0);
+});
 
 it('does not infer a different format when either title has no genres', () => {
   const unknown = { ...document, genreIds: [], voteCount: 0 };

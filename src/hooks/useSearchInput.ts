@@ -14,14 +14,17 @@ interface SearchObject {
   setIsOpen: Dispatch<SetStateAction<boolean>>;
   setSearchValue: Dispatch<SetStateAction<string>>;
   clear: () => void;
+  setComposing: Dispatch<SetStateAction<boolean>>;
 }
 
 const useSearchInput = (): SearchObject => {
   const router = useRouter();
+  const [composing, setComposing] = useState(false);
   const [searchOpen, setIsOpen] = useState(false);
   const [lastRoute, setLastRoute] = useState<Nullable<Url>>(null);
   const [searchValue, debouncedValue, setSearchValue] = useDebouncedState(
-    (router.query.query as string) ?? ''
+    (router.query.query as string) ?? '',
+    150
   );
 
   /**
@@ -32,7 +35,13 @@ const useSearchInput = (): SearchObject => {
    * in a new route. If we are, then we only replace the history.
    */
   useEffect(() => {
-    if (debouncedValue !== '' && searchOpen) {
+    if (
+      debouncedValue.trim() &&
+      searchOpen &&
+      !composing &&
+      debouncedValue === searchValue &&
+      router.query.query !== debouncedValue
+    ) {
       if (router.pathname.startsWith('/search')) {
         router.replace({
           pathname: router.pathname,
@@ -51,7 +60,7 @@ const useSearchInput = (): SearchObject => {
           .then(() => window.scrollTo(0, 0));
       }
     }
-  }, [debouncedValue]);
+  }, [debouncedValue, composing]);
 
   /**
    * This effect is handling behavior when the search input is closed.
@@ -90,11 +99,7 @@ const useSearchInput = (): SearchObject => {
    */
   useEffect(() => {
     if (router.query.query !== debouncedValue) {
-      setSearchValue(
-        router.query.query
-          ? decodeURIComponent(router.query.query as string)
-          : ''
-      );
+      setSearchValue(router.query.query ? (router.query.query as string) : '');
 
       if (!router.pathname.startsWith('/search') && !router.query.query) {
         setIsOpen(false);
@@ -117,6 +122,7 @@ const useSearchInput = (): SearchObject => {
     setIsOpen,
     setSearchValue,
     clear,
+    setComposing,
   };
 };
 

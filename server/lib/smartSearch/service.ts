@@ -98,10 +98,44 @@ export function fuseSmartCandidates(
     .map(({ item, rank }) => ({ ...item, score: rank }));
 }
 
+/** Give each seed a chance in the visible part of the Discover row. */
+export function balanceRecommendationPools(
+  pools: SmartMatch[][]
+): SmartMatch[] {
+  const key = ({ document }: SmartMatch) =>
+    `${document.mediaType}:${document.sourceId}`;
+  const rank = (pool: SmartMatch[]) => {
+    const bestScore = pool[0]?.score || 1;
+    const score = (item: SmartMatch) =>
+      item.score +
+      0.002 *
+        ratingEvidence(item.document) *
+        relevanceStrength(item.score / bestScore);
+    return [...pool].sort((a, b) => score(b) - score(a));
+  };
+  const ranked = rank(fuseSmartCandidates(pools, 60));
+  const active = pools.filter((pool) => pool.length > 0);
+  if (active.length <= 1) return ranked.slice(0, 30);
+
+  const selected = new Map<string, SmartMatch>();
+  const perSeed = active.map(rank);
+  for (let round = 0; round < 2; round++) {
+    for (const pool of perSeed) {
+      const match = pool.find((candidate) => !selected.has(key(candidate)));
+      if (match) selected.set(key(match), match);
+    }
+  }
+  for (const match of ranked) {
+    if (selected.size >= 30) break;
+    if (!selected.has(key(match))) selected.set(key(match), match);
+  }
+  return [...selected.values()];
+}
+
 const relevanceStrength = (score: number) =>
   Math.min(1, Math.max(0, (score - 0.3) / 0.7));
 
-/** Prefer a similar format and established titles when plot similarity is close. */
+/** Favor compatible genres and formats. Audience size only breaks close ties. */
 export function relatedPrior(
   seed: SmartDocument,
   candidate: SmartDocument,
@@ -125,11 +159,33 @@ export function relatedPrior(
   const animationMismatch =
     bothKnown && sourceGenres.has(16) !== targetGenres.has(16);
   return (
-    0.05 * genreSimilarity +
-    0.08 * audience * relevanceStrength(similarity) -
+    0.06 * genreSimilarity +
+    0.012 * audience * relevanceStrength(similarity) -
     (documentaryMismatch ? 0.15 : 0) -
     (animationMismatch ? 0.04 : 0)
   );
+}
+
+// Drama alone says little about a story's tone. When both titles have more
+// specific genres, a shared setting alone is weaker evidence of similarity.
+export function storyMatchPenalty(
+  seed: SmartDocument,
+  candidate: SmartDocument
+): number {
+  const broadGenres = [18, 36, 10770];
+  const genres = seed.genreIds.filter((id) => !broadGenres.includes(id));
+  const otherGenres = candidate.genreIds.filter(
+    (id) => !broadGenres.includes(id)
+  );
+  const incompatible =
+    genres.length > 0 &&
+    candidate.genreIds.length > 0 &&
+    !otherGenres.some((id) => genres.includes(id));
+  let words = 0;
+  for (const part of wordSegmenter.segment(candidate.overview)) {
+    if (part.isWordLike && ++words === 16) break;
+  }
+  return (incompatible ? 0.012 : 0) + 0.008 * (1 - words / 16);
 }
 
 /** Shrink noisy ratings toward the catalog average; missing ratings are neutral. */
@@ -317,7 +373,8 @@ export class SmartSearchService {
     query: string,
     candidates: SmartMatch[],
     maxCandidates = 80,
-    timeout = 6000
+    timeout = 6000,
+    mode: 'search' | 'similar' = 'search'
   ): Promise<SmartMatch[]> {
     if (!this.rerankerEnabled() || !candidates.length) return candidates;
     if (this.reranker.phase !== 'ready') {
@@ -333,10 +390,12 @@ export class SmartSearchService {
     const limit = Math.max(1, Math.min(maxCandidates, 80, configured));
     const prefix = candidates.slice(0, limit);
     const docs = prefix.map(({ document }) =>
-      `Title: ${document.title}. Description: ${document.overview}`.slice(
-        0,
-        700
-      )
+      mode === 'similar'
+        ? documentText(document)
+        : `Title: ${document.title}. Description: ${document.overview}`.slice(
+            0,
+            700
+          )
     );
     const modelQuery = query.slice(0, 600);
     const keys = docs.map((doc) => JSON.stringify([modelQuery, doc]));
@@ -419,9 +478,11 @@ export class SmartSearchService {
         .sort((a, b) => b.score - a.score);
       // The model can demote good cross-language matches. Combine rankings
       // without comparing uncalibrated scores, retaining a retrieval bias.
-      return fuseSmartCandidates([baseline, baseline, ranked], limit).concat(
-        candidates.slice(limit)
-      );
+      const lists =
+        mode === 'similar'
+          ? [baseline, ranked, ranked]
+          : [baseline, baseline, ranked];
+      return fuseSmartCandidates(lists, limit).concat(candidates.slice(limit));
     } catch (error) {
       this.clearRerankScores();
       this.rerankerError =
@@ -1119,6 +1180,21 @@ export class SmartSearchService {
     }
   }
 
+  async indexedTitleCards(
+    type: SmartMediaType,
+    ids: string[],
+    locale: string
+  ): Promise<SmartDocument[]> {
+    if (
+      !this.enabled() ||
+      !this.store ||
+      this.source.id !== 'tmdb' ||
+      !/^en(?:-us)?$/i.test(locale)
+    )
+      return [];
+    return this.store.findDocuments('tmdb', type, ids);
+  }
+
   private async seed(type: SmartMediaType, id: string) {
     if (!this.store) return undefined;
     let seed = await this.store.find(this.source.id, type, id);
@@ -1179,7 +1255,7 @@ export class SmartSearchService {
     const relatedScore = (doc: SmartDocument, similarity: number) =>
       similarity +
       (seed ? relatedPrior(seed.document, doc, similarity) : 0) +
-      0.02 * ratingEvidence(doc) * relevanceStrength(similarity);
+      0.008 * ratingEvidence(doc) * relevanceStrength(similarity);
     if (seed && remote.length && this.engine.phase === 'ready') {
       try {
         // Score a small remote candidate pool in the same vector space as the
@@ -1222,14 +1298,22 @@ export class SmartSearchService {
         item.document.mediaType !== type || item.document.sourceId !== id
     );
     const query = seed
-      ? `Find films or series similar in themes, plot and tone to: ${seed.document.title}. ${seed.document.overview}`.slice(
-          0,
-          1000
-        )
+      ? `Find similar stories with a comparable plot, central conflict, themes and tone. ${documentText(seed.document)}`
       : '';
-    return (
-      query ? await this.rerank(query, candidates, 12, 2500) : candidates
-    ).slice(0, 30);
+    if (!seed || !query) return candidates.slice(0, 30);
+    const ranked = await this.rerank(query, candidates, 16, 2500, 'similar');
+    return ranked
+      .map((item, index) => ({
+        item,
+        // Reranked scores are fusions with more votes than the remaining
+        // candidates. Use the final order to apply the same small priors.
+        rank:
+          4 / (40 + index + 1) -
+          storyMatchPenalty(seed.document, item.document),
+      }))
+      .sort((a, b) => b.rank - a.rank)
+      .slice(0, 30)
+      .map(({ item }) => item);
   }
 
   async recommendations(
@@ -1242,50 +1326,51 @@ export class SmartSearchService {
       ...new Map(
         seeds.map((seed) => [`${seed.type}:${seed.id}`, seed])
       ).values(),
-    ].slice(0, 5);
-    const pools: SmartMatch[][] = [];
+    ];
     const exclude = new Set(unique.map((item) => `${item.type}:${item.id}`));
-    for (const item of unique.slice(0, 3)) {
+    const sources = unique.slice(0, 3).map((item) => ({
+      item,
+      remote: this.source.fetchRelated
+        ? withDeadline(
+            this.source.fetchRelated(item.type, item.id, language)
+          ).catch(() => [])
+        : Promise.resolve([]),
+    }));
+    const pools: SmartMatch[][] = [];
+    for (const { item, remote } of sources) {
       const seed = await this.seed(item.type, item.id).catch(() => undefined);
-      const [local, remote] = await Promise.all([
+      const [local, related] = await Promise.all([
         seed
           ? this.searchDense(seed.vector, filters, 50).catch(() => [])
           : Promise.resolve([]),
-        this.source.fetchRelated
-          ? withDeadline(
-              this.source.fetchRelated(item.type, item.id, language)
-            ).catch(() => [])
-          : Promise.resolve([]),
+        remote,
       ]);
-      pools.push(local.map((match) => ({ ...match, methods: ['semantic'] })));
+      const matches = fuseSmartCandidates(
+        [
+          local.map((match) => ({
+            ...match,
+            methods: ['semantic'],
+          })),
+          related
+            .filter((doc) => matchesFilters(doc, filters))
+            .map((document) => ({
+              document,
+              score: 0,
+              methods: ['tmdb-recommendation'],
+            })),
+        ],
+        50
+      );
       pools.push(
-        remote
-          .filter((doc) => matchesFilters(doc, filters))
-          .map((document) => ({
-            document,
-            score: 0,
-            methods: ['tmdb-recommendation'],
-          }))
+        matches.filter(
+          (match) =>
+            !exclude.has(
+              `${match.document.mediaType}:${match.document.sourceId}`
+            )
+        )
       );
     }
-    const candidates = fuseSmartCandidates(pools, 60).filter(
-      (item) =>
-        !exclude.has(`${item.document.mediaType}:${item.document.sourceId}`)
-    );
-    const bestScore = candidates[0]?.score ?? 0;
-    return candidates
-      .map((item, order) => ({
-        item,
-        order,
-        rank:
-          item.score +
-          0.002 *
-            ratingEvidence(item.document) *
-            relevanceStrength(bestScore ? item.score / bestScore : 0),
-      }))
-      .sort((a, b) => b.rank - a.rank || a.order - b.order)
-      .map(({ item }) => item)
-      .slice(0, 30);
+    return balanceRecommendationPools(pools);
   }
 
   async close(): Promise<void> {

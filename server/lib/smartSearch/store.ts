@@ -451,6 +451,18 @@ export class SmartStore {
       }
     );
   }
+  async findDocuments(
+    source: string,
+    type: SmartMediaType,
+    ids: string[]
+  ): Promise<SmartDocument[]> {
+    if (!ids.length) return [];
+    const rows = await this.all<{ document: string }>(
+      `SELECT document FROM smart_documents WHERE source = ? AND mediaType = ? AND sourceId IN (${ids.map(() => '?').join(',')})`,
+      [source, type, ...ids]
+    );
+    return rows.map(({ document }) => JSON.parse(document) as SmartDocument);
+  }
   async search(
     vector: Buffer,
     filters: SmartFilters = {},

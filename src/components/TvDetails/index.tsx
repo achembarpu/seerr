@@ -1391,7 +1391,8 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
       )}
       <MediaSlider
         sliderKey="more-like-this"
-        maxItems={30}
+        maxItems={12}
+        linkUrl={`/tv/${data.id}/similar`}
         title={intl.formatMessage(messages.moreLikeThis)}
         url="/api/v1/search/smart/similar"
         extraParams={`mediaType=tv&id=${router.query.tvId}`}

@@ -111,15 +111,16 @@ export class TmdbMetadataSource implements MetadataSource {
     const lists = results.map((result) =>
       result.status === 'fulfilled' ? result.value.results : []
     );
-    const documents: SmartDocument[] = [];
+    const documents = new Map<string, SmartDocument>();
+    const [similar, recommendations] = lists;
     for (let i = 0; i < 20; i++)
-      for (const list of lists) {
+      for (const list of [recommendations, similar]) {
         const item = list[i];
-        if (!item) continue;
+        if (!item || documents.has(String(item.id))) continue;
         const doc = this.document(item, mediaType);
-        if (doc) documents.push(doc);
+        if (doc) documents.set(doc.sourceId, doc);
       }
-    return documents;
+    return [...documents.values()];
   }
 
   /** Use TMDB keywords to find popular titles outside the partially built index. */
