@@ -35,6 +35,7 @@ interface CandidateRow extends IndexedTitle {
 const SEARCH_CACHE_SIZE = 128;
 const NON_ASCII_TITLES = nonAsciiTitles();
 const PAIR_BATCH_SIZE = 4000;
+const READ_MMAP_BYTES = 0x7fff0000;
 
 function nonAsciiTitles(prefix = ''): string {
   return `(${prefix}searchTitle GLOB '*[^ -~]*' OR ${prefix}searchOriginalTitle GLOB '*[^ -~]*')`;
@@ -210,6 +211,11 @@ export class SearchIndex {
     ) WITHOUT ROWID`);
     // Read the last committed WAL snapshot while an import is published.
     this.reader = await this.connect(sqlite3.OPEN_READONLY);
+    await this.run(
+      `PRAGMA mmap_size=${READ_MMAP_BYTES}`,
+      [],
+      this.reader
+    ).catch(() => undefined);
     this.titlePairsBuild = this.backfillTitlePairs().catch((error) => {
       logger.warn('Short title pair index unavailable', {
         label: 'Search',
@@ -568,10 +574,17 @@ export class SearchIndex {
       FROM titles t LEFT JOIN imdb_votes v ON t.source = 'imdb' AND t.sourceId = v.sourceId`;
     const candidates = grams.length
       ? await this.all<CandidateRow>(
-          `SELECT t.source, t.sourceId, t.mediaType, t.title, t.originalTitle, t.searchTitle, t.searchOriginalTitle, CASE WHEN t.source = 'imdb' THEN COALESCE(v.votes, 0) ELSE t.popularity END AS popularity
-      FROM title_fts JOIN titles t ON t.id = title_fts.rowid
-      LEFT JOIN imdb_votes v ON t.source = 'imdb' AND t.sourceId = v.sourceId
-      WHERE title_fts MATCH ? ORDER BY rank LIMIT 5000`,
+          // Let SQLite limit its BM25 sort before reading titles and votes.
+          `WITH matches AS MATERIALIZED (
+            SELECT rowid AS id, bm25(title_fts) AS score FROM title_fts
+            WHERE title_fts MATCH ? ORDER BY score, rowid LIMIT 5000
+          )
+          SELECT t.source, t.sourceId, t.mediaType, t.title, t.originalTitle,
+            t.searchTitle, t.searchOriginalTitle,
+            CASE WHEN t.source = 'imdb' THEN COALESCE(v.votes, 0) ELSE t.popularity END AS popularity
+          FROM matches m CROSS JOIN titles t ON t.id = m.id
+          LEFT JOIN imdb_votes v ON t.source = 'imdb' AND t.sourceId = v.sourceId
+          ORDER BY m.score, m.id`,
           [expression],
           this.reader
         )

@@ -548,9 +548,18 @@ export class SmartStore {
           SELECT d.document, r.rank FROM ranked r
           CROSS JOIN smart_documents d ON d.id = r.id
           ORDER BY r.rank, r.id`
-        : `SELECT d.document, smart_fts.rank AS rank
+        : clauses.length
+          ? `SELECT d.document, smart_fts.rank AS rank
           FROM smart_fts CROSS JOIN smart_documents d ON d.id=smart_fts.rowid
-          WHERE ${[match, ...clauses].join(' AND ')} ORDER BY smart_fts.rank LIMIT ?`,
+          WHERE ${[match, ...clauses].join(' AND ')} ORDER BY smart_fts.rank LIMIT ?`
+          : `WITH ranked AS MATERIALIZED (
+              SELECT rowid AS id, bm25(smart_fts, 3.0, 1.0) AS score
+              FROM smart_fts WHERE smart_fts MATCH ?
+              ORDER BY score, rowid LIMIT ?
+            )
+            SELECT d.document, r.score AS rank FROM ranked r
+            CROSS JOIN smart_documents d ON d.id = r.id
+            ORDER BY r.score, r.id`,
       useCover
         ? [...values, expression, limit]
         : [expression, ...values, limit],

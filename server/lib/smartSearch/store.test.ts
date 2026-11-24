@@ -812,7 +812,7 @@ it('interrupts an aborted lexical read on its own connection', async () => {
   let reader: { interrupt: () => void } | undefined;
   let interrupts = 0;
   internal.all = async (...args) => {
-    if (args[0].includes('smart_fts.rank AS rank')) {
+    if (args[0].includes('smart_fts MATCH ?')) {
       reader = args[2] as typeof reader;
       if (reader && reader !== internal.db) {
         const interrupt = reader.interrupt.bind(reader);
