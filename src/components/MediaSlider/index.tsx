@@ -35,7 +35,6 @@ interface MediaSliderProps {
   onNewTitles?: (titleCount: number) => void;
   emptyMessage?: (basis: MixedResult['basis']) => string;
   errorMessage?: string;
-  titleForBasis?: (basis: MixedResult['basis']) => string;
 }
 
 const MediaSlider = ({
@@ -47,7 +46,6 @@ const MediaSlider = ({
   hideWhenEmpty = false,
   maxItems = 20,
   onNewTitles,
-  titleForBasis,
   emptyMessage,
   errorMessage,
 }: MediaSliderProps) => {
@@ -129,7 +127,6 @@ const MediaSlider = ({
         MediaStatus.BLOCKLISTED
   );
   if (hideWhenEmpty && !visibleTitles.length) return null;
-  const displayTitle = titleForBasis ? titleForBasis(data?.[0]?.basis) : title;
 
   const finalTitles = visibleTitles.slice(0, maxItems).map((title) => {
     switch (title.mediaType) {
@@ -196,18 +193,18 @@ const MediaSlider = ({
       <div className="slider-header">
         {linkUrl ? (
           <Link href={linkUrl} className="slider-title min-w-0 pr-16">
-            <span className="truncate">{displayTitle}</span>
+            <span className="truncate">{title}</span>
             <ArrowRightCircleIcon />
           </Link>
         ) : (
           <div className="slider-title">
-            <span>{displayTitle}</span>
+            <span>{title}</span>
           </div>
         )}
       </div>
       <div
         className={
-          emptyMessage ? 'min-h-[15.5rem] md:min-h-[18.5rem]' : undefined
+          emptyMessage ? 'min-h-[13.5rem] md:min-h-[16.5rem]' : undefined
         }
       >
         {error && !data && errorMessage ? (

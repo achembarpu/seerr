@@ -116,6 +116,53 @@ it('treats missing ratings as neutral and shrinks ratings with few votes', () =>
 });
 
 describe('smart search lifecycle', () => {
+  it('opens the existing index for the first Discover request', async () => {
+    const store = new SmartStore(':memory:');
+    await store.initialize();
+    await store.upsert(document, quantize([1, 0]));
+    await store.upsert(
+      { ...document, sourceId: '13', title: 'Related' },
+      quantize([1, 0])
+    );
+    const engine = {
+      phase: 'idle' as const,
+      downloadBytes: 0,
+      downloadTotal: 0,
+      async start() {},
+      stop() {},
+      async embed() {
+        throw new Error('Indexed seeds do not need new embeddings');
+      },
+    };
+    const source: MetadataSource = {
+      id: 'tmdb',
+      async fetchOne() {
+        return undefined;
+      },
+      async fetchPage() {
+        return { documents: [], totalPages: 0 };
+      },
+    };
+    const service = new SmartSearchService(
+      () => true,
+      engine,
+      source,
+      () => store
+    );
+    try {
+      const matches = await service.recommendations(
+        [{ type: 'movie', id: '12' }],
+        {}
+      );
+      assert.deepEqual(
+        matches.map((match) => match.document.sourceId),
+        ['13']
+      );
+    } finally {
+      await service.close();
+    }
+  });
+
   it('restarts an in-progress index when the inference device changes', async () => {
     const directory = await mkdtemp(
       path.join(os.tmpdir(), 'smart-reconfigure-')

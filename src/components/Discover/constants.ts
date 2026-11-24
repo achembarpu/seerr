@@ -74,7 +74,7 @@ export const sliderTitles = defineMessages('components.Discover', {
   recentlyAdded: 'Recently Added',
   upcoming: 'Upcoming Movies',
   trending: 'Trending',
-  smartRecommendations: 'Smart recommendations',
+  smartRecommendations: 'Recommended for you',
   plexwatchlist: 'Your Watchlist',
   moviegenres: 'Movie Genres',
   tvgenres: 'Series Genres',

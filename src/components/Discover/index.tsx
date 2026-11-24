@@ -51,8 +51,6 @@ const messages = defineMessages('components.Discover', {
   customizediscover: 'Customize Discover',
   stopediting: 'Stop Editing',
   createnewslider: 'Create New Slider',
-  requestRecommendations: 'Based on your requests',
-  libraryRecommendations: 'From your library',
   noRecommendationSeeds:
     'Recommendations will appear as Seerr indexes titles from your library and requests.',
   noVisibleRecommendations:
@@ -247,15 +245,6 @@ const Discover = () => {
                 <MediaSlider
                   sliderKey="smart-recommendations"
                   title={intl.formatMessage(sliderTitles.smartRecommendations)}
-                  titleForBasis={(basis) =>
-                    intl.formatMessage(
-                      basis === 'requests'
-                        ? messages.requestRecommendations
-                        : basis === 'library'
-                          ? messages.libraryRecommendations
-                          : sliderTitles.smartRecommendations
-                    )
-                  }
                   url="/api/v1/search/smart/recommendations"
                   emptyMessage={(basis) =>
                     intl.formatMessage(

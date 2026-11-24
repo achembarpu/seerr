@@ -1247,13 +1247,14 @@ export class SmartSearchService {
     if (cached) return cached;
     try {
       if (!seed) {
-        await this.startEngine();
-        const signal = AbortSignal.timeout(2000);
-        const document = await this.source.fetchOne(type, id, signal);
+        const [document] = await Promise.all([
+          this.source.fetchOne(type, id, AbortSignal.timeout(2000)),
+          this.startEngine(),
+        ]);
         if (document) {
           const [embedding] = await this.engine.embed(
             [documentText(document)],
-            signal
+            AbortSignal.timeout(2000)
           );
           seed = { document, vector: quantize(embedding) };
           this.seedCache.set(`${type}:${id}`, seed);
@@ -1390,7 +1391,12 @@ export class SmartSearchService {
     filters: SmartFilters,
     language?: string
   ) {
-    if (!this.enabled() || !this.store) return [];
+    if (!this.enabled()) return [];
+    // The HTTP server can accept Discover requests before the startup
+    // task opens the index. Join its in-progress open instead of reporting
+    // that there are no recommendations.
+    const store = await this.open().catch(() => undefined);
+    if (!store) return [];
     const unique = [
       ...new Map(
         seeds.map((seed) => [`${seed.type}:${seed.id}`, seed])
@@ -1414,9 +1420,8 @@ export class SmartSearchService {
     const vectors = seedsBySource.flatMap((seed) =>
       seed ? [seed.vector] : []
     );
-    const store = this.store;
     const localPools =
-      vectors.length > 1 && store
+      vectors.length > 1
         ? await this.runDenseScan(() =>
             store.searchMany(vectors, filters, 50)
           ).catch(() => [])

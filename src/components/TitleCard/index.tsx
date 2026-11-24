@@ -404,72 +404,87 @@ const TitleCard = ({
                     : intl.formatMessage(globalMessages.tvshow)}
               </div>
             </div>
-            {showDetail && currentStatus !== MediaStatus.BLOCKLISTED && (
-              <div className="flex flex-col gap-1">
-                {user?.userType !== UserType.PLEX &&
-                  (toggleWatchlist ? (
-                    <Button
-                      buttonType={'ghost'}
-                      className="z-40"
-                      buttonSize={'sm'}
-                      onClick={onClickWatchlistBtn}
-                    >
-                      <StarIcon className={'h-3 text-amber-300'} />
-                    </Button>
-                  ) : (
-                    <Button
-                      className="z-40"
-                      buttonSize={'sm'}
-                      onClick={onClickDeleteWatchlistBtn}
-                    >
-                      <MinusCircleIcon className={'h-3'} />
-                    </Button>
-                  ))}
-                {showHideButton &&
-                  currentStatus !== MediaStatus.PROCESSING &&
-                  currentStatus !== MediaStatus.AVAILABLE &&
-                  currentStatus !== MediaStatus.PARTIALLY_AVAILABLE &&
-                  currentStatus !== MediaStatus.PENDING && (
-                    <Button
-                      buttonType={'ghost'}
-                      className="z-40"
-                      buttonSize={'sm'}
-                      onClick={() => setShowBlocklistModal(true)}
-                    >
-                      <EyeSlashIcon className={'h-3'} />
-                    </Button>
+            <div className="ml-auto flex items-start gap-1">
+              {(matchExplanation ||
+                (showDetail && currentStatus !== MediaStatus.BLOCKLISTED)) && (
+                <div className="flex flex-col items-end gap-1">
+                  {matchExplanation && (
+                    <MatchReason
+                      explanation={matchExplanation}
+                      title={title}
+                      isTouch={isTouch}
+                    />
                   )}
-              </div>
-            )}
-            {showDetail &&
-              showHideButton &&
-              currentStatus == MediaStatus.BLOCKLISTED && (
-                <Tooltip
-                  content={intl.formatMessage(
-                    globalMessages.removefromBlocklist
-                  )}
-                >
-                  <Button
-                    buttonType={'ghost'}
-                    className="z-40"
-                    buttonSize={'sm'}
-                    onClick={() => onClickShowBlocklistBtn()}
-                  >
-                    <EyeIcon className={'h-3'} />
-                  </Button>
-                </Tooltip>
-              )}
-            {currentStatus && currentStatus !== MediaStatus.UNKNOWN && (
-              <div className="flex flex-col items-center gap-1">
-                <div className="pointer-events-none z-40 flex">
-                  <StatusBadgeMini
-                    status={currentStatus}
-                    inProgress={inProgress}
-                    shrink
-                  />
+                  {showDetail &&
+                    currentStatus !== MediaStatus.BLOCKLISTED &&
+                    user?.userType !== UserType.PLEX &&
+                    (toggleWatchlist ? (
+                      <Button
+                        buttonType={'ghost'}
+                        className="z-40"
+                        buttonSize={'sm'}
+                        onClick={onClickWatchlistBtn}
+                      >
+                        <StarIcon className={'h-3 text-amber-300'} />
+                      </Button>
+                    ) : (
+                      <Button
+                        className="z-40"
+                        buttonSize={'sm'}
+                        onClick={onClickDeleteWatchlistBtn}
+                      >
+                        <MinusCircleIcon className={'h-3'} />
+                      </Button>
+                    ))}
+                  {!matchExplanation &&
+                    showDetail &&
+                    showHideButton &&
+                    currentStatus !== MediaStatus.BLOCKLISTED &&
+                    currentStatus !== MediaStatus.PROCESSING &&
+                    currentStatus !== MediaStatus.AVAILABLE &&
+                    currentStatus !== MediaStatus.PARTIALLY_AVAILABLE &&
+                    currentStatus !== MediaStatus.PENDING && (
+                      <Button
+                        buttonType={'ghost'}
+                        className="z-40"
+                        buttonSize={'sm'}
+                        onClick={() => setShowBlocklistModal(true)}
+                      >
+                        <EyeSlashIcon className={'h-3'} />
+                      </Button>
+                    )}
                 </div>
-              </div>
-            )}
+              )}
+              {showDetail &&
+                showHideButton &&
+                currentStatus == MediaStatus.BLOCKLISTED && (
+                  <Tooltip
+                    content={intl.formatMessage(
+                      globalMessages.removefromBlocklist
+                    )}
+                  >
+                    <Button
+                      buttonType={'ghost'}
+                      className="z-40"
+                      buttonSize={'sm'}
+                      onClick={() => onClickShowBlocklistBtn()}
+                    >
+                      <EyeIcon className={'h-3'} />
+                    </Button>
+                  </Tooltip>
+                )}
+              {currentStatus && currentStatus !== MediaStatus.UNKNOWN && (
+                <div className="flex flex-col items-center gap-1">
+                  <div className="pointer-events-none z-40 flex">
+                    <StatusBadgeMini
+                      status={currentStatus}
+                      inProgress={inProgress}
+                      shrink
+                    />
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
           <Transition
             as={Fragment}
@@ -582,9 +597,6 @@ const TitleCard = ({
           </Transition>
         </div>
       </div>
-      {matchExplanation && (
-        <MatchReason explanation={matchExplanation} title={title} />
-      )}
     </div>
   );
 };

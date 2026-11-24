@@ -31,6 +31,8 @@ interface CandidateRow extends IndexedTitle {
 }
 
 const SEARCH_CACHE_SIZE = 128;
+const NON_ASCII_TITLES =
+  "(searchTitle GLOB '*[^ -~]*' OR searchOriginalTitle GLOB '*[^ -~]*')";
 
 const trigrams = (query: string): string[] => {
   const grams = new Set<string>();
@@ -123,6 +125,12 @@ export class SearchIndex {
       popularity REAL NOT NULL DEFAULT 0,
       UNIQUE(source, sourceId)
     )`);
+    // Keep short non-ASCII substring lookups on a narrow, covering SQLite
+    // index. SQLite creates it from existing rows and maintains it on writes.
+    await this.run(
+      `CREATE INDEX IF NOT EXISTS title_non_ascii ON titles(id, searchTitle, searchOriginalTitle)
+      WHERE ${NON_ASCII_TITLES}`
+    );
     await this.run(`CREATE VIRTUAL TABLE IF NOT EXISTS title_fts USING fts5(
       searchTitle, searchOriginalTitle, content='titles', content_rowid='id', tokenize='trigram'
     )`);
@@ -429,12 +437,21 @@ export class SearchIndex {
           chars.slice(0, -1).map((_, i) => chars.slice(i, i + 2).join(''))
         ),
       ];
+      // Every hit must contain non-ASCII if each pair does. Mixed-script
+      // queries may have an ASCII pair, so they still scan the full table.
+      const useCoveringIndex = pairs.every((pair) =>
+        /[^\p{ASCII}]/u.test(pair)
+      );
       const predicates = pairs.map(
-        () => '(t.searchTitle LIKE ? OR t.searchOriginalTitle LIKE ?)'
+        () => '(instr(searchTitle, ?) OR instr(searchOriginalTitle, ?))'
       );
       const nearby = await this.all<CandidateRow>(
-        `${select} WHERE ${predicates.join(' OR ')} LIMIT 5000`,
-        pairs.flatMap((pair) => [`%${pair}%`, `%${pair}%`]),
+        `WITH nearby AS MATERIALIZED (
+          SELECT id FROM titles ${useCoveringIndex ? 'INDEXED BY title_non_ascii' : ''}
+          WHERE ${useCoveringIndex ? `${NON_ASCII_TITLES} AND ` : ''}(${predicates.join(' OR ')})
+          ORDER BY id LIMIT 5000
+        ) ${select} JOIN nearby ON nearby.id = t.id ORDER BY t.id`,
+        pairs.flatMap((pair) => [pair, pair]),
         this.reader
       );
       const keys = new Set(

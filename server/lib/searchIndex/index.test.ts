@@ -126,6 +126,30 @@ describe('local title search index', () => {
     assert.equal(normalizeTitle('മാവീരൻ'), 'മാവീരൻ');
   });
 
+  it('keeps mixed-script candidates and updates short Unicode matches on import', async () => {
+    await index.beginImport('imdb');
+    await index.writeBatch([
+      movie('tt1', 'abc', 'abc', 100),
+      movie('tt2', '無間道'),
+      movie('tt3', '기생충'),
+    ]);
+    await index.finishImport('v1');
+    assert.ok(
+      (await index.search('abé')).some(({ sourceId }) => sourceId === 'tt1')
+    );
+    assert.ok(
+      (await index.search('無間到')).some(({ sourceId }) => sourceId === 'tt2')
+    );
+    assert.ok(
+      (await index.search('기생총')).some(({ sourceId }) => sourceId === 'tt3')
+    );
+
+    await index.beginImport('imdb');
+    await index.writeBatch([movie('tt1', 'abc'), movie('tt2', 'Other Film')]);
+    await index.finishImport('v2');
+    assert.equal((await index.search('無間到')).length, 0);
+  });
+
   it('updates changed titles and removes records only after a successful import', async () => {
     await index.beginImport('imdb');
     await index.writeBatch([
