@@ -113,14 +113,9 @@ const SearchResults = ({
 }) => {
   const intl = useIntl();
   const { hasPermission } = useUser();
-  const [settled, setSettled] = useState(false);
   const [matchLimit, setMatchLimit] = useState(resultsPerPage);
   const [suggestionsExpanded, setSuggestionsExpanded] = useState(false);
   const directLookup = isDirectLookup(query);
-  useEffect(() => {
-    const settle = setTimeout(() => setSettled(true), 450);
-    return () => clearTimeout(settle);
-  }, []);
 
   const {
     firstResultData,
@@ -182,10 +177,9 @@ const SearchResults = ({
     genre: filters.genre,
   }))
     if (value) params.set(key, value);
-  const descriptionKey =
-    showSuggestions && settled
-      ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
-      : null;
+  const descriptionKey = showSuggestions
+    ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
+    : null;
   const [descriptionResponse, setDescriptionResponse] = useState<{
     key: string;
     data?: { ready: boolean; results: SearchItem[] };

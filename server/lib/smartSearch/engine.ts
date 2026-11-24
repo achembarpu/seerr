@@ -275,6 +275,10 @@ export class EmbeddingEngine {
   ): Promise<void> {
     const port = await freePort();
     this.baseUrl = `http://127.0.0.1:${port}`;
+    const metalBatch =
+      this.mode === 'reranking' &&
+      device?.startsWith('MTL') &&
+      process.env.SEERR_NATIVE_METAL_RERANK === '1';
     const child = spawn(
       binary,
       [
@@ -284,11 +288,24 @@ export class EmbeddingEngine {
           ? ['--embedding', '--pooling', 'mean']
           : ['--reranking', '--pooling', 'rank']),
         '--ctx-size',
-        this.mode === 'embedding' ? '512' : '2048',
+        this.mode === 'embedding' ? '512' : metalBatch ? '8192' : '2048',
         '--threads',
         '2',
         '--parallel',
-        '1',
+        metalBatch ? '4' : '1',
+        ...(metalBatch
+          ? [
+              '--batch-size',
+              '1024',
+              '--ubatch-size',
+              '1024',
+              '--kv-unified',
+              '--kv-unified-per-slot',
+              '2048',
+              '--cache-ram',
+              '0',
+            ]
+          : []),
         '--host',
         '127.0.0.1',
         '--port',

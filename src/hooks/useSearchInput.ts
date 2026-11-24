@@ -24,7 +24,7 @@ const useSearchInput = (): SearchObject => {
   const [lastRoute, setLastRoute] = useState<Nullable<Url>>(null);
   const [searchValue, debouncedValue, setSearchValue] = useDebouncedState(
     (router.query.query as string) ?? '',
-    250
+    120
   );
 
   /**
@@ -43,13 +43,17 @@ const useSearchInput = (): SearchObject => {
       router.query.query !== debouncedValue
     ) {
       if (router.pathname.startsWith('/search')) {
-        router.replace({
-          pathname: router.pathname,
-          query: {
-            ...router.query,
-            query: debouncedValue,
+        router.replace(
+          {
+            pathname: router.pathname,
+            query: {
+              ...router.query,
+              query: debouncedValue,
+            },
           },
-        });
+          undefined,
+          { shallow: true }
+        );
       } else {
         setLastRoute(router.asPath);
         router

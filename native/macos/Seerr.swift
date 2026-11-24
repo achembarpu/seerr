@@ -80,6 +80,7 @@ final class SeerrApplication: NSObject, NSApplicationDelegate {
             variables["NEXT_TELEMETRY_DISABLED"] = "1"
             variables["CONFIG_DIRECTORY"] = dataDirectory.path
             variables["SEERR_LLAMA_SERVER"] = resources.appendingPathComponent("runtime/llama-server").path
+            variables["SEERR_NATIVE_METAL_RERANK"] = "1"
             variables["SEERR_VECTOR_EXTENSION"] = resources.appendingPathComponent("runtime/seerrvectors.dylib").path
             variables["PORT"] = String(portNumber)
             variables["HOST"] = environment["SEERR_NATIVE_HOST"] ??

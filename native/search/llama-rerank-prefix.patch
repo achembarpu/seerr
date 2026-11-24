@@ -41,7 +41,7 @@
 
 -                            if (slot.task->params.cache_prompt && !slot.task->is_stateless()) {
 +                            if (slot.task->params.cache_prompt &&
-+                                (!slot.task->is_stateless() || (slots.size() == 1 && slot.can_reuse_rerank_prefix()))) {
++                                (!slot.task->is_stateless() || ((slots.size() == 1 || !params_base.cache_idle_slots) && slot.can_reuse_rerank_prefix()))) {
                                  // reuse any previously computed tokens that are common with the new prompt
                                  n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -51,7 +51,7 @@
                      send_rerank(slot, batch.view);
 -                    slot.release();
 +                    // A dedicated reranker can keep the previous prompt in its active slot.
-+                    slot.release(slots.size() == 1 && slot.task->params.cache_prompt && slot.can_reuse_rerank_prefix());
++                    slot.release((slots.size() == 1 || !params_base.cache_idle_slots) && slot.task->params.cache_prompt && slot.can_reuse_rerank_prefix());
                      slot.i_batch = -1;
                      return;
                  }
