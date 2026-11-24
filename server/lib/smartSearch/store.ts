@@ -100,6 +100,7 @@ const maxNeighborDelta = 4096;
 const minKeywordEnrichmentVotes = 100;
 const maxKeywords = 64;
 const maxKeywordLength = 120;
+const readMmapBytes = 0x7fff0000;
 const plotStopwords = new Set([
   'the',
   'and',
@@ -128,7 +129,7 @@ const plotStopwords = new Set([
 ]);
 const wordsIn = (text: string): string[] =>
   text.toLowerCase().match(/[\p{L}\p{M}\p{N}]+/gu) ?? [];
-const plotSearchWords = (query: string): string[] =>
+export const plotSearchWords = (query: string): string[] =>
   [
     ...new Set(
       wordsIn(query).filter((word) =>
@@ -138,7 +139,7 @@ const plotSearchWords = (query: string): string[] =>
       )
     ),
   ].slice(0, 8);
-const foldText = (value: string): string =>
+export const foldText = (value: string): string =>
   value
     .toLowerCase()
     .normalize('NFD')
@@ -273,6 +274,15 @@ export class SmartStore {
               (error) => (error ? reject(error) : resolve(reader))
             );
           });
+      if (!transient) {
+        // Use SQLite's standard mmap ceiling for demand-paged reads of
+        // shortlisted documents. Other VFSes can fall back to cached I/O.
+        await this.run(
+          `PRAGMA mmap_size=${readMmapBytes}`,
+          [],
+          connection
+        ).catch(() => undefined);
+      }
       return await query(connection, transient);
     } finally {
       try {
@@ -488,18 +498,33 @@ export class SmartStore {
     // Plot search uses whole terms; title typo/substring matching has its own
     // index. Prefix expansion of common words can stall SQLite for minutes.
     const { clauses, values } = metadataConditions(filters);
-    const conditions = [
-      'smart_fts MATCH ?',
-      "smart_fts.rank MATCH 'bm25(3.0, 1.0)'",
-      ...clauses,
-    ];
+    const match = "smart_fts MATCH ? AND smart_fts.rank MATCH 'bm25(3.0, 1.0)'";
+    // With a meaningful vote floor, preselect the small eligible ID set
+    // from the covering index. Broad FTS matches then avoid random lookups
+    // into full document rows just to reject them on metadata.
+    const useCover = this.denseCoverAvailable && (filters.minVotes ?? 0) >= 100;
+    const expression = ftsTerms(words);
     // FTS ranking can be expensive for broad terms. Isolate it so it cannot
     // delay indexing or the dense search's document-version checks.
     const rows = await this.readSearchRows<{ document: string; rank: number }>(
-      `SELECT d.document, smart_fts.rank AS rank
-      FROM smart_fts CROSS JOIN smart_documents d ON d.id=smart_fts.rowid
-      WHERE ${conditions.join(' AND ')} ORDER BY smart_fts.rank LIMIT ?`,
-      [ftsTerms(words), ...values, limit],
+      useCover
+        ? `WITH allowed AS MATERIALIZED (
+            SELECT d.id FROM smart_documents d INDEXED BY smart_dense_cover
+            WHERE ${clauses.join(' AND ')}
+          ), ranked AS MATERIALIZED (
+            SELECT smart_fts.rowid AS id, smart_fts.rank AS rank
+            FROM smart_fts CROSS JOIN allowed a ON a.id = smart_fts.rowid
+            WHERE ${match} ORDER BY smart_fts.rank LIMIT ?
+          )
+          SELECT d.document, r.rank FROM ranked r
+          CROSS JOIN smart_documents d ON d.id = r.id
+          ORDER BY r.rank, r.id`
+        : `SELECT d.document, smart_fts.rank AS rank
+          FROM smart_fts CROSS JOIN smart_documents d ON d.id=smart_fts.rowid
+          WHERE ${[match, ...clauses].join(' AND ')} ORDER BY smart_fts.rank LIMIT ?`,
+      useCover
+        ? [...values, expression, limit]
+        : [expression, ...values, limit],
       signal
     );
     signal?.throwIfAborted();

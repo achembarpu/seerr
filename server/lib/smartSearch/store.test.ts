@@ -581,6 +581,58 @@ it('indexes lexical metadata without changing embeddings, and keeps it updated',
   }
 });
 
+it('uses covering metadata for selective lexical search with the same filter and tie order', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-fts-cover-'));
+  const filename = path.join(directory, 'store.sqlite3');
+  const portable = new SmartStore(filename, '');
+  const covered = new SmartStore(filename, 'unused-for-lexical-ranking');
+  const vector = quantize([1, 0]);
+  const series = (id: string, overrides: Partial<SmartDocument> = {}) =>
+    doc(id, {
+      mediaType: 'tv',
+      title: 'A risky heist',
+      overview: 'A thief races through the city.',
+      ...overrides,
+    });
+  const filters = {
+    mediaType: 'tv' as const,
+    language: 'en',
+    yearFrom: 2010,
+    yearTo: 2025,
+    minRating: 7,
+    minVotes: 100,
+    genre: 12,
+  };
+  try {
+    await portable.initialize();
+    await portable.upsertBatch(
+      [
+        series('99'),
+        series('1'),
+        series('2', { genreIds: [35] }),
+        series('3', { voteCount: 99 }),
+        series('4', { mediaType: 'movie' }),
+        series('5', { originalLanguage: 'ko' }),
+        series('6', { year: 2026 }),
+        series('7', { voteAverage: 6 }),
+        series('8'),
+      ].map((document) => ({ document, vector }))
+    );
+    await covered.initialize();
+    const baseline = await portable.searchLexical('heist city', filters, 2);
+    const optimized = await covered.searchLexical('heist city', filters, 2);
+    assert.deepEqual(optimized, baseline);
+    assert.deepEqual(
+      optimized.map(({ document }) => document.sourceId),
+      ['99', '1']
+    );
+    assert.equal(optimized[0].score, optimized[1].score);
+  } finally {
+    await Promise.all([portable.close(), covered.close()]);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 it('retrieves compound keywords, prioritizes multiple matching terms and honors filters', async () => {
   const { directory, store } = await versionTestStore();
   const vector = quantize([1, 0]);
