@@ -247,8 +247,12 @@ searchRoutes.get('/suggestions', async (req, res) => {
     findSearchProvider(query.toLowerCase())
   )
     return res.status(200).json({ results: [] });
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  res.once('close', abort);
   try {
-    const matches = await searchIndex.search(query, 40);
+    const matches = await searchIndex.search(query, 40, controller.signal);
+    controller.signal.throwIfAborted();
     const tmdb = new TheMovieDb();
     const language = (req.query.language as string) ?? req.locale;
     const localCards = new Map<string, MediaCard>();
@@ -278,6 +282,7 @@ searchRoutes.get('/suggestions', async (req, res) => {
       offset < matches.length && results.length < 15;
       offset += 20
     ) {
+      controller.signal.throwIfAborted();
       const batch = matches.slice(offset, offset + 20);
       const resolved = batch
         .map(async (match): Promise<MediaCard | false> => {
@@ -287,6 +292,7 @@ searchRoutes.get('/suggestions', async (req, res) => {
           const cached = titleCards.get(key);
           if (cached !== undefined) return cached;
           if (source !== 'imdb') await indexedCardsReady;
+          controller.signal.throwIfAborted();
           const local = source !== 'imdb' ? localCards.get(id) : undefined;
           // The indexed card is already current enough for search and needs no
           // per-title request. Don't cache it independently of the index.
@@ -344,6 +350,7 @@ searchRoutes.get('/suggestions', async (req, res) => {
         .map((lookup) => lookup.catch(() => false as const));
       for (const [index, result] of resolved.entries()) {
         const card = await result;
+        controller.signal.throwIfAborted();
         if (!card) continue;
         const key = `${card.mediaType}:${card.id}`;
         if (seen.has(key)) continue;
@@ -355,6 +362,7 @@ searchRoutes.get('/suggestions', async (req, res) => {
     }
 
     const cards = await attachMediaInfo(results, req.user);
+    controller.signal.throwIfAborted();
     return res.status(200).json({
       results: cards.map((card, index) => ({
         ...card,
@@ -362,6 +370,7 @@ searchRoutes.get('/suggestions', async (req, res) => {
       })),
     });
   } catch (error) {
+    if (controller.signal.aborted) return;
     logger.warn('Unable to retrieve local search suggestions', {
       label: 'Search',
       errorMessage: error instanceof Error ? error.message : String(error),
@@ -369,6 +378,8 @@ searchRoutes.get('/suggestions', async (req, res) => {
     return res
       .status(503)
       .json({ results: [], message: 'Local title search is unavailable.' });
+  } finally {
+    res.off('close', abort);
   }
 });
 

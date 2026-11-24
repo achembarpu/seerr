@@ -18,7 +18,6 @@ import axios from 'axios';
 import { useRouter } from 'next/router';
 import { useEffect, useRef, useState } from 'react';
 import { useIntl } from 'react-intl';
-import useSWR from 'swr';
 import SmartSearch, {
   emptySearchFilters,
   type SearchFilters,
@@ -101,6 +100,35 @@ const ResultControls = ({
 const supportsSemanticSearch = (query: string, filters: SearchFilters) =>
   !isDirectLookup(query) && filters.type !== 'person';
 
+interface SearchResponse {
+  ready?: boolean;
+  results: SearchItem[];
+}
+
+const useSearchResponse = (key: string | null) => {
+  const [response, setResponse] = useState<{
+    key: string;
+    data?: SearchResponse;
+    error?: true;
+  }>();
+  const readyKey =
+    response?.data && response.data.ready !== false ? response.key : undefined;
+  useEffect(() => {
+    if (!key || key === readyKey) return;
+    const controller = new AbortController();
+    axios.get<SearchResponse>(key, { signal: controller.signal }).then(
+      ({ data }) => {
+        if (!controller.signal.aborted) setResponse({ key, data });
+      },
+      () => {
+        if (!controller.signal.aborted) setResponse({ key, error: true });
+      }
+    );
+    return () => controller.abort();
+  }, [key, readyKey]);
+  return response?.key === key ? response : undefined;
+};
+
 const SearchResults = ({
   query,
   filters,
@@ -133,18 +161,14 @@ const SearchResults = ({
       initialSize: 1,
     }
   );
-  const {
-    data: fuzzy,
-    error: fuzzyError,
-    isLoading: fuzzyLoading,
-  } = useSWR<{
-    results: SearchItem[];
-  }>(
+  const suggestionKey =
     !directLookup && filters.type !== 'person' && Array.from(query).length >= 2
       ? `/api/v1/search/suggestions?query=${encodeURIComponent(query)}`
-      : null,
-    { revalidateOnFocus: false, shouldRetryOnError: false }
-  );
+      : null;
+  const latestSuggestion = useSearchResponse(suggestionKey);
+  const fuzzy = latestSuggestion?.data;
+  const fuzzyError = latestSuggestion?.error;
+  const fuzzyLoading = !!suggestionKey && !latestSuggestion;
   const canViewBlocklisted = hasPermission(
     [Permission.MANAGE_BLOCKLIST, Permission.VIEW_BLOCKLIST],
     { type: 'or' }
@@ -178,37 +202,7 @@ const SearchResults = ({
   const descriptionKey = smartEnabled
     ? `/api/v1/search/smart?${serializeSmartSearchParams(params)}`
     : null;
-  const [descriptionResponse, setDescriptionResponse] = useState<{
-    key: string;
-    data?: { ready: boolean; results: SearchItem[] };
-    error?: true;
-  }>();
-  const readyKey = descriptionResponse?.data?.ready
-    ? descriptionResponse.key
-    : undefined;
-  useEffect(() => {
-    if (!descriptionKey || descriptionKey === readyKey) return;
-    const controller = new AbortController();
-    axios
-      .get<{ ready: boolean; results: SearchItem[] }>(descriptionKey, {
-        signal: controller.signal,
-      })
-      .then(
-        ({ data }) => {
-          if (!controller.signal.aborted)
-            setDescriptionResponse({ key: descriptionKey, data });
-        },
-        () => {
-          if (!controller.signal.aborted)
-            setDescriptionResponse({ key: descriptionKey, error: true });
-        }
-      );
-    return () => controller.abort();
-  }, [descriptionKey, readyKey]);
-  const latest =
-    descriptionResponse?.key === descriptionKey
-      ? descriptionResponse
-      : undefined;
+  const latest = useSearchResponse(descriptionKey);
   const smart = latest?.data;
   const smartError = latest?.error;
   const smartLoading = smartEnabled && !latest;

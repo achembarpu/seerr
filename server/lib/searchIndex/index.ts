@@ -33,6 +33,12 @@ interface CandidateRow extends IndexedTitle {
   searchOriginalTitle: string;
 }
 
+interface PendingSearch {
+  controller: AbortController;
+  promise: Promise<TitleMatch[]>;
+  waiters: number;
+}
+
 const SEARCH_CACHE_SIZE = 128;
 const NON_ASCII_TITLES = nonAsciiTitles();
 const PAIR_BATCH_SIZE = 4000;
@@ -111,7 +117,8 @@ export class SearchIndex {
   private importing?: IndexSource;
   private revision = 0;
   private readonly searchCache = new Map<string, TitleMatch[]>();
-  private readonly pendingSearches = new Map<string, Promise<TitleMatch[]>>();
+  private readonly pendingSearches = new Map<string, PendingSearch>();
+  private searchQueue = Promise.resolve();
 
   constructor(private readonly filename: string) {
     if (!filename || filename === ':memory:') {
@@ -537,8 +544,15 @@ export class SearchIndex {
     );
   }
 
-  async search(query: string, limit = 20): Promise<TitleMatch[]> {
-    if (!this.reader) throw new Error('Search index is not initialized');
+  async search(
+    query: string,
+    limit = 20,
+    signal?: AbortSignal
+  ): Promise<TitleMatch[]> {
+    const reader = this.reader;
+    if (!reader || this.closing)
+      throw new Error('Search index is not available');
+    signal?.throwIfAborted();
     const normalized = normalizeTitle(query);
     const characters = Array.from(normalized);
     const shortNonLatin =
@@ -559,23 +573,74 @@ export class SearchIndex {
 
     let pending = this.pendingSearches.get(key);
     if (!pending) {
-      pending = this.findMatches(normalized, grams, limit, shortNonLatin);
+      const controller = new AbortController();
+      const work = this.searchQueue
+        .then(async () => {
+          controller.signal.throwIfAborted();
+          // SQLite interruption is connection-wide. Let only the query at
+          // the front of this queue use the reader while it can be aborted.
+          const interrupt = () => reader.interrupt();
+          controller.signal.addEventListener('abort', interrupt, {
+            once: true,
+          });
+          try {
+            const matches = await this.findMatches(
+              normalized,
+              grams,
+              limit,
+              shortNonLatin,
+              controller.signal
+            );
+            controller.signal.throwIfAborted();
+            if (revision === this.revision) {
+              this.searchCache.set(key, matches);
+              if (this.searchCache.size > SEARCH_CACHE_SIZE) {
+                const oldest = this.searchCache.keys().next().value;
+                if (oldest !== undefined) this.searchCache.delete(oldest);
+              }
+            }
+            return matches;
+          } catch (error) {
+            controller.signal.throwIfAborted();
+            throw error;
+          } finally {
+            controller.signal.removeEventListener('abort', interrupt);
+          }
+        })
+        .finally(() => {
+          if (this.pendingSearches.get(key)?.controller === controller)
+            this.pendingSearches.delete(key);
+        });
+      pending = { controller, promise: work, waiters: 0 };
       this.pendingSearches.set(key, pending);
+      this.searchQueue = work.then(
+        () => undefined,
+        () => undefined
+      );
     }
+    pending.waiters++;
+    let abort: (() => void) | undefined;
     try {
-      const matches = await pending;
-      if (revision === this.revision) {
-        this.searchCache.delete(key);
-        this.searchCache.set(key, matches);
-        if (this.searchCache.size > SEARCH_CACHE_SIZE) {
-          const oldest = this.searchCache.keys().next().value;
-          if (oldest !== undefined) this.searchCache.delete(oldest);
-        }
-      }
+      const matches = await (signal
+        ? Promise.race([
+            pending.promise,
+            new Promise<never>((_, reject) => {
+              abort = () => reject(signal.reason);
+              signal.addEventListener('abort', abort, { once: true });
+            }),
+          ])
+        : pending.promise);
+      signal?.throwIfAborted();
       return matches.map((match) => ({ ...match }));
     } finally {
-      if (this.pendingSearches.get(key) === pending)
+      if (abort) signal?.removeEventListener('abort', abort);
+      if (
+        --pending.waiters === 0 &&
+        this.pendingSearches.get(key) === pending
+      ) {
         this.pendingSearches.delete(key);
+        pending.controller.abort();
+      }
     }
   }
 
@@ -583,7 +648,8 @@ export class SearchIndex {
     normalized: string,
     grams: string[],
     limit: number,
-    shortNonLatin: boolean
+    shortNonLatin: boolean,
+    signal: AbortSignal
   ): Promise<TitleMatch[]> {
     const expression = grams
       .map((gram) => `"${gram.replace(/"/g, '""')}"`)
@@ -607,6 +673,7 @@ export class SearchIndex {
           this.reader
         )
       : [];
+    signal.throwIfAborted();
     // A changed character can remove every trigram from a short title. Other
     // titles can still match the query's trigrams, so supplement those matches
     // with adjacent pairs rather than only falling back on an empty result.
@@ -632,6 +699,7 @@ export class SearchIndex {
           [pairs.map((pair) => Buffer.from(pair).toString('hex')).join(' OR ')],
           this.reader
         ).catch(() => {
+          signal.throwIfAborted();
           this.titlePairsReady = false;
           return undefined;
         });
@@ -662,6 +730,7 @@ export class SearchIndex {
         )
       );
     }
+    signal.throwIfAborted();
     const similarity = prepareTitleSimilarity(normalized);
     return candidates
       .map(({ searchTitle, searchOriginalTitle, ...candidate }) => {
@@ -686,6 +755,9 @@ export class SearchIndex {
 
   async close(): Promise<void> {
     this.closing = true;
+    for (const search of this.pendingSearches.values())
+      search.controller.abort();
+    await this.searchQueue;
     await this.titlePairsBuild;
     const databases = this.reader
       ? [this.reader, this.database]

@@ -237,10 +237,11 @@ export class SearchIndexService {
     }
   }
 
-  async search(query: string, limit = 10) {
+  async search(query: string, limit = 10, signal?: AbortSignal) {
+    signal?.throwIfAborted();
     if (!this.enabled()) return [];
     const index = await this.open();
-    return this.enabled() ? index.search(query, limit) : [];
+    return this.enabled() ? index.search(query, limit, signal) : [];
   }
 }
 

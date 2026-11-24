@@ -437,10 +437,15 @@ describe('local title search index', () => {
     };
     const findMatches = mock.method(methods, 'findMatches');
     try {
-      const [first, second] = await Promise.all([
+      const abandoned = new AbortController();
+      const disconnected = index.search('Matrix', 20, abandoned.signal);
+      const active = Promise.all([
         index.search('matrix'),
         index.search('MATRIX'),
       ]);
+      abandoned.abort();
+      await assert.rejects(disconnected, { name: 'AbortError' });
+      const [first, second] = await active;
       assert.equal(findMatches.mock.callCount(), 1);
       first[0].title = 'Changed by caller';
       assert.equal(second[0].title, 'The Matrix');
@@ -468,6 +473,62 @@ describe('local title search index', () => {
     }
   });
 
+  it('cancels a running title lookup and skips disconnected readers waiting behind it', async () => {
+    await index.beginImport('imdb');
+    await index.writeBatch([movie('tt1', 'The Matrix')]);
+    await index.finishImport('v1');
+
+    const methods = index as unknown as {
+      findMatches: (
+        query: string,
+        grams: string[],
+        limit: number,
+        shortNonLatin: boolean,
+        signal: AbortSignal
+      ) => Promise<TitleMatch[]>;
+    };
+    const findMatches = methods.findMatches.bind(index);
+    let begin: () => void = () => undefined;
+    const started = new Promise<void>((resolve) => {
+      begin = resolve;
+    });
+    const intercepted = mock.method(
+      methods,
+      'findMatches',
+      async (...args: Parameters<typeof findMatches>) => {
+        if (args[0] === 'running query') {
+          const signal = args[4];
+          begin();
+          return new Promise<never>((_, reject) => {
+            signal.addEventListener('abort', () => reject(signal.reason), {
+              once: true,
+            });
+          });
+        }
+        return findMatches(...args);
+      }
+    );
+    try {
+      const running = new AbortController();
+      const first = index.search('running query', 20, running.signal);
+      await started;
+      const queued = new AbortController();
+      const dropped = index.search('queued query', 20, queued.signal);
+      const latest = index.search('matrix');
+      queued.abort();
+      await assert.rejects(dropped, { name: 'AbortError' });
+      running.abort();
+      await assert.rejects(first, { name: 'AbortError' });
+      assert.equal((await latest)[0].sourceId, 'tt1');
+      assert.deepEqual(
+        intercepted.mock.calls.map(({ arguments: [query] }) => query),
+        ['running query', 'matrix']
+      );
+    } finally {
+      intercepted.mock.restore();
+    }
+  });
+
   it('does not cache an old search that completes after a refresh', async () => {
     await index.beginImport('imdb');
     await index.writeBatch([movie('tt1', 'The Matrix')]);
@@ -476,7 +537,9 @@ describe('local title search index', () => {
       findMatches: (
         query: string,
         grams: string[],
-        limit: number
+        limit: number,
+        shortNonLatin: boolean,
+        signal: AbortSignal
       ) => Promise<TitleMatch[]>;
     };
     const find = methods.findMatches.bind(index);
@@ -491,8 +554,8 @@ describe('local title search index', () => {
     const spy = mock.method(
       methods,
       'findMatches',
-      async (query: string, grams: string[], limit: number) => {
-        const results = await find(query, grams, limit);
+      async (...args: Parameters<typeof find>) => {
+        const results = await find(...args);
         ready();
         await gate;
         return results;
