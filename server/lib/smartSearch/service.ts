@@ -34,7 +34,23 @@ const rerankCacheLimit = 1024;
 const rerankCacheTtl = 5 * 60 * 1000;
 const denseCacheLimit = 8;
 const denseCacheTtl = 30 * 1000;
+const searchShortlistSize = 30;
+const defaultRerankLimit = 40;
+const maxRerankLimit = 80;
 const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
+
+const rerankLimit = (maximum: number) =>
+  Math.max(
+    1,
+    Math.min(
+      maximum,
+      Number(getSettings().main.smartSearchRerankCandidates) ||
+        defaultRerankLimit
+    )
+  );
+
+const matchKey = ({ document }: SmartMatch) =>
+  `${document.mediaType}:${document.source}:${document.sourceId}`;
 
 /** Keep offline upstream discovery from blocking the local index indefinitely. */
 async function withDeadline<T>(
@@ -78,7 +94,7 @@ export function fuseSmartCandidates(
   let order = 0;
   for (const list of lists)
     list.forEach((item, index) => {
-      const key = `${item.document.mediaType}:${item.document.source}:${item.document.sourceId}`;
+      const key = matchKey(item);
       const existing = entries.get(key);
       if (existing) {
         existing.rank += 1 / (40 + index + 1);
@@ -96,6 +112,53 @@ export function fuseSmartCandidates(
     .sort((a, b) => b.rank - a.rank || a.order - b.order)
     .slice(0, limit)
     .map(({ item, rank }) => ({ ...item, score: rank }));
+}
+
+/** Give each retrieval signal room in the expensive rerank pass. */
+export function searchRerankShortlist(
+  candidates: SmartMatch[],
+  dense: SmartMatch[],
+  words: number,
+  budget: number
+) {
+  // Short queries leave more ambiguity. Keep the configured candidate budget
+  // for those queries and for deliberately small budgets.
+  if (
+    words <= 4 ||
+    budget < defaultRerankLimit ||
+    candidates.length < defaultRerankLimit
+  )
+    return { candidates, limit: budget };
+
+  const firstPage = candidates.slice(0, searchShortlistSize);
+  const topDense = new Set(dense.slice(0, 12).map(matchKey));
+  const kept = new Set(firstPage.slice(0, 15));
+  for (const method of ['lexical', 'tmdb-keyword'] as const) {
+    for (const match of firstPage
+      .filter((item) => item.methods?.includes(method))
+      .slice(0, 3))
+      kept.add(match);
+  }
+  for (const item of firstPage) {
+    if (topDense.has(matchKey(item)) || (item.methods?.length ?? 0) > 1)
+      kept.add(item);
+  }
+  for (const item of firstPage) {
+    if (kept.size >= 20) break;
+    kept.add(item);
+  }
+  const selected = firstPage.filter((item) => kept.has(item));
+  const deeper = candidates.slice(searchShortlistSize, budget);
+  return {
+    candidates: [
+      ...selected,
+      // Keep audience-backed candidates that can rescue overlooked titles.
+      ...deeper,
+      ...firstPage.filter((item) => !kept.has(item)),
+      ...candidates.slice(budget),
+    ],
+    limit: selected.length + deeper.length,
+  };
 }
 
 /** Give each seed a chance in the visible part of the Discover row. */
@@ -373,7 +436,7 @@ export class SmartSearchService {
   private async rerank(
     query: string,
     candidates: SmartMatch[],
-    maxCandidates = 80,
+    maxCandidates = maxRerankLimit,
     timeout = 6000,
     mode: 'search' | 'similar' = 'search',
     signal?: AbortSignal
@@ -388,9 +451,7 @@ export class SmartSearchService {
           .catch(() => undefined);
       return candidates;
     }
-    const configured =
-      Number(getSettings().main.smartSearchRerankCandidates) || 40;
-    const limit = Math.max(1, Math.min(maxCandidates, 80, configured));
+    const limit = rerankLimit(maxCandidates);
     const prefix = candidates.slice(0, limit);
     const docs = prefix.map(({ document }) =>
       mode === 'similar'
@@ -1123,27 +1184,27 @@ export class SmartSearchService {
         [denseMatches, lexical, remoteMatches],
         1000
       );
-      const key = (item: SmartMatch) =>
-        `${item.document.mediaType}:${item.document.source}:${item.document.sourceId}`;
       // Reserve room for both strong dense candidates and high-ranked
       // on-demand metadata candidates; RRF alone over-rewards overlap and
       // can hide an older film that is not yet in the vector index.
       const protectedKeys = new Set(
-        [...denseMatches.slice(0, 20), ...remoteMatches.slice(0, 5)].map(key)
+        [...denseMatches.slice(0, 20), ...remoteMatches.slice(0, 5)].map(
+          matchKey
+        )
       );
       const protectedItems = fused.filter((item) =>
-        protectedKeys.has(key(item))
+        protectedKeys.has(matchKey(item))
       );
-      const extras = fused.filter((item) => !protectedKeys.has(key(item)));
+      const extras = fused.filter((item) => !protectedKeys.has(matchKey(item)));
       const firstPageKeys = new Set(
         [
           ...protectedItems,
-          ...extras.slice(0, Math.max(0, 30 - protectedItems.length)),
-        ].map(key)
+          ...extras.slice(0, searchShortlistSize - protectedItems.length),
+        ].map(matchKey)
       );
       const audienceKeys = new Set(
         denseMatches
-          .filter((item) => !firstPageKeys.has(key(item)))
+          .filter((item) => !firstPageKeys.has(matchKey(item)))
           .map((item) => ({
             item,
             rank:
@@ -1157,14 +1218,15 @@ export class SmartSearchService {
           }))
           .sort((a, b) => b.rank - a.rank)
           .slice(0, 10)
-          .map(({ item }) => key(item))
+          .map(({ item }) => matchKey(item))
       );
       const candidates = [
-        ...fused.filter((item) => firstPageKeys.has(key(item))),
-        ...fused.filter((item) => audienceKeys.has(key(item))),
+        ...fused.filter((item) => firstPageKeys.has(matchKey(item))),
+        ...fused.filter((item) => audienceKeys.has(matchKey(item))),
         ...fused.filter(
           (item) =>
-            !firstPageKeys.has(key(item)) && !audienceKeys.has(key(item))
+            !firstPageKeys.has(matchKey(item)) &&
+            !audienceKeys.has(matchKey(item))
         ),
       ].slice(0, 100);
       // Very short searches often name concepts rather than describing the
@@ -1177,10 +1239,16 @@ export class SmartSearchService {
         wordCount > 0 && wordCount <= 4 && Array.from(query).length <= 60
           ? `A film or series about ${query}`
           : query;
+      const shortlist = searchRerankShortlist(
+        candidates,
+        denseMatches,
+        wordCount,
+        rerankLimit(maxRerankLimit)
+      );
       const reranked = await this.rerank(
         rerankQuery,
-        candidates,
-        80,
+        shortlist.candidates,
+        shortlist.limit,
         6000,
         'search',
         signal
@@ -1190,8 +1258,8 @@ export class SmartSearchService {
         // after the reranker has assessed them. Keep the original retrieval
         // order when the model is disabled, busy, starting, or failed.
         return candidates
-          .filter((item) => firstPageKeys.has(key(item)))
-          .slice(0, 30);
+          .filter((item) => firstPageKeys.has(matchKey(item)))
+          .slice(0, searchShortlistSize);
       }
       // Audience evidence only nudges a relevance ranking; it is capped so
       // unrated and less-known work remains eligible. These scores are ranks,
@@ -1215,7 +1283,7 @@ export class SmartSearchService {
         }))
         .sort((a, b) => b.rank - a.rank || a.order - b.order)
         .map(({ item, rank }) => ({ ...item, score: rank }));
-      return ranked.slice(0, 30);
+      return ranked.slice(0, searchShortlistSize);
     } finally {
       this.unloadWhenIdle();
     }

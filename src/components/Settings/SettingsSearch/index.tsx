@@ -119,7 +119,7 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   rerankTip:
     'Download a separate 396 MB multilingual model when needed to refine search and similar-title results. It requires additional inference memory.',
   rerankStatus: 'Reranker: {phase}',
-  rerankCandidates: 'Candidates to rerank',
+  rerankCandidates: 'Maximum candidates to rerank',
   rerankCandidatesTip:
     'More candidates can improve coverage but take more time and inference resources.',
   rerank20: '20 — faster',

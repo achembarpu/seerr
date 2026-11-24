@@ -1396,7 +1396,9 @@ const TvDetails = ({ tv }: TvDetailsProps) => {
         title={intl.formatMessage(messages.moreLikeThis)}
         url="/api/v1/search/smart/similar"
         extraParams={`mediaType=tv&id=${router.query.tvId}`}
-        hideWhenEmpty
+        loadingMessage={intl.formatMessage(globalMessages.loading)}
+        emptyMessage={() => intl.formatMessage(globalMessages.noresults)}
+        errorMessage={intl.formatMessage(globalMessages.error)}
       />
       <div className="extra-bottom-space relative" />
     </div>

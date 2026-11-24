@@ -75,7 +75,7 @@ const SmartSearch = ({
     genre,
   ].filter(Boolean).length;
   return (
-    <div className="mb-6">
+    <>
       <Button type="button" onClick={() => setShowFilters(true)}>
         <FunnelIcon />
         <span>
@@ -220,7 +220,7 @@ const SmartSearch = ({
           )}
         </div>
       </SlideOver>
-    </div>
+    </>
   );
 };
 export default SmartSearch;

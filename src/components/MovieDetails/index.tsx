@@ -1163,7 +1163,9 @@ const MovieDetails = ({ movie }: MovieDetailsProps) => {
         title={intl.formatMessage(messages.moreLikeThis)}
         url="/api/v1/search/smart/similar"
         extraParams={`mediaType=movie&id=${router.query.movieId}`}
-        hideWhenEmpty
+        loadingMessage={intl.formatMessage(globalMessages.loading)}
+        emptyMessage={() => intl.formatMessage(globalMessages.noresults)}
+        errorMessage={intl.formatMessage(globalMessages.error)}
       />
       <div className="extra-bottom-space relative" />
     </div>

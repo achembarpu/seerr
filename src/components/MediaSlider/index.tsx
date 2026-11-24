@@ -4,7 +4,10 @@ import Slider from '@app/components/Slider';
 import TitleCard from '@app/components/TitleCard';
 import useSettings from '@app/hooks/useSettings';
 import { useUser } from '@app/hooks/useUser';
-import { ArrowRightCircleIcon } from '@heroicons/react/24/outline';
+import {
+  ArrowPathIcon,
+  ArrowRightCircleIcon,
+} from '@heroicons/react/24/outline';
 import { MediaStatus } from '@server/constants/media';
 import { Permission } from '@server/lib/permissions';
 import type {
@@ -35,6 +38,7 @@ interface MediaSliderProps {
   onNewTitles?: (titleCount: number) => void;
   emptyMessage?: (basis: MixedResult['basis']) => string;
   errorMessage?: string;
+  loadingMessage?: string;
 }
 
 const MediaSlider = ({
@@ -48,6 +52,7 @@ const MediaSlider = ({
   onNewTitles,
   emptyMessage,
   errorMessage,
+  loadingMessage,
 }: MediaSliderProps) => {
   const settings = useSettings();
   const { hasPermission } = useUser();
@@ -127,6 +132,7 @@ const MediaSlider = ({
         MediaStatus.BLOCKLISTED
   );
   if (hideWhenEmpty && !visibleTitles.length) return null;
+  const isLoading = !data && !error;
 
   const finalTitles = visibleTitles.slice(0, maxItems).map((title) => {
     switch (title.mediaType) {
@@ -190,9 +196,9 @@ const MediaSlider = ({
 
   return (
     <>
-      <div className="slider-header">
+      <div className="slider-header items-center gap-3 pr-16">
         {linkUrl ? (
-          <Link href={linkUrl} className="slider-title min-w-0 pr-16">
+          <Link href={linkUrl} className="slider-title min-w-0">
             <span className="truncate">{title}</span>
             <ArrowRightCircleIcon />
           </Link>
@@ -200,6 +206,18 @@ const MediaSlider = ({
           <div className="slider-title">
             <span>{title}</span>
           </div>
+        )}
+        {isLoading && loadingMessage && (
+          <span
+            role="status"
+            className="flex items-center gap-1.5 text-sm text-gray-400"
+          >
+            <ArrowPathIcon
+              className="size-4 animate-spin motion-reduce:animate-none"
+              aria-hidden="true"
+            />
+            <span className="sr-only sm:not-sr-only">{loadingMessage}</span>
+          </span>
         )}
       </div>
       <div
@@ -214,7 +232,7 @@ const MediaSlider = ({
         ) : (
           <Slider
             sliderKey={sliderKey}
-            isLoading={!data && !error}
+            isLoading={isLoading}
             isEmpty={!!emptyMessage && !!data && finalTitles.length === 0}
             emptyMessage={emptyMessage?.(data?.[0]?.basis)}
             items={finalTitles}

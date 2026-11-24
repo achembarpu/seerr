@@ -246,6 +246,7 @@ const Discover = () => {
                   sliderKey="smart-recommendations"
                   title={intl.formatMessage(sliderTitles.smartRecommendations)}
                   url="/api/v1/search/smart/recommendations"
+                  loadingMessage={intl.formatMessage(globalMessages.loading)}
                   emptyMessage={(basis) =>
                     intl.formatMessage(
                       basis === 'none'

@@ -1,3 +1,4 @@
+import Button from '@app/components/Common/Button';
 import Tooltip from '@app/components/Common/Tooltip';
 import { genres } from '@app/i18n/mediaGenres';
 import defineMessages from '@app/utils/defineMessages';
@@ -63,30 +64,30 @@ const MatchReason = ({
 
   return (
     <Tooltip
-      className="max-w-60 whitespace-normal"
       tooltipConfig={{
         followCursor: false,
-        placement: 'top-end',
-        offset: [0, 6],
+        placement: 'bottom-end',
+        offset: [0, 8],
         trigger: isTouch ? 'click' : ['hover', 'focus'],
       }}
       content={
-        <>
-          <p>{primary}</p>
+        <div className="max-w-56 whitespace-normal leading-snug">
+          <p className="font-medium">{primary}</p>
           {!!commonGenres.length && (
-            <p className="mt-0.5 text-xs text-gray-300">
+            <p className="mt-1 text-xs text-gray-400">
               {intl.formatMessage(messages.genres, {
                 genres: intl.formatList(commonGenres),
               })}
             </p>
           )}
-        </>
+        </div>
       }
     >
-      <button
+      <Button
         type="button"
+        buttonSize="sm"
         aria-label={intl.formatMessage(messages.label, { title })}
-        className="relative z-40 flex size-7 items-center justify-center rounded-full bg-gray-900/85 text-gray-200 shadow-sm ring-1 ring-white/20 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-400"
+        className="relative z-40 size-7 rounded-full p-0"
         onClick={(event) => event.stopPropagation()}
         onKeyDown={(event) => {
           if (event.key === 'Enter' || event.key === ' ')
@@ -94,7 +95,7 @@ const MatchReason = ({
         }}
       >
         <InformationCircleIcon className="size-4" aria-hidden="true" />
-      </button>
+      </Button>
     </Tooltip>
   );
 };

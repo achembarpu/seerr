@@ -11,8 +11,10 @@ import {
   balanceRecommendationPools,
   ratingEvidence,
   relatedPrior,
+  searchRerankShortlist,
   storyMatchPenalty,
 } from './service';
+import type { SmartMatch } from './store';
 import { SmartStore, documentHash } from './store';
 import type { MetadataSource, SmartDocument } from './types';
 import { quantize } from './vectors';
@@ -38,6 +40,33 @@ const waitFor = async (condition: () => boolean) => {
   }
   throw new Error('Timed out waiting for indexing');
 };
+
+it('keeps independently strong plot matches and spends the full budget on short queries', () => {
+  const candidates: SmartMatch[] = Array.from({ length: 45 }, (_, index) => ({
+    document: { ...document, sourceId: String(index) },
+    score: 1 / (index + 1),
+    methods: ['semantic'],
+  }));
+  candidates[26].methods = ['semantic', 'lexical'];
+  candidates[27].methods = ['tmdb-keyword'];
+  candidates[28].methods = ['lexical'];
+  const dense = [candidates[29]];
+  const plot = searchRerankShortlist(candidates, dense, 8, 40);
+  const judged = plot.candidates.slice(0, plot.limit);
+
+  assert.equal(plot.limit, 30);
+  for (const item of candidates.slice(26, 40)) assert.ok(judged.includes(item));
+  assert.equal(judged.includes(candidates[25]), false);
+  assert.deepEqual(new Set(plot.candidates), new Set(candidates));
+  assert.deepEqual(searchRerankShortlist(candidates, dense, 2, 40), {
+    candidates,
+    limit: 40,
+  });
+  assert.deepEqual(searchRerankShortlist(candidates, dense, 8, 24), {
+    candidates,
+    limit: 24,
+  });
+});
 
 it('gives different seeds visible recommendations without repeating shared matches', () => {
   const shared = {

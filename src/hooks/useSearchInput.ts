@@ -24,7 +24,7 @@ const useSearchInput = (): SearchObject => {
   const [lastRoute, setLastRoute] = useState<Nullable<Url>>(null);
   const [searchValue, debouncedValue, setSearchValue] = useDebouncedState(
     (router.query.query as string) ?? '',
-    150
+    250
   );
 
   /**
