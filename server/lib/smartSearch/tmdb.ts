@@ -147,20 +147,18 @@ export class TmdbMetadataSource implements MetadataSource {
     if (!terms.length) return [];
     // TMDB's keyword search is fuzzy and related compounds may occur on later
     // pages. Keep prefix-related keyword names rather than unrelated spellings.
-    const keywordPages = await Promise.allSettled(
-      terms.flatMap((term) =>
-        [1, 2, 3].map((page) => this.tmdb.searchKeyword({ query: term, page }))
-      )
-    );
-    const keywordGroups = terms
-      .map((term, i) => {
+    const groups = await Promise.all(
+      terms.map(async (term) => {
+        const keywordPages = await Promise.allSettled(
+          [1, 2, 3].map((page) =>
+            this.tmdb.searchKeyword({ query: term, page })
+          )
+        );
         const root = term.length > 4 ? term.replace(/s$/u, '') : term;
-        const candidates = keywordPages
-          .slice(i * 3, i * 3 + 3)
-          .flatMap((page) =>
-            page.status === 'fulfilled' ? page.value.results : []
-          );
-        return [
+        const candidates = keywordPages.flatMap((page) =>
+          page.status === 'fulfilled' ? page.value.results : []
+        );
+        const keywords = [
           ...new Map(
             candidates
               .filter((item) =>
@@ -173,33 +171,34 @@ export class TmdbMetadataSource implements MetadataSource {
           .slice(0, 5)
           .map((item) => item.id)
           .join('|');
+        if (!keywords) return [];
+        const opts = {
+          keywords,
+          language,
+          page: 1,
+          sortBy: 'popularity.desc' as const,
+          originalLanguage: filters.language,
+          genre: filters.genre?.toString(),
+          voteAverageGte: filters.minRating?.toString(),
+          voteCountGte: filters.minVotes?.toString(),
+        };
+        // Start this term's discovery as soon as its keywords are ready.
+        // Promise.all preserves the original term and media-type order.
+        return Promise.allSettled([
+          ...(!filters.mediaType || filters.mediaType === 'movie'
+            ? [this.tmdb.getDiscoverMovies({ ...opts, includeVideo: false })]
+            : []),
+          ...(!filters.mediaType || filters.mediaType === 'tv'
+            ? [this.tmdb.getDiscoverTv(opts)]
+            : []),
+        ]);
       })
-      .filter(Boolean);
-    if (!keywordGroups.length) return [];
-    const requests = keywordGroups.flatMap((keywords) => {
-      const opts = {
-        keywords,
-        language,
-        page: 1,
-        sortBy: 'popularity.desc' as const,
-        originalLanguage: filters.language,
-        genre: filters.genre?.toString(),
-        voteAverageGte: filters.minRating?.toString(),
-        voteCountGte: filters.minVotes?.toString(),
-      };
-      return [
-        ...(!filters.mediaType || filters.mediaType === 'movie'
-          ? [this.tmdb.getDiscoverMovies({ ...opts, includeVideo: false })]
-          : []),
-        ...(!filters.mediaType || filters.mediaType === 'tv'
-          ? [this.tmdb.getDiscoverTv(opts)]
-          : []),
-      ];
-    });
-    const responses = await Promise.allSettled(requests);
-    const lists = responses.map((response) =>
-      response.status === 'fulfilled' ? response.value.results : []
     );
+    const lists = groups
+      .flat()
+      .map((response) =>
+        response.status === 'fulfilled' ? response.value.results : []
+      );
     const documents: SmartDocument[] = [];
     for (let i = 0; i < 20; i++)
       for (const list of lists) {

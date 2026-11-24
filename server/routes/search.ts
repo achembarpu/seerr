@@ -248,7 +248,7 @@ searchRoutes.get('/suggestions', async (req, res) => {
     const tmdb = new TheMovieDb();
     const language = (req.query.language as string) ?? req.locale;
     const localCards = new Map<string, MediaCard>();
-    await Promise.all(
+    const indexedCardsReady = Promise.all(
       (['movie', 'tv'] as const).map(async (type) => {
         const ids = matches
           .filter(
@@ -275,13 +275,14 @@ searchRoutes.get('/suggestions', async (req, res) => {
       offset += 20
     ) {
       const batch = matches.slice(offset, offset + 20);
-      const resolved = await Promise.allSettled(
-        batch.map(async (match): Promise<MediaCard | false> => {
+      const resolved = batch
+        .map(async (match): Promise<MediaCard | false> => {
           const { source, mediaType, sourceId } = match;
           const id = `${mediaType}:${sourceId}`;
           const key = JSON.stringify([language, source, id]);
           const cached = titleCards.get(key);
           if (cached !== undefined) return cached;
+          if (source !== 'imdb') await indexedCardsReady;
           const local = source !== 'imdb' ? localCards.get(id) : undefined;
           // The indexed card is already current enough for search and needs no
           // per-title request. Don't cache it independently of the index.
@@ -321,10 +322,10 @@ searchRoutes.get('/suggestions', async (req, res) => {
           titleCards.set(key, card, card ? undefined : { ttl: 5 * 60 * 1000 });
           return card;
         })
-      );
-      for (const [index, value] of resolved.entries()) {
-        if (value.status !== 'fulfilled' || !value.value) continue;
-        const card = value.value;
+        .map((lookup) => lookup.catch(() => false as const));
+      for (const [index, result] of resolved.entries()) {
+        const card = await result;
+        if (!card) continue;
         const key = `${card.mediaType}:${card.id}`;
         if (seen.has(key)) continue;
         seen.add(key);

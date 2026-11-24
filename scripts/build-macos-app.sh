@@ -15,7 +15,7 @@ fi
 if [[ $# -gt 0 ]]; then
   echo "Usage: $0 [--install [absolute-install-path.app]]" >&2; exit 1
 fi
-for tool in node pnpm git cmake swiftc curl shasum ditto sips python3 codesign vtool zip; do
+for tool in node pnpm git cmake clang swiftc curl shasum ditto sips python3 codesign vtool zip; do
   command -v "$tool" >/dev/null || { echo "Missing build tool: $tool" >&2; exit 1; }
 done
 export MACOSX_DEPLOYMENT_TARGET=13.5
@@ -69,6 +69,17 @@ CLANG_MODULE_CACHE_PATH="$work/swift-cache" swiftc -target arm64-apple-macos13.5
   native/macos/Seerr.swift -o "$app/Contents/MacOS/Seerr"
 cp "$work/node-v$node_version-darwin-arm64/bin/node" "$resources/runtime/node"
 cp "$llama" "$resources/runtime/llama-server"
+
+# Use the pinned sqlite3 package's headers. The macOS SDK's headers disable
+# dynamic extension declarations for its separate system SQLite build.
+sqlite_deps="$(node -p 'require("path").dirname(require.resolve("sqlite3/package.json"))')/deps"
+mkdir -p "$work/sqlite-headers"
+sqlite_archive=("$sqlite_deps"/sqlite-autoconf-*.tar.gz)
+tar -xzf "${sqlite_archive[0]}" -C "$work/sqlite-headers" --strip-components 1 \
+  --include '*/sqlite3.h' --include '*/sqlite3ext.h'
+clang -O3 -Wall -Wextra -Werror -dynamiclib -arch arm64 -mmacosx-version-min=13.5 \
+  -march=armv8.2-a+dotprod -I"$work/sqlite-headers" \
+  native/search/seerrvectors.c -o "$resources/runtime/seerrvectors.dylib"
 cp package.json next.config.mjs seerr-api.yml "$resources/app/"
 ditto dist "$resources/app/dist"
 ditto public "$resources/app/public"
@@ -89,7 +100,7 @@ if not version or parts > (13, 5, 0):
     raise SystemExit(f'{name} requires macOS {version or "unknown"}; expected 13.5 or earlier')
 PYTHON
 }
-for executable in "$app/Contents/MacOS/Seerr" "$resources/runtime/node" "$resources/runtime/llama-server"; do
+for executable in "$app/Contents/MacOS/Seerr" "$resources/runtime/node" "$resources/runtime/llama-server" "$resources/runtime/seerrvectors.dylib"; do
   check_minimum "$executable"
 done
 while IFS= read -r -d '' executable; do

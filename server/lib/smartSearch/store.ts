@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'crypto';
+import { endianness } from 'node:os';
 import sqlite3 from 'sqlite3';
 import type { SmartDocument, SmartFilters, SmartMediaType } from './types';
 import { prepareCosine } from './vectors';
@@ -75,6 +76,13 @@ const denseVoteBonuses = Array.from(
   (_, votes) => 0.015 * (Math.log1p(votes) / Math.log(1001))
 );
 
+const nativeVoteBonuses = Buffer.from(
+  Float64Array.from(denseVoteBonuses).buffer
+);
+const littleEndian = endianness() === 'LE';
+
+type DenseHit = { id: number; score: number };
+
 export class SmartStore {
   private db: sqlite3.Database;
   private lexicalTask?: Promise<void>;
@@ -88,9 +96,20 @@ export class SmartStore {
   private readonly documentVersionId = randomUUID();
   private documentRevision = 0;
   private activeDocumentWrites = 0;
-  constructor(private readonly filename: string) {
+  private canLoadVectorExtension = true;
+  private vectorExtensionLoaded = false;
+  constructor(
+    private readonly filename: string,
+    private readonly vectorExtension = process.env.SEERR_VECTOR_EXTENSION
+  ) {
     this.db = new sqlite3.Database(filename);
   }
+  get vectorBackend() {
+    return this.vectorExtensionLoaded && this.canLoadVectorExtension
+      ? 'sqlite'
+      : 'javascript';
+  }
+
   private run(
     sql: string,
     params: (string | number | Buffer | null)[] = [],
@@ -102,7 +121,7 @@ export class SmartStore {
   }
   private all<T>(
     sql: string,
-    params: (string | number)[] = [],
+    params: (string | number | Buffer)[] = [],
     db = this.db
   ): Promise<T[]> {
     return new Promise((resolve, reject) =>
@@ -470,6 +489,105 @@ export class SmartStore {
     );
     return rows.map(({ document }) => JSON.parse(document) as SmartDocument);
   }
+  private async nativeSearch(
+    snapshot: sqlite3.Database,
+    vectors: readonly Buffer[],
+    conditions: string[],
+    filters: (string | number)[],
+    limit: number,
+    signal?: AbortSignal
+  ): Promise<DenseHit[][] | undefined> {
+    const extension = this.vectorExtension;
+    if (
+      !extension ||
+      !this.canLoadVectorExtension ||
+      limit > 1024 ||
+      vectors.length > 8 ||
+      vectors.some((vector) => !vector.length || vector.length > 4096)
+    )
+      return undefined;
+    try {
+      await new Promise<void>((resolve, reject) =>
+        snapshot.loadExtension(extension, (error) =>
+          error ? reject(error) : resolve()
+        )
+      );
+    } catch {
+      // Keep the portable path available on builds without extension support.
+      this.canLoadVectorExtension = false;
+      return undefined;
+    }
+    this.vectorExtensionLoaded = true;
+    signal?.throwIfAborted();
+    const interrupt = () => snapshot.interrupt();
+    signal?.addEventListener('abort', interrupt, { once: true });
+    try {
+      const expressions = vectors.map(
+        (_, index) =>
+          `seerr_top(?, ?, vector, seerr_votes(?, voteCount), id) AS hits${index}`
+      );
+      const [row] = await this.all<Record<string, Buffer | null>>(
+        `SELECT ${expressions.join(', ')} FROM smart_documents WHERE ${conditions.join(' AND ')}`,
+        [
+          ...vectors.flatMap((vector) => [vector, limit, nativeVoteBonuses]),
+          0,
+          ...filters,
+        ],
+        snapshot
+      );
+      signal?.throwIfAborted();
+      return vectors.map((_, index) => {
+        const result = row[`hits${index}`];
+        const hits: DenseHit[] = [];
+        if (result) {
+          for (let offset = 0; offset < result.length; offset += 16) {
+            hits.push({
+              id: Number(
+                littleEndian
+                  ? result.readBigInt64LE(offset)
+                  : result.readBigInt64BE(offset)
+              ),
+              score: littleEndian
+                ? result.readDoubleLE(offset + 8)
+                : result.readDoubleBE(offset + 8),
+            });
+          }
+        }
+        return hits;
+      });
+    } catch (error) {
+      signal?.throwIfAborted();
+      throw error;
+    } finally {
+      signal?.removeEventListener('abort', interrupt);
+    }
+  }
+
+  private async loadDenseDocuments(
+    hits: DenseHit[][],
+    snapshot: sqlite3.Database
+  ): Promise<SmartMatch[][]> {
+    const documents = new Map<number, SmartDocument>();
+    const ids = [
+      ...new Set(hits.flatMap((group) => group.map(({ id }) => id))),
+    ];
+    for (let start = 0; start < ids.length; start += 500) {
+      const batch = ids.slice(start, start + 500);
+      const rows = await this.all<Pick<Row, 'id' | 'document'>>(
+        `SELECT id, document FROM smart_documents WHERE id IN (${batch.map(() => '?').join(',')})`,
+        batch,
+        snapshot
+      );
+      rows.forEach((row) => documents.set(row.id, JSON.parse(row.document)));
+    }
+    return hits.map((group) =>
+      group.flatMap(({ id, score }) => {
+        const document = documents.get(id);
+        return document ? [{ document, score }] : [];
+      })
+    );
+  }
+
   async search(
     vector: Buffer,
     filters: SmartFilters = {},
@@ -548,6 +666,17 @@ export class SmartStore {
         );
         params.push(filters.genre);
       }
+      if (!transient) {
+        const native = await this.nativeSearch(
+          snapshot,
+          vectors,
+          conditions,
+          params,
+          limit,
+          signal
+        );
+        if (native) return await this.loadDenseDocuments(native, snapshot);
+      }
       let after = 0;
       const queries = vectors.map((vector) => ({
         score: prepareCosine(vector),
@@ -613,24 +742,9 @@ export class SmartStore {
             score,
           }))
         );
-      const documents = new Map<number, SmartDocument>();
-      const ids = [
-        ...new Set(queries.flatMap(({ best }) => best.map(({ id }) => id))),
-      ];
-      for (let start = 0; start < ids.length; start += 500) {
-        const batch = ids.slice(start, start + 500);
-        const rows = await this.all<Pick<Row, 'id' | 'document'>>(
-          `SELECT id, document FROM smart_documents WHERE id IN (${batch.map(() => '?').join(',')})`,
-          batch,
-          snapshot
-        );
-        rows.forEach((row) => documents.set(row.id, JSON.parse(row.document)));
-      }
-      return queries.map(({ best }) =>
-        best.flatMap(({ id, score }) => {
-          const document = documents.get(id);
-          return document ? [{ document, score }] : [];
-        })
+      return await this.loadDenseDocuments(
+        queries.map(({ best }) => best),
+        snapshot
       );
     } finally {
       try {

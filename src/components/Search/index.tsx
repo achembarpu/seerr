@@ -31,8 +31,6 @@ const messages = defineMessages('components.Search', {
   searchresults: 'Search Results',
   titleMatches: 'Title matches',
   descriptionMatches: 'Matches by description',
-  searchDescriptions: 'Search descriptions',
-  hideDescriptions: 'Hide description matches',
   moreTitles: 'Load more title matches',
   noTitleMatches: 'No matching titles.',
   noDescriptionMatches: 'No additional matches by description.',
@@ -44,6 +42,8 @@ const messages = defineMessages('components.Search', {
     'Information courtesy of IMDb (https://www.imdb.com). Used with permission.',
 });
 
+const words = new Intl.Segmenter(undefined, { granularity: 'word' });
+
 const SearchResults = ({
   query,
   filters,
@@ -54,23 +54,24 @@ const SearchResults = ({
   const intl = useIntl();
   const settings = useSettings();
   const { hasPermission } = useUser();
-  const [requestedDescriptions, setRequestedDescriptions] = useState(false);
   const [settled, setSettled] = useState(false);
   const [titleDeadline, setTitleDeadline] = useState(false);
   const directLookup = isDirectLookup(query);
+  const longQuery =
+    [...words.segment(query)].filter((word) => word.isWordLike).length >= 6;
   const canSearchDescriptions =
     settings.currentSettings.smartSearch &&
     !directLookup &&
     filters.type !== 'person';
   useEffect(() => {
     if (!canSearchDescriptions) return;
-    const settle = setTimeout(() => setSettled(true), 400);
-    const deadline = setTimeout(() => setTitleDeadline(true), 900);
+    const settle = setTimeout(() => setSettled(true), longQuery ? 180 : 350);
+    const deadline = setTimeout(() => setTitleDeadline(true), 750);
     return () => {
       clearTimeout(settle);
       clearTimeout(deadline);
     };
-  }, [canSearchDescriptions]);
+  }, [canSearchDescriptions, longQuery]);
 
   const {
     firstResultData,
@@ -123,8 +124,9 @@ const SearchResults = ({
     (isLoadingInitialData && !firstResultData) || fuzzyLoading;
   const searchDescriptions =
     canSearchDescriptions &&
-    (requestedDescriptions ||
-      (!ranked.confident && settled && (!titlesLoading || titleDeadline)));
+    !ranked.confident &&
+    settled &&
+    (longQuery || !titlesLoading || titleDeadline);
   const params = new URLSearchParams({ query });
   for (const [key, value] of Object.entries({
     mediaType: filters.type,
@@ -190,20 +192,6 @@ const SearchResults = ({
         <h3 id="title-matches" className="slider-title">
           {intl.formatMessage(messages.titleMatches)}
         </h3>
-        {canSearchDescriptions && ranked.confident && (
-          <Button
-            buttonType="ghost"
-            buttonSize="sm"
-            aria-expanded={requestedDescriptions}
-            onClick={() => setRequestedDescriptions(!requestedDescriptions)}
-          >
-            {intl.formatMessage(
-              requestedDescriptions
-                ? messages.hideDescriptions
-                : messages.searchDescriptions
-            )}
-          </Button>
-        )}
       </div>
       {(error || fuzzyError) && (
         <Alert type="warning">

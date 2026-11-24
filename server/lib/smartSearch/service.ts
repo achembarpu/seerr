@@ -282,6 +282,7 @@ export class SmartSearchService {
       devices: this.engine.devices ?? [],
       externalAvailable: this.engine.externalAvailable ?? false,
       activeDevice: this.engine.activeDevice,
+      vectorBackend: this.store?.vectorBackend,
       deviceWarning: this.engine.deviceWarning,
       lexical: this.lexicalStatus(),
       retrievalWarning: this.retrievalWarning,

@@ -672,3 +672,65 @@ it('returns the same filtered rankings for separate and batched query vectors', 
     await store.close();
   }
 });
+
+it(
+  'uses native SQLite ranking with the same scores, filters and stable ties',
+  { skip: !process.env.SEERR_TEST_VECTOR_EXTENSION },
+  async () => {
+    const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-native-'));
+    const filename = path.join(directory, 'store.sqlite3');
+    const portable = new SmartStore(filename, '');
+    const native = new SmartStore(
+      filename,
+      process.env.SEERR_TEST_VECTOR_EXTENSION
+    );
+    const unavailable = new SmartStore(
+      filename,
+      path.join(directory, 'missing.dylib')
+    );
+    try {
+      await portable.initialize();
+      const vectors = [
+        [1, 0, -1],
+        [0, 1, -1],
+        [-1, 0, 1],
+        [1, 0, 0],
+      ].map(quantize);
+      await portable.upsertBatch(
+        Array.from({ length: 50 }, (_, index) => ({
+          document: doc(String(index), {
+            originalLanguage: index % 2 ? 'en' : 'fr',
+            voteCount: (index % 7) * 123,
+          }),
+          vector: vectors[index % vectors.length],
+        }))
+      );
+      const expected = await portable.searchMany(
+        vectors,
+        { language: 'en' },
+        6
+      );
+      assert.deepEqual(
+        await native.searchMany(vectors, { language: 'en' }, 6),
+        expected
+      );
+      assert.equal(native.vectorBackend, 'sqlite');
+      assert.deepEqual(
+        await native.searchMany(vectors, { language: 'ko' }, 6),
+        [[], [], [], []]
+      );
+      assert.deepEqual(
+        await unavailable.searchMany(vectors, { language: 'en' }, 6),
+        expected
+      );
+      assert.equal(unavailable.vectorBackend, 'javascript');
+    } finally {
+      await Promise.all([
+        portable.close(),
+        native.close(),
+        unavailable.close(),
+      ]);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+);
