@@ -559,6 +559,103 @@ describe('smart search lifecycle', () => {
     }
   });
 
+  it('splits large change windows, resumes settled pages, and replays an interrupted current day', async () => {
+    const store = new SmartStore(':memory:');
+    await store.initialize();
+    const day = (offset: number) =>
+      new Date(Date.now() + offset * 86400000).toISOString().slice(0, 10);
+    const from = day(-3);
+    const splitThrough = day(-2);
+    const yesterday = day(-1);
+    const today = day(0);
+    await store.setState('lastUpdated', from);
+    const calls: [string, string, string, number][] = [];
+    let failSettled = true;
+    let failToday = true;
+    const source: MetadataSource = {
+      id: 'tmdb',
+      async fetchOne() {
+        throw new Error('No details expected');
+      },
+      async fetchPage() {
+        throw new Error('Unexpected historical scan');
+      },
+      async fetchChanges(mediaType, start, end, page) {
+        calls.push([mediaType, start, end, page]);
+        if (start === from && end === yesterday)
+          return { totalPages: 501, ids: [] };
+        if (mediaType === 'movie' && page === 2) {
+          if (start === from && failSettled) {
+            failSettled = false;
+            throw new Error('Settled page unavailable');
+          }
+          if (start === today && failToday) {
+            failToday = false;
+            throw new Error('Current page unavailable');
+          }
+        }
+        return {
+          totalPages:
+            mediaType === 'movie' && (start === from || start === today)
+              ? 2
+              : 1,
+          ids: [],
+        };
+      },
+    };
+    const engine = {
+      phase: 'idle' as const,
+      downloadBytes: 0,
+      downloadTotal: 0,
+      async start() {},
+      stop() {},
+      async embed() {
+        throw new Error('Unexpected embedding');
+      },
+    };
+    const service = new SmartSearchService(
+      () => true,
+      engine,
+      source,
+      () => store
+    );
+    try {
+      assert.equal(service.refreshNow(), true);
+      await waitFor(() => !service.status().indexing);
+      assert.equal(service.status().error, 'Settled page unavailable');
+      assert.deepEqual(calls.splice(0), [
+        ['movie', from, yesterday, 1],
+        ['movie', from, splitThrough, 1],
+        ['movie', from, splitThrough, 2],
+      ]);
+
+      assert.equal(service.refreshNow(), true);
+      await waitFor(() => !service.status().indexing);
+      assert.equal(service.status().error, 'Current page unavailable');
+      assert.deepEqual(calls.splice(0), [
+        ['movie', from, splitThrough, 2],
+        ['tv', from, splitThrough, 1],
+        ['movie', yesterday, yesterday, 1],
+        ['tv', yesterday, yesterday, 1],
+        ['movie', today, today, 1],
+        ['movie', today, today, 2],
+      ]);
+
+      assert.equal(service.refreshNow(), true);
+      await waitFor(() => !service.status().indexing);
+      assert.equal(service.status().error, undefined);
+      assert.deepEqual(calls, [
+        ['movie', today, today, 1],
+        ['movie', today, today, 2],
+        ['tv', today, today, 1],
+      ]);
+      assert.equal(await store.getState('changesCursor'), '');
+      assert.equal(await store.getState('lastUpdated'), today);
+    } finally {
+      await service.close();
+    }
+  });
+
   it('reconciles one settled change page before resuming a historical scan', async () => {
     const directory = await mkdtemp(
       path.join(os.tmpdir(), 'smart-backfill-changes-')

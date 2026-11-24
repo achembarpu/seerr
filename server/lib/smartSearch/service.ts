@@ -32,9 +32,17 @@ type Cursor = {
   page: number;
 };
 type CatalogPage = Awaited<ReturnType<MetadataSource['fetchPage']>>;
+type ChangesCursor = {
+  date: string;
+  through?: string;
+  mediaType: SmartMediaType;
+  page: number;
+};
 const firstYear = 1870;
 const interval = 24 * 60 * 60 * 1000;
 const retryInterval = 60 * 60 * 1000;
+const changeWindowDays = 3;
+const maxChangePages = 500;
 const changeFetchConcurrency = 4;
 const changeFetchInterval = 250;
 const rerankCacheLimit = 1024;
@@ -44,6 +52,11 @@ const denseCacheTtl = 30 * 1000;
 const searchShortlistSize = 30;
 const defaultRerankLimit = 40;
 const maxRerankLimit = 80;
+
+const shiftDay = (date: string, days: number) =>
+  new Date(Date.parse(`${date}T00:00:00Z`) + days * interval)
+    .toISOString()
+    .slice(0, 10);
 const searchFallbackTimeout = 550;
 const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 
@@ -868,9 +881,10 @@ export class SmartSearchService {
     if (changed.length && this.engine.phase !== 'ready')
       await this.startEngine();
     const fresh = new Map<string, Buffer>();
-    for (let offset = 0; offset < changed.length; offset += 8) {
+    const batchSize = this.engine.activeDevice?.startsWith('MTL') ? 16 : 8;
+    for (let offset = 0; offset < changed.length; offset += batchSize) {
       signal.throwIfAborted();
-      const part = changed.slice(offset, offset + 8);
+      const part = changed.slice(offset, offset + batchSize);
       const embeddings = await this.engine.embed(
         part.map(({ text }) => text),
         signal
@@ -906,29 +920,50 @@ export class SmartSearchService {
     if (!this.source.fetchChanges)
       throw new Error('Source does not support incremental updates');
     const today = new Date().toISOString().slice(0, 10);
+    const yesterday = shiftDay(today, -1);
     // Reconcile settled days a page at a time while the historical scan runs.
-    const through = duringBackfill
-      ? new Date(Date.parse(`${today}T00:00:00Z`) - interval)
-          .toISOString()
-          .slice(0, 10)
-      : today;
-    if (since > through) return;
+    const deadline = duringBackfill ? yesterday : today;
+    if (since > deadline) return;
+    const firstPage = (date: string): ChangesCursor => {
+      const cursor: ChangesCursor = { date, mediaType: 'movie', page: 1 };
+      if (duringBackfill || date >= yesterday) return cursor;
+      const end = shiftDay(date, changeWindowDays - 1);
+      return { ...cursor, through: end < yesterday ? end : yesterday };
+    };
     const saved = await store.getState('changesCursor');
-    let cursor: { date: string; mediaType: SmartMediaType; page: number } =
-      saved ? JSON.parse(saved) : { date: since, mediaType: 'movie', page: 1 };
-    while (cursor.date <= through) {
+    let cursor: ChangesCursor = saved ? JSON.parse(saved) : firstPage(since);
+    // Today is still changing. Resume it from page one because a page number
+    // can point to different titles after new changes arrive.
+    if (cursor.date === today) cursor = firstPage(today);
+    signal.throwIfAborted();
+    // Older checkpoints without a range still describe one calendar day.
+    await store.setState('changesCursor', JSON.stringify(cursor));
+    while (cursor.date <= deadline) {
       signal.throwIfAborted();
+      const end = cursor.through ?? cursor.date;
+      const openDay = cursor.date === today;
       const batch = await this.source.fetchChanges(
         cursor.mediaType,
         cursor.date,
-        cursor.date,
+        end,
         cursor.page,
         signal
       );
-      if (batch.totalPages > 500)
+      if (batch.totalPages > maxChangePages) {
+        if (end > cursor.date) {
+          const days = (Date.parse(end) - Date.parse(cursor.date)) / interval;
+          cursor = {
+            ...cursor,
+            through: shiftDay(cursor.date, Math.floor(days / 2)),
+            page: 1,
+          };
+          await store.setState('changesCursor', JSON.stringify(cursor));
+          continue;
+        }
         throw new Error(
-          `Too many changes for ${cursor.date}; a full reconciliation is required.`
+          `Too many changes for ${cursor.date}; use Rescan catalog to reconcile the index.`
         );
+      }
       const documents: SmartDocument[] = [];
       const removed: string[] = [];
       const ids = [...new Set(batch.ids)];
@@ -964,17 +999,13 @@ export class SmartSearchService {
         cursor = { ...cursor, page: cursor.page + 1 };
       else if (cursor.mediaType === 'movie')
         cursor = { ...cursor, mediaType: 'tv', page: 1 };
-      else
-        cursor = {
-          date: new Date(Date.parse(`${cursor.date}T00:00:00Z`) + 86400000)
-            .toISOString()
-            .slice(0, 10),
-          mediaType: 'movie',
-          page: 1,
-        };
-      await store.setState('changesCursor', JSON.stringify(cursor));
+      else cursor = firstPage(shiftDay(end, 1));
+      // A settled window is stable across restarts. Keep today's checkpoint
+      // at its first page while advancing through it in memory.
+      if (!openDay)
+        await store.setState('changesCursor', JSON.stringify(cursor));
       await this.updateCount(store);
-      if (duringBackfill && cursor.date <= through) return;
+      if (duringBackfill && cursor.date <= deadline) return;
     }
     await store.setStates({ lastUpdated: today, changesCursor: '' });
   }
