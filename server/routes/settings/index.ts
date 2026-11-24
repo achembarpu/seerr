@@ -160,8 +160,8 @@ settingsRoutes.get('/smart-search', (_req, res) => {
   res.status(200).json(smartSearch.status());
 });
 
-settingsRoutes.post('/smart-search/refresh', (_req, res) => {
-  if (!smartSearch.refreshNow())
+settingsRoutes.post('/smart-search/refresh', (req, res) => {
+  if (!smartSearch.refreshNow(req.query.mode === 'rescan'))
     return res
       .status(409)
       .json({ message: 'Smart search is disabled or already indexing.' });

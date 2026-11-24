@@ -62,9 +62,9 @@ final class SeerrApplication: NSObject, NSApplicationDelegate {
                 fail("Port \(portNumber) is already in use. Stop the other service or set SEERR_NATIVE_PORT before launching Seerr.")
                 return
             }
-            guard let resources = Bundle.main.resourceURL else { throw NSError(domain: "Seerr", code: 1) }
-            let applicationDirectory = resources.appendingPathComponent("app", isDirectory: true)
-            let runtimeDirectory = try prepareRuntime(applicationDirectory)
+            guard let serverURL = Bundle.main.url(forAuxiliaryExecutable: "SeerrServer") else {
+                throw NSError(domain: "Seerr", code: 1)
+            }
             let logURL = dataDirectory.appendingPathComponent("logs/native-launcher.log")
             if !FileManager.default.fileExists(atPath: logURL.path) {
                 FileManager.default.createFile(atPath: logURL.path, contents: nil)
@@ -72,16 +72,9 @@ final class SeerrApplication: NSObject, NSApplicationDelegate {
             let log = try FileHandle(forWritingTo: logURL)
             try log.seekToEnd()
             let server = Process()
-            server.executableURL = resources.appendingPathComponent("runtime/node")
-            server.arguments = [applicationDirectory.appendingPathComponent("dist/index.js").path]
-            server.currentDirectoryURL = runtimeDirectory
+            server.executableURL = serverURL
             var variables = environment
-            variables["NODE_ENV"] = "production"
-            variables["NEXT_TELEMETRY_DISABLED"] = "1"
             variables["CONFIG_DIRECTORY"] = dataDirectory.path
-            variables["SEERR_LLAMA_SERVER"] = resources.appendingPathComponent("runtime/llama-server").path
-            variables["SEERR_NATIVE_METAL_RERANK"] = "1"
-            variables["SEERR_VECTOR_EXTENSION"] = resources.appendingPathComponent("runtime/seerrvectors.dylib").path
             variables["PORT"] = String(portNumber)
             variables["HOST"] = environment["SEERR_NATIVE_HOST"] ??
                 (UserDefaults.standard.bool(forKey: "allowNetworkAccess") ? "0.0.0.0" : "127.0.0.1")
@@ -101,35 +94,6 @@ final class SeerrApplication: NSObject, NSApplicationDelegate {
         } catch {
             fail("Could not start Seerr: \(error.localizedDescription)")
         }
-    }
-
-    // Next.js writes its image cache under .next. Keep immutable app files in
-    // the signed bundle and put the writable cache in Application Support.
-    private func prepareRuntime(_ applicationDirectory: URL) throws -> URL {
-        let manager = FileManager.default
-        let runtime = dataDirectory.appendingPathComponent("runtime", isDirectory: true)
-        let next = runtime.appendingPathComponent(".next", isDirectory: true)
-        try manager.createDirectory(at: next, withIntermediateDirectories: true)
-        let assets = ["dist", "node_modules", "public", "package.json", "next.config.mjs", "seerr-api.yml"]
-        for name in assets {
-            try replaceLink(runtime.appendingPathComponent(name), with: applicationDirectory.appendingPathComponent(name))
-        }
-        let bundledNext = applicationDirectory.appendingPathComponent(".next", isDirectory: true)
-        for name in try manager.contentsOfDirectory(atPath: bundledNext.path) where name != "cache" {
-            try replaceLink(next.appendingPathComponent(name), with: bundledNext.appendingPathComponent(name))
-        }
-        return runtime
-    }
-
-    private func replaceLink(_ link: URL, with target: URL) throws {
-        let manager = FileManager.default
-        if let attributes = try? manager.attributesOfItem(atPath: link.path) {
-            guard attributes[.type] as? FileAttributeType == .typeSymbolicLink else {
-                throw NSError(domain: "Seerr", code: 2, userInfo: [NSLocalizedDescriptionKey: "A runtime path is not a symbolic link: \(link.path)"])
-            }
-            try manager.removeItem(at: link)
-        }
-        try manager.createSymbolicLink(at: link, withDestinationURL: target)
     }
 
     private func portAvailable(_ port: UInt16) -> Bool {

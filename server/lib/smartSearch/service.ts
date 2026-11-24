@@ -9,6 +9,7 @@ import { EmbeddingEngine } from './engine';
 import {
   documentHash,
   documentText,
+  embeddingTextHash,
   foldText,
   plotSearchWords,
   SmartStore,
@@ -30,9 +31,12 @@ type Cursor = {
   day?: number;
   page: number;
 };
+type CatalogPage = Awaited<ReturnType<MetadataSource['fetchPage']>>;
 const firstYear = 1870;
 const interval = 24 * 60 * 60 * 1000;
 const retryInterval = 60 * 60 * 1000;
+const changeFetchConcurrency = 4;
+const changeFetchInterval = 250;
 const rerankCacheLimit = 1024;
 const rerankCacheTtl = 5 * 60 * 1000;
 const denseCacheLimit = 8;
@@ -379,6 +383,7 @@ export class SmartSearchService {
     ttl: 30 * 60 * 1000,
   });
   private count = 0;
+  private nextCountAt = 0;
   private error?: string;
   private nextRefreshAt?: string;
   private inFlight?: Promise<void>;
@@ -683,12 +688,12 @@ export class SmartSearchService {
     if (!this.controller) this.start();
   }
 
-  refreshNow(): boolean {
+  refreshNow(rescan = false): boolean {
     if (!this.enabled() || this.controller) return false;
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.nextRefreshAt = undefined;
-    this.inFlight = this.refresh();
+    this.inFlight = this.refresh(rescan, true);
     this.enrichKeywords();
     return true;
   }
@@ -847,34 +852,49 @@ export class SmartSearchService {
     documents: SmartDocument[],
     signal: AbortSignal
   ): Promise<void> {
+    if (!documents.length) return;
     const previous = await store.existing(
       this.source.id,
       mediaType,
       documents.map((doc) => doc.sourceId)
     );
-    const changed = documents.filter(
-      (doc) => previous.get(doc.sourceId)?.hash !== documentHash(doc)
+    const prepared = documents.map((document) => {
+      const text = documentText(document);
+      return { document, text, hash: embeddingTextHash(text) };
+    });
+    const changed = prepared.filter(
+      ({ document, hash }) => previous.get(document.sourceId)?.hash !== hash
     );
+    if (changed.length && this.engine.phase !== 'ready')
+      await this.startEngine();
     const fresh = new Map<string, Buffer>();
     for (let offset = 0; offset < changed.length; offset += 8) {
       signal.throwIfAborted();
       const part = changed.slice(offset, offset + 8);
       const embeddings = await this.engine.embed(
-        part.map(documentText),
+        part.map(({ text }) => text),
         signal
       );
       signal.throwIfAborted();
       for (let i = 0; i < part.length; i++)
-        fresh.set(part[i].sourceId, quantize(embeddings[i]));
+        fresh.set(part[i].document.sourceId, quantize(embeddings[i]));
     }
+    signal.throwIfAborted();
     await store.upsertBatch(
-      documents.map((document) => ({
+      prepared.map(({ document, hash }) => ({
         document,
+        hash,
         vector:
           fresh.get(document.sourceId) ??
           previous.get(document.sourceId)!.vector,
       }))
     );
+  }
+
+  private async updateCount(store: SmartStore, force = false): Promise<void> {
+    if (!force && performance.now() < this.nextCountAt) return;
+    this.count = await store.count();
+    this.nextCountAt = performance.now() + 1000;
   }
 
   private async updateChanges(
@@ -910,31 +930,36 @@ export class SmartSearchService {
           `Too many changes for ${cursor.date}; a full reconciliation is required.`
         );
       const documents: SmartDocument[] = [];
-      for (const id of batch.ids) {
+      const removed: string[] = [];
+      const ids = [...new Set(batch.ids)];
+      for (
+        let offset = 0;
+        offset < ids.length;
+        offset += changeFetchConcurrency
+      ) {
         signal.throwIfAborted();
-        await delay(250, undefined, { signal });
-        try {
-          const document = await this.source.fetchOne(
-            cursor.mediaType,
-            id,
-            signal
-          );
-          if (document) documents.push(document);
-          else await store.remove(this.source.id, cursor.mediaType, id);
-        } catch (error) {
-          if (
-            typeof error === 'object' &&
-            error !== null &&
-            'response' in error &&
-            (error as { response?: { status?: number } }).response?.status ===
-              404
-          )
-            await store.remove(this.source.id, cursor.mediaType, id);
-          else throw error;
+        const wave = ids.slice(offset, offset + changeFetchConcurrency);
+        // Allow requests in a wave to overlap without turning a catch-up scan
+        // into a burst of detail calls. Wait for the wave before retrying.
+        const started = performance.now();
+        const results = await Promise.allSettled(
+          wave.map((id) => this.source.fetchOne(cursor.mediaType, id, signal))
+        );
+        signal.throwIfAborted();
+        for (const [index, result] of results.entries()) {
+          if (result.status === 'rejected') {
+            const error = result.reason;
+            if (error?.response?.status !== 404) throw error;
+            removed.push(wave[index]);
+          } else if (result.value) documents.push(result.value);
+          else removed.push(wave[index]);
         }
+        const remaining = changeFetchInterval - (performance.now() - started);
+        if (remaining > 0 && offset + wave.length < ids.length)
+          await delay(remaining, undefined, { signal });
       }
       await this.indexDocuments(store, cursor.mediaType, documents, signal);
-      this.count = await store.count();
+      await store.removeBatch(this.source.id, cursor.mediaType, removed);
       if (cursor.page < batch.totalPages)
         cursor = { ...cursor, page: cursor.page + 1 };
       else if (cursor.mediaType === 'movie')
@@ -948,10 +973,10 @@ export class SmartSearchService {
           page: 1,
         };
       await store.setState('changesCursor', JSON.stringify(cursor));
+      await this.updateCount(store);
       if (duringBackfill && cursor.date <= through) return;
     }
-    await store.setState('lastUpdated', today);
-    await store.setState('changesCursor', '');
+    await store.setStates({ lastUpdated: today, changesCursor: '' });
   }
 
   private async indexPopular(
@@ -975,7 +1000,7 @@ export class SmartSearchService {
       );
       signal.throwIfAborted();
       await this.indexDocuments(store, cursor.type, batch.documents, signal);
-      this.count = await store.count();
+      await this.updateCount(store);
       if (cursor.page < Math.min(25, batch.totalPages))
         cursor = { ...cursor, page: cursor.page + 1 };
       else if (cursor.type === 'movie') cursor = { type: 'tv', page: 1 };
@@ -988,14 +1013,21 @@ export class SmartSearchService {
     }
   }
 
-  private async refresh(): Promise<void> {
+  private async refresh(rescan = false, force = false): Promise<void> {
     const controller = new AbortController();
     this.controller = controller;
     this.error = undefined;
     let failed = false;
+    let nextRun: number | undefined;
+    let store: SmartStore | undefined;
+    let pendingPage:
+      | {
+          controller: AbortController;
+          result: Promise<PromiseSettledResult<CatalogPage>>;
+        }
+      | undefined;
     try {
-      const store = await this.open();
-      await this.startEngine();
+      store = await this.open();
       try {
         await this.indexPopular(store, controller.signal);
       } catch (error) {
@@ -1007,16 +1039,39 @@ export class SmartSearchService {
       }
       const lastUpdated = await store.getState('lastUpdated');
       const saved = await store.getState('cursor');
-      if (!saved && lastUpdated && this.source.fetchChanges) {
+      if (!rescan && !saved && lastUpdated && this.source.fetchChanges) {
+        const checked = Date.parse(
+          (await store.getState('lastRefreshAt')) || ''
+        );
+        const age = Date.now() - checked;
+        const cadence =
+          getSettings().main.smartSearchRefreshInterval === 'weekly'
+            ? interval * 7
+            : interval;
+        if (
+          !force &&
+          age >= 0 &&
+          age < cadence &&
+          !(await store.getState('changesCursor'))
+        ) {
+          nextRun = cadence - age;
+          return;
+        }
         await this.updateChanges(store, lastUpdated, controller.signal);
+        await store.setState('lastRefreshAt', new Date().toISOString());
         return;
       }
+      // Warm the engine on a first build. Rescans and incremental updates
+      // can reuse every vector, so start it only when their text changes.
+      if (!rescan && !saved && !lastUpdated) await this.startEngine();
       let scanStarted = await store.getState('scanStarted');
       if (!saved || !scanStarted) {
         scanStarted = new Date().toISOString().slice(0, 10);
-        await store.setState('scanStarted', scanStarted);
-        await store.setState('lastUpdated', '');
-        await store.setState('changesCursor', '');
+        await store.setStates({
+          scanStarted,
+          lastUpdated: '',
+          changesCursor: '',
+        });
       }
       this.cursor = saved
         ? (JSON.parse(saved) as Cursor)
@@ -1030,6 +1085,8 @@ export class SmartSearchService {
       while (this.cursor.year >= firstYear) {
         controller.signal.throwIfAborted();
         if (this.source.fetchChanges && Date.now() >= nextChangeCheck) {
+          pendingPage?.controller.abort();
+          pendingPage = undefined;
           nextChangeCheck = Date.now() + 30000;
           try {
             const since = (await store.getState('lastUpdated')) || scanStarted;
@@ -1055,13 +1112,21 @@ export class SmartSearchService {
         const to = month
           ? `${year}-${String(month).padStart(2, '0')}-${String(day || last).padStart(2, '0')}`
           : `${year}-12-31`;
-        const batch = await this.source.fetchPage(
-          mediaType,
-          from,
-          to,
-          page,
-          controller.signal
-        );
+        let batch: CatalogPage;
+        if (pendingPage) {
+          const result = await pendingPage.result;
+          pendingPage = undefined;
+          if (result.status === 'rejected') throw result.reason;
+          batch = result.value;
+        } else {
+          batch = await this.source.fetchPage(
+            mediaType,
+            from,
+            to,
+            page,
+            controller.signal
+          );
+        }
         controller.signal.throwIfAborted();
         if (batch.totalPages > 500 && month === 0) {
           this.cursor = { year, month: 1, page: 1, mediaType };
@@ -1077,13 +1142,31 @@ export class SmartSearchService {
           throw new Error(
             `TMDB returned more than 500 pages for ${mediaType} ${from}–${to}; indexing stopped to avoid missing titles.`
           );
+        // Keep one page in flight while this page is embedded and committed.
+        // Only consume it after the current page's checkpoint is durable.
+        if (page < batch.totalPages) {
+          const next = new AbortController();
+          const abort = () => next.abort(controller.signal.reason);
+          controller.signal.addEventListener('abort', abort, { once: true });
+          pendingPage = {
+            controller: next,
+            result: this.source
+              .fetchPage(mediaType, from, to, page + 1, next.signal)
+              .then(
+                (value) => ({ status: 'fulfilled' as const, value }),
+                (reason) => ({ status: 'rejected' as const, reason })
+              )
+              .finally(() =>
+                controller.signal.removeEventListener('abort', abort)
+              ),
+          };
+        }
         await this.indexDocuments(
           store,
           mediaType,
           batch.documents,
           controller.signal
         );
-        this.count = await store.count();
         if (page < Math.min(batch.totalPages, 500))
           this.cursor = { year, mediaType, month, day, page: page + 1 };
         else if (day && day < last)
@@ -1100,11 +1183,13 @@ export class SmartSearchService {
             page: 1,
           };
         await store.setState('cursor', JSON.stringify(this.cursor));
+        await this.updateCount(store);
       }
-      await store.setState('cursor', '');
-      if (!(await store.getState('lastUpdated')))
-        await store.setState('lastUpdated', scanStarted);
-      await store.setState('scanStarted', '');
+      await store.setStates({
+        cursor: '',
+        lastUpdated: (await store.getState('lastUpdated')) || scanStarted,
+        scanStarted: '',
+      });
       this.cursor = undefined;
     } catch (error) {
       if (!controller.signal.aborted) {
@@ -1116,6 +1201,8 @@ export class SmartSearchService {
         });
       }
     } finally {
+      pendingPage?.controller.abort();
+      if (store) await this.updateCount(store, true).catch(() => undefined);
       this.controller = undefined;
       this.unloadWhenIdle();
       if (this.enabled() && !this.closing) {
@@ -1126,9 +1213,7 @@ export class SmartSearchService {
             this.schedule(
               failed
                 ? retryInterval
-                : schedule === 'weekly'
-                  ? interval * 7
-                  : interval
+                : (nextRun ?? (schedule === 'weekly' ? interval * 7 : interval))
             );
         }
       }

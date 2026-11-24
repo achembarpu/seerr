@@ -12,7 +12,10 @@ import {
   mapTvResult,
 } from '@server/models/Search';
 import { isAxiosError } from 'axios';
-import { setImmediate as nextTurn } from 'node:timers/promises';
+import {
+  setTimeout as delay,
+  setImmediate as nextTurn,
+} from 'node:timers/promises';
 import { TmdbKeywordCatalog, normalizeTmdbKeyword } from './keywordCatalog';
 import type {
   MetadataSource,
@@ -380,41 +383,45 @@ export class TmdbMetadataSource implements MetadataSource {
       page,
       signal,
     });
-    const documents: SmartDocument[] = [];
-    for (const item of response.results) {
-      if ('adult' in item && item.adult) continue;
-      let document = this.document(item, mediaType);
-      if (
-        !document &&
+    const documents = response.results.map((item) =>
+      this.document(item, mediaType)
+    );
+    const untranslated = [...response.results.entries()].filter(
+      ([index, item]) =>
+        !documents[index] &&
+        !('adult' in item && item.adult) &&
         !item.overview?.trim() &&
         item.original_language &&
         item.original_language !== 'en'
-      ) {
-        try {
-          const localized = await this.load(
-            mediaType,
-            item.id,
-            item.original_language,
-            signal
-          );
-          document = this.document(
-            localized.item,
-            mediaType,
-            localized.keywords
-          );
-        } catch (error) {
-          if (
-            typeof error !== 'object' ||
-            error === null ||
-            !('response' in error) ||
-            (error as { response?: { status?: number } }).response?.status !==
-              404
-          )
-            throw error;
+    );
+    for (let offset = 0; offset < untranslated.length; offset += 3) {
+      signal?.throwIfAborted();
+      const started = performance.now();
+      const part = untranslated.slice(offset, offset + 3);
+      const localized = await Promise.allSettled(
+        part.map(([, item]) =>
+          this.load(mediaType, item.id, item.original_language, signal)
+        )
+      );
+      signal?.throwIfAborted();
+      for (const [index, result] of localized.entries()) {
+        if (result.status === 'rejected') {
+          if (result.reason?.response?.status !== 404) throw result.reason;
+          continue;
         }
+        documents[part[index][0]] = this.document(
+          result.value.item,
+          mediaType,
+          result.value.keywords
+        );
       }
-      if (document) documents.push(document);
+      const remaining = 250 - (performance.now() - started);
+      if (remaining > 0 && offset + part.length < untranslated.length)
+        await delay(remaining, undefined, { signal });
     }
-    return { documents, totalPages: response.total_pages };
+    return {
+      documents: documents.filter((item): item is SmartDocument => !!item),
+      totalPages: response.total_pages,
+    };
   }
 }

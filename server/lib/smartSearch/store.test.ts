@@ -71,6 +71,9 @@ it('tracks local and external document changes without invalidating on local lex
     await store.upsert(doc('1'), quantize([1, 0]));
     const inserted = await store.documentVersion();
     assert.notEqual(inserted, initial);
+    await store.upsert(doc('1'), quantize([1, 0]));
+    await store.remove('tmdb', 'movie', 'missing');
+    assert.equal(await store.documentVersion(), inserted);
     await store.remove('tmdb', 'movie', '1');
     const deleted = await store.documentVersion();
     assert.notEqual(deleted, inserted);
@@ -84,6 +87,51 @@ it('tracks local and external document changes without invalidating on local lex
     await other?.close();
     await store.close();
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('keeps text postings intact across metadata updates and publishes changed text', async () => {
+  const store = new SmartStore(':memory:');
+  try {
+    await store.initialize();
+    const document = doc('10', {
+      overview: 'A festival in a small town',
+      keywords: ['celebration'],
+    });
+    const vector = quantize([1, 0]);
+    await store.upsert(document, vector);
+    const internal = store as unknown as VersionTestInternals;
+    const postings = () =>
+      internal.all(
+        'SELECT id, hex(block) AS page FROM smart_fts_data UNION ALL SELECT id, hex(block) FROM smart_keywords_data'
+      );
+    const before = await postings();
+    await store.upsert({ ...document, voteAverage: 9 }, vector);
+    assert.deepEqual(await postings(), before);
+    assert.equal(
+      (await store.searchLexical('festival'))[0].document.voteAverage,
+      9
+    );
+    await store.upsert(
+      {
+        ...document,
+        overview: 'A musician starts a band',
+        keywords: ['orchestra'],
+      },
+      vector
+    );
+    assert.deepEqual(await store.searchLexical('festival'), []);
+    assert.equal(
+      (await store.searchLexical('musician'))[0].document.sourceId,
+      '10'
+    );
+    assert.deepEqual(await store.searchKeywords('celebration'), []);
+    assert.equal(
+      (await store.searchKeywords('orchestra'))[0].document.sourceId,
+      '10'
+    );
+  } finally {
+    await store.close();
   }
 });
 

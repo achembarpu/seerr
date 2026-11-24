@@ -72,6 +72,7 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   smartSearchDownload: 'Downloading model: {percent}%',
   smartSearchProgress: 'Indexing {mediaType} from {year}, page {page}',
   smartSearchRefreshFailed: 'Could not start smart search refresh.',
+  rescanCatalog: 'Rescan catalog',
 
   titleCardTitle: 'Title search',
   titleCardDescription:
@@ -204,6 +205,19 @@ const SettingsSearch = () => {
   } as const;
 
   const progress = smartStatus ? indexProgress(smartStatus) : undefined;
+  const refreshSmartSearch = async (mode?: 'rescan') => {
+    try {
+      await axios.post('/api/v1/settings/smart-search/refresh', undefined, {
+        params: { mode },
+      });
+      await refreshSmartStatus();
+    } catch {
+      addToast(intl.formatMessage(messages.smartSearchRefreshFailed), {
+        autoDismiss: true,
+        appearance: 'error',
+      });
+    }
+  };
 
   if (!data && !error) return <LoadingSpinner />;
   if (!data)
@@ -609,31 +623,32 @@ const SettingsSearch = () => {
                               )}
                             </p>
                           </div>
-                          <Button
-                            type="button"
-                            buttonSize="sm"
-                            disabled={smartStatus.indexing}
-                            onClick={async () => {
-                              try {
-                                await axios.post(
-                                  '/api/v1/settings/smart-search/refresh'
-                                );
-                                await refreshSmartStatus();
-                              } catch {
-                                addToast(
-                                  intl.formatMessage(
-                                    messages.smartSearchRefreshFailed
-                                  ),
-                                  { autoDismiss: true, appearance: 'error' }
-                                );
-                              }
-                            }}
-                          >
-                            <ArrowPathIcon />
-                            <span>
-                              {intl.formatMessage(messages.searchIndexRefresh)}
-                            </span>
-                          </Button>
+                          <div className="flex flex-wrap gap-2">
+                            {smartStatus.count > 0 && !smartStatus.cursor && (
+                              <Button
+                                type="button"
+                                buttonType="ghost"
+                                buttonSize="sm"
+                                disabled={smartStatus.indexing}
+                                onClick={() => refreshSmartSearch('rescan')}
+                              >
+                                {intl.formatMessage(messages.rescanCatalog)}
+                              </Button>
+                            )}
+                            <Button
+                              type="button"
+                              buttonSize="sm"
+                              disabled={smartStatus.indexing}
+                              onClick={() => refreshSmartSearch()}
+                            >
+                              <ArrowPathIcon />
+                              <span>
+                                {intl.formatMessage(
+                                  messages.searchIndexRefresh
+                                )}
+                              </span>
+                            </Button>
+                          </div>
                         </div>
                         <div className="mt-4 grid gap-3 sm:grid-cols-2">
                           <div className="rounded-md bg-gray-800/70 px-3 py-2.5">

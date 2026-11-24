@@ -1,0 +1,37 @@
+#!/bin/sh
+set -eu
+
+resources=$(CDPATH='' cd -- "$(dirname -- "$0")/../Resources" && pwd -P)
+: "${CONFIG_DIRECTORY:=${HOME}/Library/Application Support/Seerr}"
+: "${HOST:=127.0.0.1}"
+: "${PORT:=5055}"
+case "$CONFIG_DIRECTORY" in /*) ;; *) CONFIG_DIRECTORY="$PWD/$CONFIG_DIRECTORY" ;; esac
+export CONFIG_DIRECTORY HOST PORT
+export NODE_ENV=production NEXT_TELEMETRY_DISABLED=1
+export SEERR_LLAMA_SERVER="$resources/runtime/llama-server"
+export SEERR_VECTOR_EXTENSION="$resources/runtime/seerrvectors.dylib"
+export SEERR_NATIVE_METAL_RERANK=1
+
+# Next writes its image cache in the working directory. Keep the writable
+# cache in Seerr's data directory beside links to the signed release.
+app="$resources/app"
+runtime="$CONFIG_DIRECTORY/runtime"
+mkdir -p "$runtime/.next" "$CONFIG_DIRECTORY/db" "$CONFIG_DIRECTORY/logs"
+link_asset() {
+  if [ -L "$2" ]; then
+    unlink "$2"
+  elif [ -e "$2" ]; then
+    printf '%s\n' "Seerr runtime path is not a symbolic link: $2" >&2
+    exit 1
+  fi
+  ln -s "$1" "$2"
+}
+for name in dist node_modules public package.json next.config.mjs seerr-api.yml; do
+  link_asset "$app/$name" "$runtime/$name"
+done
+for asset in "$app/.next/"*; do
+  name=${asset##*/}
+  if [ "$name" != cache ]; then link_asset "$asset" "$runtime/.next/$name"; fi
+done
+cd "$runtime"
+exec "$resources/runtime/node" "$app/dist/index.js"

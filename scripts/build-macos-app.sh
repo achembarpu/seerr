@@ -67,6 +67,7 @@ app="$work/Seerr.app"
 resources="$app/Contents/Resources"
 mkdir -p "$app/Contents/MacOS" "$resources/app" "$resources/runtime"
 cp native/macos/Info.plist "$app/Contents/Info.plist"
+install -m 755 native/macos/SeerrServer "$app/Contents/MacOS/SeerrServer"
 CLANG_MODULE_CACHE_PATH="$work/swift-cache" swiftc -target arm64-apple-macos13.5 -module-cache-path "$work/swift-cache" -O \
   native/macos/Seerr.swift -o "$app/Contents/MacOS/Seerr"
 cp "$work/node-v$node_version-darwin-arm64/bin/node" "$resources/runtime/node"

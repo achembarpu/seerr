@@ -67,8 +67,10 @@ export const documentText = (document: SmartDocument): string => {
     .slice(0, 450)
     .join('');
 };
+export const embeddingTextHash = (text: string): string =>
+  createHash('sha256').update(text).digest('hex');
 export const documentHash = (document: SmartDocument): string =>
-  createHash('sha256').update(documentText(document)).digest('hex');
+  embeddingTextHash(documentText(document));
 
 type Row = {
   id: number;
@@ -213,6 +215,7 @@ export class SmartStore {
   });
   private readonly documentVersionId = randomUUID();
   private documentRevision = 0;
+  private documentWriteEpoch = 0;
   private activeDocumentWrites = 0;
   private canLoadVectorExtension = true;
   private vectorExtensionLoaded = false;
@@ -234,9 +237,12 @@ export class SmartStore {
     sql: string,
     params: (string | number | Buffer | null)[] = [],
     db = this.db
-  ): Promise<void> {
+  ): Promise<number> {
     return new Promise((resolve, reject) =>
-      db.run(sql, params, (error) => (error ? reject(error) : resolve()))
+      db.run(sql, params, function (error) {
+        if (error) reject(error);
+        else resolve(this.changes);
+      })
     );
   }
   private all<T>(
@@ -402,11 +408,6 @@ export class SmartStore {
       INSERT OR REPLACE INTO smart_fts(rowid, title, overview) VALUES (new.id, json_extract(new.document, '$.title'), json_extract(new.document, '$.overview'));
     END`);
     await this
-      .run(`CREATE TRIGGER IF NOT EXISTS smart_fts_update AFTER UPDATE ON smart_documents BEGIN
-      DELETE FROM smart_fts WHERE rowid = old.id;
-      INSERT OR REPLACE INTO smart_fts(rowid, title, overview) VALUES (new.id, json_extract(new.document, '$.title'), json_extract(new.document, '$.overview'));
-    END`);
-    await this
       .run(`CREATE TRIGGER IF NOT EXISTS smart_fts_delete AFTER DELETE ON smart_documents BEGIN
       DELETE FROM smart_fts WHERE rowid = old.id;
     END`);
@@ -423,18 +424,7 @@ export class SmartStore {
       INSERT INTO smart_keywords(rowid, keywords)
       VALUES (new.id, ${storedKeywords('new.document')});
     END`);
-    await this.run(`CREATE TRIGGER IF NOT EXISTS smart_keywords_update
-      AFTER UPDATE OF id, document ON smart_documents
-      WHEN old.id != new.id OR json_type(new.document, '$.keywords') = 'array' BEGIN
-      DELETE FROM smart_keywords WHERE rowid = new.id;
-      INSERT INTO smart_keywords(rowid, keywords)
-      SELECT new.id, ${storedKeywords('new.document')}
-      WHERE json_type(new.document, '$.keywords') = 'array'
-      UNION ALL
-      SELECT new.id, keywords FROM smart_keywords
-      WHERE rowid = old.id AND json_type(new.document, '$.keywords') IS NOT 'array';
-      DELETE FROM smart_keywords WHERE rowid = old.id AND old.id != new.id;
-    END`);
+    await this.installTextUpdateTriggers();
     await this.run(`CREATE TRIGGER IF NOT EXISTS smart_keywords_delete
       AFTER DELETE ON smart_documents BEGIN
       DELETE FROM smart_keywords WHERE rowid = old.id;
@@ -444,6 +434,66 @@ export class SmartStore {
     )[0].n;
     this.lexicalTotal = await this.count();
     this.resumeLexical();
+  }
+
+  private async installTextUpdateTriggers(): Promise<void> {
+    // Replace the definitions together. Existing FTS rows and vectors stay in
+    // place, and another connection never sees only half the trigger update.
+    const definitions = [
+      [
+        'smart_fts_update',
+        `CREATE TRIGGER smart_fts_update AFTER UPDATE OF id, document ON smart_documents
+        WHEN old.id != new.id
+          OR json_extract(old.document, '$.title') IS NOT json_extract(new.document, '$.title')
+          OR json_extract(old.document, '$.overview') IS NOT json_extract(new.document, '$.overview')
+        BEGIN
+          DELETE FROM smart_fts WHERE rowid = old.id;
+          INSERT OR REPLACE INTO smart_fts(rowid, title, overview)
+          VALUES (new.id, json_extract(new.document, '$.title'), json_extract(new.document, '$.overview'));
+        END`,
+      ],
+      [
+        'smart_keywords_update',
+        `CREATE TRIGGER smart_keywords_update AFTER UPDATE OF id, document ON smart_documents
+        WHEN old.id != new.id OR (json_type(new.document, '$.keywords') = 'array'
+          AND (SELECT keywords FROM smart_keywords WHERE rowid = new.id)
+            IS NOT ${storedKeywords('new.document')})
+        BEGIN
+          DELETE FROM smart_keywords WHERE rowid = new.id;
+          INSERT INTO smart_keywords(rowid, keywords)
+          SELECT new.id, ${storedKeywords('new.document')}
+          WHERE json_type(new.document, '$.keywords') = 'array'
+          UNION ALL
+          SELECT new.id, keywords FROM smart_keywords
+          WHERE rowid = old.id AND json_type(new.document, '$.keywords') IS NOT 'array';
+          DELETE FROM smart_keywords WHERE rowid = old.id AND old.id != new.id;
+        END`,
+      ],
+    ];
+    const existing = new Map(
+      (
+        await this.all<{ name: string; sql: string }>(
+          "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND name IN ('smart_fts_update', 'smart_keywords_update')"
+        )
+      ).map(({ name, sql }) => [name, sql])
+    );
+    const needed = definitions.filter(
+      ([name, sql]) => existing.get(name) !== sql
+    );
+    if (!needed.length) return;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.db.exec(
+          `BEGIN IMMEDIATE;
+          ${needed.map(([name, sql]) => `DROP TRIGGER IF EXISTS ${name};\n${sql};`).join('\n')}
+          COMMIT;`,
+          (error) => (error ? reject(error) : resolve())
+        );
+      });
+    } catch (error) {
+      await this.run('ROLLBACK').catch(() => undefined);
+      throw error;
+    }
   }
 
   pauseLexical(): void {
@@ -494,18 +544,15 @@ export class SmartStore {
         break;
       }
       const last = rows[rows.length - 1].id;
-      await this.run(
-        `INSERT OR REPLACE INTO smart_fts(rowid, title, overview)
-        SELECT id, json_extract(document, '$.title'), json_extract(document, '$.overview')
-        FROM smart_documents WHERE id > ? AND id <= ?`,
+      this.lexicalCount += await this.run(
+        `INSERT INTO smart_fts(rowid, title, overview)
+        SELECT d.id, json_extract(d.document, '$.title'), json_extract(d.document, '$.overview')
+        FROM smart_documents d WHERE d.id > ? AND d.id <= ?
+          AND NOT EXISTS (SELECT 1 FROM smart_fts f WHERE f.rowid = d.id)`,
         [cursor, last]
       );
       cursor = last;
       await this.setState('lexicalCursor', String(cursor));
-      if (cursor % 8192 < 512)
-        this.lexicalCount = (
-          await this.all<{ n: number }>('SELECT count(*) AS n FROM smart_fts')
-        )[0].n;
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
     this.lexicalCount = (
@@ -692,10 +739,16 @@ export class SmartStore {
     )[0]?.value;
   }
   async setState(key: string, value: string): Promise<void> {
-    await this.run('INSERT OR REPLACE INTO smart_state VALUES (?, ?)', [
-      key,
-      value,
-    ]);
+    await this.setStates({ [key]: value });
+  }
+  async setStates(state: Record<string, string>): Promise<void> {
+    const entries = Object.entries(state);
+    await this.run(
+      `INSERT INTO smart_state(key, value) VALUES ${entries.map(() => '(?, ?)').join(', ')}
+      ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      WHERE smart_state.value != excluded.value`,
+      entries.flat()
+    );
   }
 
   /**
@@ -707,28 +760,28 @@ export class SmartStore {
   async documentVersion(): Promise<string | undefined> {
     if (this.closing) throw new Error('Search index is closing');
     if (this.activeDocumentWrites) return undefined;
-    const revision = this.documentRevision;
+    const epoch = this.documentWriteEpoch;
     const rows = await this.all<{ data_version: number }>(
       'PRAGMA data_version'
     );
     if (this.closing) throw new Error('Search index is closing');
-    if (this.activeDocumentWrites || revision !== this.documentRevision)
+    if (this.activeDocumentWrites || epoch !== this.documentWriteEpoch)
       return undefined;
     const externalVersion = rows[0]?.data_version;
     if (!Number.isSafeInteger(externalVersion))
       throw new Error('Unable to read search index version');
-    return `${this.documentVersionId}:${revision}:${externalVersion}`;
+    return `${this.documentVersionId}:${this.documentRevision}:${externalVersion}`;
   }
 
-  private async writeDocuments(write: () => Promise<void>): Promise<void> {
+  private async writeDocuments(write: () => Promise<number>): Promise<void> {
     this.activeDocumentWrites++;
-    this.documentRevision++;
+    this.documentWriteEpoch++;
     try {
-      await write();
-    } finally {
-      // Advance even on failure: callers cannot assume a failed write had no
-      // observable effects, and overlapping writes remain unavailable.
+      if (await write()) this.documentRevision++;
+    } catch (error) {
       this.documentRevision++;
+      throw error;
+    } finally {
       this.activeDocumentWrites--;
     }
   }
@@ -754,13 +807,13 @@ export class SmartStore {
     return this.upsertBatch([{ document, vector }]);
   }
   async upsertBatch(
-    items: { document: SmartDocument; vector: Buffer }[]
+    items: { document: SmartDocument; vector: Buffer; hash?: string }[]
   ): Promise<void> {
     if (!items.length) return;
     const values = items
       .map(() => '(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
       .join(',');
-    const params = items.flatMap(({ document, vector }) => [
+    const params = items.flatMap(({ document, vector, hash }) => [
       document.source,
       document.sourceId,
       document.mediaType,
@@ -769,7 +822,7 @@ export class SmartStore {
       document.voteAverage,
       document.voteCount,
       JSON.stringify(document.genreIds),
-      documentHash(document),
+      hash ?? documentHash(document),
       vector,
       JSON.stringify(document),
     ]);
@@ -790,10 +843,19 @@ export class SmartStore {
     type: SmartMediaType,
     id: string
   ): Promise<void> {
+    await this.removeBatch(source, type, [id]);
+  }
+  async removeBatch(
+    source: string,
+    type: SmartMediaType,
+    ids: string[]
+  ): Promise<void> {
+    if (!ids.length) return;
     await this.writeDocuments(() =>
       this.run(
-        'DELETE FROM smart_documents WHERE source = ? AND mediaType = ? AND sourceId = ?',
-        [source, type, id]
+        `DELETE FROM smart_documents WHERE source = ? AND mediaType = ?
+        AND sourceId IN (${ids.map(() => '?').join(',')})`,
+        [source, type, ...ids]
       )
     );
   }

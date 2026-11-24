@@ -443,12 +443,14 @@ describe('smart search lifecycle', () => {
     await store.setState('lastUpdated', new Date().toISOString().slice(0, 10));
     await store.close();
     let enabled = true,
-      embeds = 0;
+      embeds = 0,
+      starts = 0;
     const engine = {
       phase: 'idle' as 'idle' | 'ready',
       downloadBytes: 0,
       downloadTotal: 1,
       async start() {
+        starts++;
         this.phase = 'ready';
       },
       stop() {
@@ -482,6 +484,7 @@ describe('smart search lifecycle', () => {
       await waitFor(() => !service.status().indexing);
       assert.equal(service.status().error, undefined);
       assert.equal(embeds, 0);
+      assert.equal(starts, 0);
       enabled = false;
       service.start();
       await service.close();
@@ -498,6 +501,64 @@ describe('smart search lifecycle', () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+  it('prefetches a rescan page, reuses unchanged embeddings, and resumes after failure', async () => {
+    const store = new SmartStore(':memory:');
+    await store.initialize();
+    await store.upsert(document, quantize([1, 0]));
+    await store.setState('lastUpdated', new Date().toISOString().slice(0, 10));
+    const calls: number[] = [];
+    const save = store.upsertBatch.bind(store);
+    store.upsertBatch = async (items) => {
+      assert.deepEqual(calls, [1, 2]);
+      await save(items);
+    };
+    const engine = {
+      phase: 'idle' as const,
+      downloadBytes: 0,
+      downloadTotal: 1,
+      async start() {
+        throw new Error('Unchanged rows do not need an embedding engine');
+      },
+      stop() {},
+      async embed() {
+        throw new Error('Unexpected embedding');
+      },
+    };
+    const source: MetadataSource = {
+      id: 'tmdb',
+      async fetchOne() {
+        return undefined;
+      },
+      async fetchPage(_type, _from, _to, page) {
+        calls.push(page);
+        if (page === 2) throw new Error('Page unavailable');
+        return { documents: [document], totalPages: 2 };
+      },
+      async fetchChanges() {
+        return { ids: [], totalPages: 1 };
+      },
+    };
+    const service = new SmartSearchService(
+      () => true,
+      engine,
+      source,
+      () => store
+    );
+    try {
+      assert.equal(service.refreshNow(true), true);
+      await waitFor(() => !service.status().indexing);
+      assert.equal(service.status().error, 'Page unavailable');
+      assert.equal(service.status().count, 1);
+      assert.equal(JSON.parse((await store.getState('cursor'))!).page, 2);
+      assert.equal(service.refreshNow(), true);
+      await waitFor(() => !service.status().indexing);
+      assert.equal(service.status().error, 'Page unavailable');
+      assert.deepEqual(calls, [1, 2, 2]);
+    } finally {
+      await service.close();
+    }
+  });
+
   it('reconciles one settled change page before resuming a historical scan', async () => {
     const directory = await mkdtemp(
       path.join(os.tmpdir(), 'smart-backfill-changes-')

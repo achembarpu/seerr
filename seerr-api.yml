@@ -2353,6 +2353,13 @@ paths:
     post:
       summary: Refresh local smart search
       tags: [settings]
+      parameters:
+        - name: mode
+          in: query
+          description: Rescan the catalog and reuse existing embeddings.
+          schema:
+            type: string
+            enum: [rescan]
       responses:
         '202':
           description: Refresh started
