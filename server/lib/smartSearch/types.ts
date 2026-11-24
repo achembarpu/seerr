@@ -42,10 +42,13 @@ export interface MetadataSource {
     id: string,
     signal?: AbortSignal
   ): Promise<string[] | undefined>;
+  prepareSearchKeywords?(allowRefresh: boolean): void;
+  canSearchRelated?(query: string): boolean;
   searchRelated?(
     query: string,
     filters: SmartFilters,
-    language?: string
+    language?: string,
+    signal?: AbortSignal
   ): Promise<SmartDocument[]>;
   fetchRelated?(
     mediaType: SmartMediaType,

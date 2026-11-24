@@ -78,4 +78,37 @@ describe('TMDB search card lookups', () => {
       get.mock.restore();
     }
   });
+
+  it('passes cancellation to keyword search and discover requests', async (context) => {
+    const tmdb = new TheMovieDb();
+    const internal = tmdb as unknown as {
+      get: (
+        endpoint: string,
+        options: { signal?: AbortSignal }
+      ) => Promise<unknown>;
+    };
+    const get = context.mock.method(
+      internal,
+      'get',
+      async (endpoint: string, options: { signal?: AbortSignal }) => ({
+        endpoint,
+        options,
+      })
+    );
+    const { signal } = new AbortController();
+    await tmdb.searchKeyword({ query: 'barber', page: 2, signal });
+    await tmdb.getDiscoverMovies({ keywords: '123', signal });
+    await tmdb.getDiscoverTv({ keywords: '123', signal });
+    assert.deepEqual(
+      get.mock.calls.map(({ arguments: [endpoint, options] }) => [
+        endpoint,
+        options.signal,
+      ]),
+      [
+        ['/search/keyword', signal],
+        ['/discover/movie', signal],
+        ['/discover/tv', signal],
+      ]
+    );
+  });
 });

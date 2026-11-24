@@ -9,6 +9,8 @@ import { EmbeddingEngine } from './engine';
 import {
   documentHash,
   documentText,
+  foldText,
+  plotSearchWords,
   SmartStore,
   type SmartMatch,
 } from './store';
@@ -38,6 +40,7 @@ const denseCacheTtl = 30 * 1000;
 const searchShortlistSize = 30;
 const defaultRerankLimit = 40;
 const maxRerankLimit = 80;
+const searchFallbackTimeout = 550;
 const wordSegmenter = new Intl.Segmenter(undefined, { granularity: 'word' });
 
 const rerankLimit = (maximum: number) =>
@@ -52,6 +55,42 @@ const rerankLimit = (maximum: number) =>
 
 const matchKey = ({ document }: SmartMatch) =>
   `${document.mediaType}:${document.source}:${document.sourceId}`;
+
+export function hasStrongLocalResults(
+  query: string,
+  dense: SmartMatch[],
+  lexical: SmartMatch[],
+  keywords: SmartMatch[]
+): boolean {
+  const terms = [...new Set(plotSearchWords(query).map(foldText))];
+  if (dense.length < 10 || terms.length < 5 || !lexical.length) return false;
+  const strongestOutsideHead = Math.max(
+    ...dense.slice(4, 10).map(({ score }) => score)
+  );
+  const lexicalHead = lexical.slice(0, 15).map(matchKey);
+  const keywordHead = new Set(keywords.slice(0, 5).map(matchKey));
+  // Broad lexical matches and raw cosine alone can both be confident about
+  // the wrong plot. Require a separated semantic head, a second retrieval
+  // signal and several query words present in the actual synopsis.
+  return dense.slice(0, 3).some((item) => {
+    if (
+      dense[0].score - item.score > 0.03 ||
+      item.score - strongestOutsideHead < 0.045
+    )
+      return false;
+    const key = matchKey(item);
+    const lexicalRank = lexicalHead.indexOf(key);
+    if (lexicalRank < 0 || (lexicalRank >= 5 && !keywordHead.has(key)))
+      return false;
+    const synopsis = new Set(
+      foldText(item.document.overview).match(/[\p{L}\p{M}\p{N}]+/gu) ?? []
+    );
+    return (
+      terms.filter((term) => synopsis.has(term)).length >=
+      Math.max(3, Math.ceil(terms.length * 0.4))
+    );
+  });
+}
 
 /** Keep offline upstream discovery from blocking the local index indefinitely. */
 async function withDeadline<T>(
@@ -600,6 +639,7 @@ export class SmartSearchService {
       return;
     }
     this.store?.resumeLexical();
+    this.prepareSearchKeywords();
     if (this.rerankerEnabled())
       void this.prepareReranker()
         .then(() => this.releaseReranker())
@@ -662,6 +702,14 @@ export class SmartSearchService {
       this.enrichKeywords();
     }, wait);
     this.keywordTimer.unref();
+  }
+
+  private prepareSearchKeywords(): void {
+    const settings = getSettings().main;
+    if (settings.smartSearchLiveKeywords !== false)
+      this.source.prepareSearchKeywords?.(
+        settings.smartSearchRefreshInterval !== 'manual'
+      );
   }
 
   private stopKeywordEnrichment(): void {
@@ -1248,6 +1296,7 @@ export class SmartSearchService {
   ) {
     signal?.throwIfAborted();
     if (!this.enabled()) return [];
+    this.prepareSearchKeywords();
     const store = await this.open().catch((error) => {
       this.retrievalWarning = String(error);
       return undefined;
@@ -1269,38 +1318,73 @@ export class SmartSearchService {
     const keywordsPromise = store
       ? store.searchKeywords(query, filters, 80, signal)
       : Promise.resolve([]);
-    const remotePromise =
-      this.source.searchRelated &&
-      getSettings().main.smartSearchLiveKeywords !== false
-        ? withDeadline(this.source.searchRelated(query, filters, language))
-        : Promise.resolve([]);
-    const [denseResult, lexicalResult, keywordsResult, remoteResult] =
-      await Promise.allSettled([
-        densePromise,
-        lexicalPromise,
-        keywordsPromise,
-        remotePromise,
-      ]);
+    const [denseResult, lexicalResult, keywordsResult] =
+      await Promise.allSettled([densePromise, lexicalPromise, keywordsPromise]);
     signal?.throwIfAborted();
-    const errors = [
-      denseResult,
-      lexicalResult,
-      keywordsResult,
-      remoteResult,
-    ].filter((result) => result.status === 'rejected');
-    this.retrievalWarning = errors.length
-      ? 'Some search sources are unavailable; showing available results.'
-      : undefined;
     const dense = denseResult.status === 'fulfilled' ? denseResult.value : [];
     const lexical =
       lexicalResult.status === 'fulfilled' ? lexicalResult.value : [];
-    const remote =
-      remoteResult.status === 'fulfilled' ? remoteResult.value : [];
+    const keywords =
+      keywordsResult.status === 'fulfilled' ? keywordsResult.value : [];
     try {
       const denseMatches = dense.map((item) => ({
         ...item,
         methods: ['semantic'] as SmartMatch['methods'],
       }));
+      // Very short searches often name concepts rather than describing the
+      // desired work. Give the reranker the media-search context while leaving
+      // longer natural-language requests unchanged.
+      const wordCount = [...wordSegmenter.segment(query)].filter(
+        (part) => part.isWordLike
+      ).length;
+      const rerankQuery =
+        wordCount > 0 && wordCount <= 4 && Array.from(query).length <= 60
+          ? `A film or series about ${query}`
+          : query;
+      const budget = rerankLimit(maxRerankLimit);
+      let remote: SmartDocument[] = [];
+      let fallbackFailed = false;
+      if (
+        this.source.searchRelated &&
+        getSettings().main.smartSearchLiveKeywords !== false &&
+        this.source.canSearchRelated?.(query) !== false &&
+        !hasStrongLocalResults(query, dense, lexical, keywords)
+      ) {
+        const controller = new AbortController();
+        const deadline = AbortSignal.timeout(searchFallbackTimeout);
+        const abort = () => controller.abort(signal?.reason);
+        const timeout = () => controller.abort(deadline.reason);
+        signal?.addEventListener('abort', abort, { once: true });
+        deadline.addEventListener('abort', timeout, { once: true });
+        try {
+          const fallback = withDeadline(
+            this.source.searchRelated(
+              query,
+              filters,
+              language,
+              controller.signal
+            ),
+            searchFallbackTimeout + 50
+          );
+          const [result] = await Promise.allSettled([
+            fallback,
+            this.preloadSearchRerank(rerankQuery, denseMatches, budget, signal),
+          ]);
+          signal?.throwIfAborted();
+          if (result.status === 'fulfilled') remote = result.value;
+          else fallbackFailed = !deadline.aborted;
+        } finally {
+          signal?.removeEventListener('abort', abort);
+          deadline.removeEventListener('abort', timeout);
+        }
+      }
+      this.retrievalWarning =
+        fallbackFailed ||
+        [denseResult, lexicalResult, keywordsResult].some(
+          (result) => result.status === 'rejected'
+        )
+          ? 'Some search sources are unavailable; showing available results.'
+          : undefined;
       const remoteMatches = remote
         .filter((doc) => matchesFilters(doc, filters))
         .map((document) => ({
@@ -1308,10 +1392,7 @@ export class SmartSearchService {
           score: 0,
           methods: ['tmdb-keyword'] as SmartMatch['methods'],
         }));
-      const keywordMatches =
-        remoteMatches.length || keywordsResult.status === 'rejected'
-          ? remoteMatches
-          : keywordsResult.value;
+      const keywordMatches = remoteMatches.length ? remoteMatches : keywords;
       const fused = fuseSmartCandidates(
         [denseMatches, lexical, keywordMatches],
         1000
@@ -1361,21 +1442,11 @@ export class SmartSearchService {
             !audienceKeys.has(matchKey(item))
         ),
       ].slice(0, 100);
-      // Very short searches often name concepts rather than describing the
-      // desired work. Give the reranker the media-search context while leaving
-      // longer natural-language requests unchanged.
-      const wordCount = [...wordSegmenter.segment(query)].filter(
-        (part) => part.isWordLike
-      ).length;
-      const rerankQuery =
-        wordCount > 0 && wordCount <= 4 && Array.from(query).length <= 60
-          ? `A film or series about ${query}`
-          : query;
       const shortlist = searchRerankShortlist(
         candidates,
         denseMatches,
         wordCount,
-        rerankLimit(maxRerankLimit)
+        budget
       );
       const reranked = await this.rerank(
         rerankQuery,
@@ -1419,6 +1490,25 @@ export class SmartSearchService {
     } finally {
       this.unloadWhenIdle();
     }
+  }
+
+  private async preloadSearchRerank(
+    query: string,
+    dense: SmartMatch[],
+    budget: number,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (
+      budget < defaultRerankLimit ||
+      dense.length < 8 ||
+      this.rerankerBusy ||
+      this.reranker.phase !== 'ready' ||
+      !this.reranker.activeDevice?.startsWith('MTL')
+    )
+      return;
+    // These leading vector hits are already protected in the final shortlist.
+    // Score them while TMDB runs so the final batch can reuse their scores.
+    await this.rerank(query, dense.slice(0, 8), 8, 6000, 'search', signal);
   }
 
   async indexedTitleCards(

@@ -1,6 +1,7 @@
 import TheMovieDb from '@server/api/themoviedb';
 import type {
   TmdbKeyword,
+  TmdbKeywordSearchResponse,
   TmdbMovieResult,
   TmdbTvResult,
 } from '@server/api/themoviedb/interfaces';
@@ -11,6 +12,8 @@ import {
   mapTvResult,
 } from '@server/models/Search';
 import { isAxiosError } from 'axios';
+import { setImmediate as nextTurn } from 'node:timers/promises';
+import { TmdbKeywordCatalog, normalizeTmdbKeyword } from './keywordCatalog';
 import type {
   MetadataSource,
   SmartDocument,
@@ -23,9 +26,25 @@ const keywordNames = (keywords: TmdbKeyword[] | undefined) =>
     ? [...new Set(keywords.map(({ name }) => name.trim()).filter(Boolean))]
     : undefined;
 
+const ignoredKeywordTerms = new Set([
+  'about',
+  'with',
+  'from',
+  'that',
+  'this',
+  'film',
+  'movie',
+  'series',
+  'show',
+  'looking',
+]);
+
 export class TmdbMetadataSource implements MetadataSource {
   readonly id = 'tmdb';
-  constructor(private readonly tmdb = new TheMovieDb({ timeout: 2000 })) {}
+  constructor(
+    private readonly tmdb = new TheMovieDb({ timeout: 2000 }),
+    private readonly keywordCatalog = new TmdbKeywordCatalog()
+  ) {}
 
   private document(
     item: TmdbMovieResult | TmdbTvResult,
@@ -168,46 +187,86 @@ export class TmdbMetadataSource implements MetadataSource {
     return [...documents.values()];
   }
 
+  private async searchKeywordPages(query: string, signal?: AbortSignal) {
+    const request = (page: number, requestSignal?: AbortSignal) =>
+      this.tmdb
+        .searchKeyword({ query, page, signal: requestSignal })
+        .catch(() => undefined);
+    const lastPage = (first?: TmdbKeywordSearchResponse) =>
+      first && Number.isSafeInteger(first.total_pages) && first.total_pages >= 0
+        ? Math.min(3, first.total_pages)
+        : 3;
+    const first = request(1, signal);
+    // A cached first page can tell us exactly which pages exist. On a cold
+    // search, start valid candidates in parallel instead of adding another RTT.
+    const early = await Promise.race([
+      first.then((response) => ({ response })),
+      nextTurn(),
+    ]);
+    signal?.throwIfAborted();
+    const pending = [2, 3]
+      .filter((page) => !early || page <= lastPage(early.response))
+      .map((page) => {
+        const controller = new AbortController();
+        const abort = () => controller.abort(signal?.reason);
+        signal?.addEventListener('abort', abort, { once: true });
+        const response = request(page, controller.signal).finally(() =>
+          signal?.removeEventListener('abort', abort)
+        );
+        return { page, response, controller };
+      });
+    const pageOne = early ? early.response : await first;
+    const limit = lastPage(pageOne);
+    for (const { page, controller } of pending)
+      if (page > limit) controller.abort();
+    const more = await Promise.all(
+      pending
+        .filter(({ page }) => page <= limit)
+        .map(({ response }) => response)
+    );
+    signal?.throwIfAborted();
+    return [pageOne, ...more].flatMap((page) => page?.results ?? []);
+  }
+
+  prepareSearchKeywords(allowRefresh: boolean): void {
+    void this.keywordCatalog.prepare(allowRefresh);
+  }
+
+  private searchTerms(query: string) {
+    return (query.toLowerCase().match(/[\p{L}\p{N}]{4,}/gu) ?? [])
+      .filter((word) => !ignoredKeywordTerms.has(word))
+      .slice(0, 2)
+      .map((term) => ({
+        term,
+        root: term.length > 4 ? term.replace(/s$/u, '') : term,
+      }))
+      .filter(({ root }) => this.keywordCatalog.possiblyContains(root));
+  }
+
+  canSearchRelated(query: string): boolean {
+    return this.searchTerms(query).length > 0;
+  }
+
   /** Use TMDB keywords to find popular titles outside the partially built index. */
   async searchRelated(
     query: string,
     filters: SmartFilters,
-    language = 'en-US'
+    language = 'en-US',
+    signal?: AbortSignal
   ): Promise<SmartDocument[]> {
-    const ignored = new Set([
-      'about',
-      'with',
-      'from',
-      'that',
-      'this',
-      'film',
-      'movie',
-      'series',
-      'show',
-      'looking',
-    ]);
-    const terms = (query.toLowerCase().match(/[\p{L}\p{N}]{4,}/gu) ?? [])
-      .filter((word) => !ignored.has(word))
-      .slice(0, 2);
+    signal?.throwIfAborted();
+    const terms = this.searchTerms(query);
     if (!terms.length) return [];
     // TMDB's keyword search is fuzzy and related compounds may occur on later
     // pages. Keep prefix-related keyword names rather than unrelated spellings.
     const groups = await Promise.all(
-      terms.map(async (term) => {
-        const keywordPages = await Promise.allSettled(
-          [1, 2, 3].map((page) =>
-            this.tmdb.searchKeyword({ query: term, page })
-          )
-        );
-        const root = term.length > 4 ? term.replace(/s$/u, '') : term;
-        const candidates = keywordPages.flatMap((page) =>
-          page.status === 'fulfilled' ? page.value.results : []
-        );
+      terms.map(async ({ term, root }) => {
+        const candidates = await this.searchKeywordPages(term, signal);
         const keywords = [
           ...new Map(
             candidates
               .filter((item) =>
-                item.name.toLowerCase().replace(/\s+/gu, '').startsWith(root)
+                normalizeTmdbKeyword(item.name).startsWith(root)
               )
               .map((item) => [item.id, item])
           ).values(),
@@ -221,6 +280,7 @@ export class TmdbMetadataSource implements MetadataSource {
           keywords,
           language,
           page: 1,
+          signal,
           sortBy: 'popularity.desc' as const,
           originalLanguage: filters.language,
           genre: filters.genre?.toString(),
@@ -239,6 +299,7 @@ export class TmdbMetadataSource implements MetadataSource {
         ]);
       })
     );
+    signal?.throwIfAborted();
     const lists = groups
       .flat()
       .map((response) =>

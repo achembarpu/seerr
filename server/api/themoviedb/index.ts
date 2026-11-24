@@ -90,6 +90,7 @@ export interface TmdbCertificationResponse {
 
 interface DiscoverMovieOptions {
   page?: number;
+  signal?: AbortSignal;
   includeAdult?: boolean;
   includeVideo?: boolean;
   language?: string;
@@ -117,6 +118,7 @@ interface DiscoverMovieOptions {
 
 interface DiscoverTvOptions {
   page?: number;
+  signal?: AbortSignal;
   language?: string;
   firstAirDateGte?: string;
   firstAirDateLte?: string;
@@ -819,6 +821,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
   public getDiscoverMovies = async ({
     sortBy = 'popularity.desc',
     page = 1,
+    signal,
     includeAdult = false,
     includeVideo = true,
     language = this.locale,
@@ -854,6 +857,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
         .split('T')[0];
 
       const data = await this.get<TmdbSearchMovieResponse>('/discover/movie', {
+        signal,
         params: {
           sort_by: sortBy,
           page,
@@ -907,6 +911,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
   public getDiscoverTv = async ({
     sortBy = 'popularity.desc',
     page = 1,
+    signal,
     language = this.locale,
     firstAirDateGte,
     firstAirDateLte,
@@ -942,6 +947,7 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
         .split('T')[0];
 
       const data = await this.get<TmdbSearchTvResponse>('/discover/tv', {
+        signal,
         params: {
           sort_by: sortBy,
           page,
@@ -1500,14 +1506,17 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
   public async searchKeyword({
     query,
     page = 1,
+    signal,
   }: {
     query: string;
     page?: number;
+    signal?: AbortSignal;
   }): Promise<TmdbKeywordSearchResponse> {
     try {
       const data = await this.get<TmdbKeywordSearchResponse>(
         '/search/keyword',
         {
+          signal,
           params: {
             query,
             page,

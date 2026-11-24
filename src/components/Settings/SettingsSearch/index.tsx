@@ -129,9 +129,9 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   titleRefreshIntervalTip:
     'Daily and weekly check for title updates automatically. Manual only uses the current index until Refresh now is pressed.',
   smartRefreshInterval: 'Description index refresh schedule',
-  liveKeywords: 'Use live TMDB plot keywords',
+  liveKeywords: 'Allow TMDB keyword fallback',
   liveKeywordsTip:
-    'Look up additional plot matches on TMDB while searching. Turn this off to search only the local description and keyword indexes. Keywords are added during background refresh.',
+    'Search the local indexes first. If the local evidence is weak, TMDB can help find additional plot matches. Turn this off to keep plot searches local.',
   smartRefreshIntervalTip:
     'Daily and weekly run the initial scan and check for updates automatically. Manual only requires Refresh now to start or resume indexing and to check for updates.',
   refreshDaily: 'Daily',

@@ -9,6 +9,7 @@ import path from 'path';
 import {
   SmartSearchService,
   balanceRecommendationPools,
+  hasStrongLocalResults,
   ratingEvidence,
   relatedPrior,
   searchRerankShortlist,
@@ -40,6 +41,39 @@ const waitFor = async (condition: () => boolean) => {
   }
   throw new Error('Timed out waiting for indexing');
 };
+
+it('requires both retrieval agreement and plot evidence to skip fallback', () => {
+  const query = 'a lonely traveller discovers a hidden valley during winter';
+  const strong = {
+    document: {
+      ...document,
+      overview: 'A lonely traveller discovers a hidden valley in winter.',
+    },
+    score: 0.7,
+  };
+  const dense = [
+    strong,
+    ...Array.from({ length: 9 }, (_, i) => ({
+      document: { ...document, sourceId: String(i + 20) },
+      score: 0.6,
+    })),
+  ];
+  assert.equal(hasStrongLocalResults(query, dense, [strong], []), true);
+  assert.equal(hasStrongLocalResults(query, dense, [], [strong]), false);
+  assert.equal(
+    hasStrongLocalResults('hidden valley', dense, [strong], []),
+    false
+  );
+  assert.equal(
+    hasStrongLocalResults(
+      query,
+      [{ ...strong, document }, ...dense.slice(1)],
+      [strong],
+      []
+    ),
+    false
+  );
+});
 
 it('keeps independently strong plot matches and spends the full budget on short queries', () => {
   const candidates: SmartMatch[] = Array.from({ length: 45 }, (_, index) => ({
@@ -599,6 +633,7 @@ describe('hybrid retrieval resilience', () => {
     settings.smartSearchRefreshInterval = 'manual';
     settings.smartSearchLiveKeywords = true;
     let liveLookups = 0;
+    let providerCanHelp = true;
     const source: MetadataSource = {
       id: 'tmdb',
       async fetchOne() {
@@ -611,6 +646,7 @@ describe('hybrid retrieval resilience', () => {
         liveLookups++;
         return [{ ...document, sourceId: '21', card: { id: 21 } }];
       },
+      canSearchRelated: () => providerCanHelp,
     };
     const engine = {
       phase: 'idle' as const,
@@ -643,13 +679,17 @@ describe('hybrid retrieval resilience', () => {
       );
       assert.ok(results.some((result) => result.document.sourceId === '21'));
       assert.ok(service.status().retrievalWarning);
-      settings.smartSearchLiveKeywords = false;
+      providerCanHelp = false;
       const local = await service.search('barber murder', {});
       assert.equal(liveLookups, 1);
       assert.deepEqual(
         local.map(({ document, methods }) => [document.sourceId, methods]),
         [['20', ['lexical', 'tmdb-keyword']]]
       );
+      providerCanHelp = true;
+      settings.smartSearchLiveKeywords = false;
+      assert.deepEqual(await service.search('barber murder', {}), local);
+      assert.equal(liveLookups, 1);
     } finally {
       await service.close();
       settings.smartSearchRefreshInterval = original;

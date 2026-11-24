@@ -1,5 +1,6 @@
 import TheMovieDb from '@server/api/themoviedb';
 import type {
+  TmdbKeywordSearchResponse,
   TmdbSearchMovieResponse,
   TmdbSmartMovieDetails,
 } from '@server/api/themoviedb/interfaces';
@@ -135,4 +136,112 @@ it('distinguishes unavailable, empty, and retryable keyword-only lookups', async
     (error) => error === rateLimited
   );
   assert.deepEqual(request.mock.calls[0].arguments, ['movie', 1, signal]);
+});
+
+const keywordPage = (
+  page: number,
+  total_pages: number,
+  id: number,
+  name: string
+): TmdbKeywordSearchResponse => ({
+  page,
+  total_pages,
+  total_results: total_pages,
+  results: [{ id, name }],
+});
+
+it('skips absent keyword pages when the first page is already available', async (context) => {
+  const tmdb = new TheMovieDb();
+  const search = context.mock.method(tmdb, 'searchKeyword', async () =>
+    keywordPage(1, 1, 2, 'barber')
+  );
+  const discover = context.mock.method(tmdb, 'getDiscoverMovies', async () => ({
+    results: [],
+  }));
+  const source = new TmdbMetadataSource(tmdb);
+  const { signal } = new AbortController();
+  await source.searchRelated('barber', { mediaType: 'movie' }, 'en-US', signal);
+  assert.deepEqual(
+    search.mock.calls.map(({ arguments: [arg] }) => arg),
+    [{ query: 'barber', page: 1, signal }]
+  );
+  assert.equal(discover.mock.calls[0].arguments[0]?.keywords, '2');
+  assert.equal(discover.mock.calls[0].arguments[0]?.signal, signal);
+});
+
+it('retains valid speculative keywords and aborts pages outside the first result count', async (context) => {
+  const tmdb = new TheMovieDb();
+  let firstPageReady: (result: TmdbKeywordSearchResponse) => void = () =>
+    undefined;
+  const first = new Promise<TmdbKeywordSearchResponse>((resolve) => {
+    firstPageReady = resolve;
+  });
+  let thirdPageStarted: () => void = () => undefined;
+  const started = new Promise<void>((resolve) => {
+    thirdPageStarted = resolve;
+  });
+  let thirdPageAborted = false;
+  context.mock.method(
+    tmdb,
+    'searchKeyword',
+    async ({ page, signal }: Parameters<TheMovieDb['searchKeyword']>[0]) => {
+      if (page === 1) return first;
+      if (page === 2) return keywordPage(2, 2, 3, 'barber shop');
+      return new Promise<TmdbKeywordSearchResponse>((_resolve, reject) => {
+        signal?.addEventListener(
+          'abort',
+          () => {
+            thirdPageAborted = true;
+            reject(signal.reason);
+          },
+          { once: true }
+        );
+        thirdPageStarted();
+      });
+    }
+  );
+  const discover = context.mock.method(tmdb, 'getDiscoverMovies', async () => ({
+    results: [],
+  }));
+  const source = new TmdbMetadataSource(tmdb);
+  const lookup = source.searchRelated('barber', { mediaType: 'movie' });
+  await started;
+  firstPageReady(keywordPage(1, 2, 2, 'barber'));
+  await lookup;
+  assert.equal(discover.mock.calls[0].arguments[0]?.keywords, '2|3');
+  assert.equal(thirdPageAborted, true);
+});
+
+it('propagates cancellation from an outstanding keyword-based discover request', async (context) => {
+  const tmdb = new TheMovieDb();
+  context.mock.method(tmdb, 'searchKeyword', async () =>
+    keywordPage(1, 1, 2, 'barber')
+  );
+  let discoverStarted: () => void = () => undefined;
+  const started = new Promise<void>((resolve) => {
+    discoverStarted = resolve;
+  });
+  context.mock.method(
+    tmdb,
+    'getDiscoverMovies',
+    ({ signal }: { signal: AbortSignal }) =>
+      new Promise((_, reject) => {
+        signal.addEventListener('abort', () => reject(signal.reason), {
+          once: true,
+        });
+        discoverStarted();
+      })
+  );
+  const source = new TmdbMetadataSource(tmdb);
+  const controller = new AbortController();
+  const lookup = source.searchRelated(
+    'barber',
+    { mediaType: 'movie' },
+    'en-US',
+    controller.signal
+  );
+  await started;
+  const reason = new Error('local search finished');
+  controller.abort(reason);
+  await assert.rejects(lookup, (error) => error === reason);
 });
