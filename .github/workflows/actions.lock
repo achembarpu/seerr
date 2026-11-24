@@ -95,6 +95,11 @@ workflows:
         - 'ossf/scorecard-action@v2.6.0'
     '.github/workflows/seerr-labeller.yml':
         - 'actions/github-script@v9.0.0'
+    '.github/workflows/smart-search-macos.yml':
+        - 'actions/checkout@v7.0.1'
+        - 'actions/setup-node@v7.1.0'
+        - 'actions/upload-artifact@v7.0.2'
+        - 'pnpm/action-setup@v6.1.1'
     '.github/workflows/stale.yml':
         - 'actions/stale@v11.0.0'
     '.github/workflows/test-docs.yml':

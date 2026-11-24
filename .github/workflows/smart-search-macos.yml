@@ -1,0 +1,72 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Smart Search macOS build
+
+on:
+  push:
+    branches: [smart-search]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'achembarpu/seerr' && github.ref == 'refs/heads/smart-search'
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      CI: true
+      CYPRESS_INSTALL_BINARY: 0
+      NEXT_TELEMETRY_DISABLED: 1
+    steps:
+      - name: Check out build commit
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v6.1.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7.1.0
+        with:
+          node-version: 24.22.1
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build signed Apple Silicon app
+        run: bash scripts/build-macos-app.sh
+
+      - name: Run tests with native SQLite
+        run: |
+          export SEERR_TEST_VECTOR_EXTENSION="$PWD/build/macos/Seerr.app/Contents/Resources/runtime/seerrvectors.dylib"
+          pnpm test
+
+      - name: Verify archive and headless startup
+        run: bash scripts/test-macos-artifact.sh build/macos/Seerr-macOS-arm64.zip
+
+      - name: Record source commit and archive checksum
+        working-directory: build/macos
+        run: |
+          git rev-parse HEAD > BUILD_COMMIT
+          test "$(cat BUILD_COMMIT)" = "$GITHUB_SHA"
+          shasum -a 256 Seerr-macOS-arm64.zip > Seerr-macOS-arm64.zip.sha256
+
+      - name: Upload macOS build
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: seerr-macos-arm64
+          path: |
+            build/macos/Seerr-macOS-arm64.zip
+            build/macos/Seerr-macOS-arm64.zip.sha256
+            build/macos/BUILD_COMMIT
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
