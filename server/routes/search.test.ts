@@ -6,6 +6,7 @@ import smartSearch from '@server/lib/smartSearch/service';
 import express from 'express';
 import assert from 'node:assert/strict';
 import { after, describe, it, mock } from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import request from 'supertest';
 import searchRoutes from './search';
 
@@ -95,6 +96,36 @@ describe('local title suggestions', () => {
       .query({ query: 'mandel', language: 'ta' })
       .expect(200);
     assert.equal(findMock.mock.callCount() - resolveCount, 4);
+  });
+
+  it('shares in-flight catalog lookups across different autocomplete queries', async () => {
+    const original = TheMovieDb.prototype.getByExternalId;
+    const slow = mock.method(
+      TheMovieDb.prototype,
+      'getByExternalId',
+      async function (
+        this: TheMovieDb,
+        ...args: Parameters<TheMovieDb['getByExternalId']>
+      ) {
+        await delay(40);
+        return original.apply(this, args);
+      }
+    );
+    try {
+      const [first, second] = await Promise.all(
+        ['mandl', 'mandla'].map((query) =>
+          request(app)
+            .get('/search/suggestions')
+            .query({ query, language: 'de' })
+            .expect(200)
+        )
+      );
+      assert.deepEqual(first.body, second.body);
+      // The fixture returns two catalog IDs for each spelling.
+      assert.equal(slow.mock.callCount(), 2);
+    } finally {
+      slow.mock.restore();
+    }
   });
 
   it('uses the indexed card for TMDB title matches when available', async () => {

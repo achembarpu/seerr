@@ -7,7 +7,6 @@ import type {
   TmdbTvResult,
   TmdbTvSearchDetails,
 } from '@server/api/themoviedb/interfaces';
-import { MediaType as MainMediaType } from '@server/constants/media';
 import type Media from '@server/entity/Media';
 
 export type MediaType = 'tv' | 'movie' | 'person' | 'collection';
@@ -156,6 +155,16 @@ export const mapPersonResult = (
   }),
 });
 
+export const mediaByIdentity = (media: readonly Media[]) => {
+  const byIdentity = new Map<string, Media>();
+  for (const item of media) {
+    const key = `${item.mediaType}:${item.tmdbId}`;
+    // Preserve the first match if old data contains duplicate media rows.
+    if (!byIdentity.has(key)) byIdentity.set(key, item);
+  }
+  return byIdentity;
+};
+
 export const mapSearchResults = (
   results: (
     | TmdbMovieResult
@@ -164,31 +173,21 @@ export const mapSearchResults = (
     | TmdbCollectionResult
   )[],
   media?: Media[]
-): Results[] =>
-  results.map((result) => {
+): Results[] => {
+  const related = media ? mediaByIdentity(media) : undefined;
+  return results.map((result) => {
     switch (result.media_type) {
       case 'movie':
-        return mapMovieResult(
-          result,
-          media?.find(
-            (req) =>
-              req.tmdbId === result.id && req.mediaType === MainMediaType.MOVIE
-          )
-        );
+        return mapMovieResult(result, related?.get(`movie:${result.id}`));
       case 'tv':
-        return mapTvResult(
-          result,
-          media?.find(
-            (req) =>
-              req.tmdbId === result.id && req.mediaType === MainMediaType.TV
-          )
-        );
+        return mapTvResult(result, related?.get(`tv:${result.id}`));
       case 'collection':
         return mapCollectionResult(result);
       default:
         return mapPersonResult(result);
     }
   });
+};
 
 export const mapMovieDetailsToResult = (
   movieDetails: TmdbMovieSearchDetails

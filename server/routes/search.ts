@@ -25,6 +25,7 @@ import {
   mapSearchResults,
   mapTvDetailsToResult,
   mapTvResult,
+  mediaByIdentity,
 } from '@server/models/Search';
 import { Router } from 'express';
 import { LRUCache } from 'lru-cache';
@@ -69,11 +70,10 @@ const attachMediaInfo = async (
     cards.map((card) => ({ tmdbId: card.id, mediaType: card.mediaType })),
     { includeActiveRequest }
   );
+  const byIdentity = mediaByIdentity(related);
   return cards.map((card) => ({
     ...card,
-    mediaInfo: related.find(
-      (media) => media.tmdbId === card.id && media.mediaType === card.mediaType
-    ),
+    mediaInfo: byIdentity.get(`${card.mediaType}:${card.id}`),
   }));
 };
 
@@ -103,6 +103,10 @@ const titleCards = new LRUCache<string, MediaCard | false>({
   max: 2048,
   ttl: 60 * 60 * 1000,
 });
+
+// An autocomplete edit often needs cards already being resolved for the
+// previous text. Share in-flight requests without holding on to completed ones.
+const pendingTitleCards = new Map<string, Promise<MediaCard | false>>();
 
 searchRoutes.get('/smart', async (req, res, next) => {
   const controller = new AbortController();
@@ -287,40 +291,55 @@ searchRoutes.get('/suggestions', async (req, res) => {
           // The indexed card is already current enough for search and needs no
           // per-title request. Don't cache it independently of the index.
           if (local) return local;
-          let card: MediaCard | false;
-          if (source === 'imdb') {
-            const result = await tmdb.getByExternalId({
-              externalId: sourceId,
-              type: 'imdb',
-              language,
-            });
-            card =
-              mediaType === 'movie'
-                ? !!result.movie_results[0] &&
-                  mapMovieResult(result.movie_results[0])
-                : !!result.tv_results[0] && mapTvResult(result.tv_results[0]);
-          } else {
-            card =
-              mediaType === 'movie'
-                ? mapMovieResult(
-                    mapMovieDetailsToResult(
-                      await tmdb.getMovieSearchDetails({
-                        movieId: Number(sourceId),
-                        language,
-                      })
+          const pending = pendingTitleCards.get(key);
+          if (pending) return pending;
+          const lookup = (async (): Promise<MediaCard | false> => {
+            let card: MediaCard | false;
+            if (source === 'imdb') {
+              const result = await tmdb.getByExternalId({
+                externalId: sourceId,
+                type: 'imdb',
+                language,
+              });
+              card =
+                mediaType === 'movie'
+                  ? !!result.movie_results[0] &&
+                    mapMovieResult(result.movie_results[0])
+                  : !!result.tv_results[0] && mapTvResult(result.tv_results[0]);
+            } else {
+              card =
+                mediaType === 'movie'
+                  ? mapMovieResult(
+                      mapMovieDetailsToResult(
+                        await tmdb.getMovieSearchDetails({
+                          movieId: Number(sourceId),
+                          language,
+                        })
+                      )
                     )
-                  )
-                : mapTvResult(
-                    mapTvDetailsToResult(
-                      await tmdb.getTvSearchDetails({
-                        tvId: Number(sourceId),
-                        language,
-                      })
-                    )
-                  );
+                  : mapTvResult(
+                      mapTvDetailsToResult(
+                        await tmdb.getTvSearchDetails({
+                          tvId: Number(sourceId),
+                          language,
+                        })
+                      )
+                    );
+            }
+            titleCards.set(
+              key,
+              card,
+              card ? undefined : { ttl: 5 * 60 * 1000 }
+            );
+            return card;
+          })();
+          if (pendingTitleCards.size < 256) pendingTitleCards.set(key, lookup);
+          try {
+            return await lookup;
+          } finally {
+            if (pendingTitleCards.get(key) === lookup)
+              pendingTitleCards.delete(key);
           }
-          titleCards.set(key, card, card ? undefined : { ttl: 5 * 60 * 1000 });
-          return card;
         })
         .map((lookup) => lookup.catch(() => false as const));
       for (const [index, result] of resolved.entries()) {

@@ -141,6 +141,9 @@ export class SmartStore {
       'CREATE INDEX IF NOT EXISTS smart_filters ON smart_documents(mediaType, language, year)'
     );
     await this.run(
+      'CREATE INDEX IF NOT EXISTS smart_original_language ON smart_documents(language)'
+    );
+    await this.run(
       'CREATE TABLE IF NOT EXISTS smart_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)'
     );
     await this.run(
@@ -677,6 +680,11 @@ export class SmartStore {
         );
         if (native) return await this.loadDenseDocuments(native, snapshot);
       }
+      // For a fixed language, this index walks matching row IDs in order
+      // without sorting or scanning titles in all the other languages.
+      const scanIndex = filters.language
+        ? 'INDEXED BY smart_original_language'
+        : 'NOT INDEXED';
       let after = 0;
       const queries = vectors.map((vector) => ({
         score: prepareCosine(vector),
@@ -692,7 +700,7 @@ export class SmartStore {
         const rows = await this.all<
           Pick<Row, 'id' | 'vector' | 'voteCount'> & { document?: string }
         >(
-          `SELECT id, vector, voteCount${transient ? ', document' : ''} FROM smart_documents NOT INDEXED WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 1024`,
+          `SELECT id, vector, voteCount${transient ? ', document' : ''} FROM smart_documents ${scanIndex} WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 1024`,
           [after, ...params],
           snapshot
         );

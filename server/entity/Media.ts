@@ -59,8 +59,11 @@ class Media {
         .where(' media.tmdbId in (:...finalIds)', { finalIds })
         .getMany();
 
-      const relatedMedia = media.filter((m) =>
-        items.some((i) => i.tmdbId === m.tmdbId && i.mediaType === m.mediaType)
+      const identities = new Set(
+        items.map(({ tmdbId, mediaType }) => `${mediaType}:${tmdbId}`)
+      );
+      const relatedMedia = media.filter(({ tmdbId, mediaType }) =>
+        identities.has(`${mediaType}:${tmdbId}`)
       );
 
       if (
