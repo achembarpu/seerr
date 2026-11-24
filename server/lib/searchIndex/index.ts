@@ -1,3 +1,5 @@
+import logger from '@server/logger';
+import { setTimeout as delay } from 'node:timers/promises';
 import sqlite3 from 'sqlite3';
 import { normalizeTitle, prepareTitleSimilarity, titleRank } from './ranking';
 
@@ -31,8 +33,33 @@ interface CandidateRow extends IndexedTitle {
 }
 
 const SEARCH_CACHE_SIZE = 128;
-const NON_ASCII_TITLES =
-  "(searchTitle GLOB '*[^ -~]*' OR searchOriginalTitle GLOB '*[^ -~]*')";
+const NON_ASCII_TITLES = nonAsciiTitles();
+const PAIR_BATCH_SIZE = 4000;
+
+function nonAsciiTitles(prefix = ''): string {
+  return `(${prefix}searchTitle GLOB '*[^ -~]*' OR ${prefix}searchOriginalTitle GLOB '*[^ -~]*')`;
+}
+
+// Two Unicode code points map to a single ASCII FTS token by encoding their
+// UTF-8 bytes as hex. Preserve marks and mixed-script pairs without relying
+// on the tokenizer to segment a title.
+const pairTokens = (titles: string): string => `
+  WITH RECURSIVE batch(id, title, original) AS MATERIALIZED (${titles}),
+  tails(id, tail) AS (
+    SELECT id, title FROM batch
+    UNION ALL SELECT id, original FROM batch WHERE title <> original
+    UNION ALL SELECT id, substr(tail, 2) FROM tails
+      WHERE length(tail) > 2 AND tail GLOB '*[^ -~]*'
+  ), pairs(id, pair) AS (
+    SELECT id, substr(tail, 1, 2) FROM tails WHERE length(tail) >= 2
+  )
+  SELECT id, group_concat(hex(pair), ' ') FROM pairs
+  WHERE pair GLOB '*[^ -~]*' GROUP BY id`;
+
+const closeConnection = (database: sqlite3.Database): Promise<void> =>
+  new Promise((resolve, reject) =>
+    database.close((error) => (error ? reject(error) : resolve()))
+  );
 
 const trigrams = (query: string): string[] => {
   const grams = new Set<string>();
@@ -76,6 +103,9 @@ const accentTrigrams = (query: string, grams: string[]): string[] => {
 export class SearchIndex {
   private database: sqlite3.Database;
   private reader?: sqlite3.Database;
+  private titlePairsReady = false;
+  private titlePairsBuild?: Promise<void>;
+  private closing = false;
   private importing?: IndexSource;
   private revision = 0;
   private readonly searchCache = new Map<string, TitleMatch[]>();
@@ -90,11 +120,20 @@ export class SearchIndex {
 
   private run(
     sql: string,
-    params: (string | number | null)[] = []
+    params: (string | number | null)[] = [],
+    database = this.database
   ): Promise<void> {
     return new Promise((resolve, reject) => {
-      this.database.run(sql, params, (error) =>
-        error ? reject(error) : resolve()
+      database.run(sql, params, (error) => (error ? reject(error) : resolve()));
+    });
+  }
+
+  private connect(mode: number): Promise<sqlite3.Database> {
+    return new Promise((resolve, reject) => {
+      const connection: sqlite3.Database = new sqlite3.Database(
+        this.filename,
+        mode,
+        (error) => (error ? reject(error) : resolve(connection))
       );
     });
   }
@@ -170,13 +209,123 @@ export class SearchIndex {
       popularity REAL NOT NULL
     ) WITHOUT ROWID`);
     // Read the last committed WAL snapshot while an import is published.
-    this.reader = await new Promise<sqlite3.Database>((resolve, reject) => {
-      const reader: sqlite3.Database = new sqlite3.Database(
-        this.filename,
-        sqlite3.OPEN_READONLY,
-        (error) => (error ? reject(error) : resolve(reader))
-      );
+    this.reader = await this.connect(sqlite3.OPEN_READONLY);
+    this.titlePairsBuild = this.backfillTitlePairs().catch((error) => {
+      logger.warn('Short title pair index unavailable', {
+        label: 'Search',
+        errorMessage: error instanceof Error ? error.message : String(error),
+      });
     });
+  }
+
+  private async backfillTitlePairs(): Promise<void> {
+    // Use a separate writer so backfill statements cannot become part of an
+    // import's transaction. Readers continue serving the committed index.
+    const writer = await this.connect(sqlite3.OPEN_READWRITE);
+    writer.configure('busyTimeout', 250);
+    try {
+      const newTokens = pairTokens(
+        'SELECT new.id, new.searchTitle, new.searchOriginalTitle'
+      );
+      let installed = false;
+      while (!this.closing && !this.titlePairsReady) {
+        try {
+          await this.run('BEGIN IMMEDIATE', [], writer);
+        } catch (error) {
+          if ((error as { code?: string }).code !== 'SQLITE_BUSY') throw error;
+          await delay(50);
+          continue;
+        }
+        try {
+          if (!installed) {
+            await this.run(
+              `CREATE VIRTUAL TABLE IF NOT EXISTS title_pairs USING fts5(
+                pairs, content='', contentless_delete=1, detail=none, tokenize='ascii'
+              )`,
+              [],
+              writer
+            );
+            await this.run(
+              `CREATE TRIGGER IF NOT EXISTS title_pairs_insert AFTER INSERT ON titles
+                WHEN ${nonAsciiTitles('new.')} BEGIN
+                INSERT INTO title_pairs(rowid, pairs) SELECT * FROM (${newTokens});
+              END`,
+              [],
+              writer
+            );
+            await this.run(
+              `CREATE TRIGGER IF NOT EXISTS title_pairs_update
+                AFTER UPDATE OF id, searchTitle, searchOriginalTitle ON titles
+                WHEN (${nonAsciiTitles('old.')} OR ${nonAsciiTitles('new.')})
+                  AND (old.id <> new.id OR old.searchTitle <> new.searchTitle
+                    OR old.searchOriginalTitle <> new.searchOriginalTitle) BEGIN
+                DELETE FROM title_pairs WHERE rowid = old.id;
+                INSERT INTO title_pairs(rowid, pairs) SELECT * FROM (${newTokens});
+              END`,
+              [],
+              writer
+            );
+            await this.run(
+              `CREATE TRIGGER IF NOT EXISTS title_pairs_delete AFTER DELETE ON titles
+                WHEN ${nonAsciiTitles('old.')} BEGIN
+                DELETE FROM title_pairs WHERE rowid = old.id;
+              END`,
+              [],
+              writer
+            );
+            await this.run(
+              `CREATE TABLE IF NOT EXISTS title_pairs_progress (
+                id INTEGER PRIMARY KEY CHECK (id = 1), cursor INTEGER NOT NULL,
+                complete INTEGER NOT NULL
+              )`,
+              [],
+              writer
+            );
+          }
+          const [progress] = await this.all<{
+            cursor: number;
+            complete: number;
+          }>('SELECT cursor, complete FROM title_pairs_progress', [], writer);
+          const cursor = progress?.cursor ?? 0;
+          let complete = !!progress?.complete;
+          if (!complete) {
+            const [{ id }] = await this.all<{ id: number | null }>(
+              `SELECT MAX(id) AS id FROM (
+                SELECT id FROM titles INDEXED BY title_non_ascii
+                WHERE id > ? AND ${NON_ASCII_TITLES} ORDER BY id LIMIT ${PAIR_BATCH_SIZE}
+              )`,
+              [cursor],
+              writer
+            );
+            complete = id === null;
+            if (id !== null)
+              await this.run(
+                `INSERT OR REPLACE INTO title_pairs(rowid, pairs) ${pairTokens(
+                  `SELECT id, searchTitle, searchOriginalTitle
+                  FROM titles INDEXED BY title_non_ascii
+                  WHERE id > ? AND id <= ? AND ${NON_ASCII_TITLES}`
+                )}`,
+                [cursor, id],
+                writer
+              );
+            await this.run(
+              'INSERT OR REPLACE INTO title_pairs_progress VALUES (1, ?, ?)',
+              [id ?? cursor, Number(complete)],
+              writer
+            );
+          }
+          await this.run('COMMIT', [], writer);
+          installed = true;
+          this.titlePairsReady = complete;
+        } catch (error) {
+          await this.run('ROLLBACK', [], writer).catch(() => undefined);
+          throw error;
+        }
+        if (!this.titlePairsReady) await delay(10);
+      }
+    } finally {
+      await closeConnection(writer);
+    }
   }
 
   async beginImport(source: IndexSource): Promise<void> {
@@ -442,18 +591,34 @@ export class SearchIndex {
       const useCoveringIndex = pairs.every((pair) =>
         /[^\p{ASCII}]/u.test(pair)
       );
-      const predicates = pairs.map(
-        () => '(instr(searchTitle, ?) OR instr(searchOriginalTitle, ?))'
-      );
-      const nearby = await this.all<CandidateRow>(
-        `WITH nearby AS MATERIALIZED (
-          SELECT id FROM titles ${useCoveringIndex ? 'INDEXED BY title_non_ascii' : ''}
-          WHERE ${useCoveringIndex ? `${NON_ASCII_TITLES} AND ` : ''}(${predicates.join(' OR ')})
-          ORDER BY id LIMIT 5000
-        ) ${select} JOIN nearby ON nearby.id = t.id ORDER BY t.id`,
-        pairs.flatMap((pair) => [pair, pair]),
-        this.reader
-      );
+      let nearby: CandidateRow[] | undefined;
+      if (useCoveringIndex && this.titlePairsReady) {
+        nearby = await this.all<CandidateRow>(
+          `WITH nearby AS MATERIALIZED (
+            SELECT rowid AS id FROM title_pairs WHERE title_pairs MATCH ?
+            ORDER BY rowid LIMIT 5000
+          ) ${select} JOIN nearby ON nearby.id = t.id ORDER BY t.id`,
+          [pairs.map((pair) => Buffer.from(pair).toString('hex')).join(' OR ')],
+          this.reader
+        ).catch(() => {
+          this.titlePairsReady = false;
+          return undefined;
+        });
+      }
+      if (!nearby) {
+        const predicates = pairs.map(
+          () => '(instr(searchTitle, ?) OR instr(searchOriginalTitle, ?))'
+        );
+        nearby = await this.all<CandidateRow>(
+          `WITH nearby AS MATERIALIZED (
+            SELECT id FROM titles ${useCoveringIndex ? 'INDEXED BY title_non_ascii' : ''}
+            WHERE ${useCoveringIndex ? `${NON_ASCII_TITLES} AND ` : ''}(${predicates.join(' OR ')})
+            ORDER BY id LIMIT 5000
+          ) ${select} JOIN nearby ON nearby.id = t.id ORDER BY t.id`,
+          pairs.flatMap((pair) => [pair, pair]),
+          this.reader
+        );
+      }
       const keys = new Set(
         candidates.map(
           (item) => `${item.source}:${item.mediaType}:${item.sourceId}`
@@ -489,16 +654,11 @@ export class SearchIndex {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
+    await this.titlePairsBuild;
     const databases = this.reader
       ? [this.reader, this.database]
       : [this.database];
-    await Promise.all(
-      databases.map(
-        (database) =>
-          new Promise<void>((resolve, reject) =>
-            database.close((error) => (error ? reject(error) : resolve()))
-          )
-      )
-    );
+    await Promise.all(databases.map(closeConnection));
   }
 }

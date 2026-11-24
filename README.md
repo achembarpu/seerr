@@ -43,6 +43,8 @@ Administrators can enable local typo-tolerant title search in Search Settings. S
 
 IMDb permits a personal movie database for individual personal, non-commercial use, subject to [IMDb's terms](https://help.imdb.com/article/imdb/general-information/can-i-use-imdb-data-in-my-software/G5JTRESSHJBBHTGX). Enable this feature only if your use complies. Information courtesy of IMDb (https://www.imdb.com). Used with permission. Disabling it cancels active downloads and hides suggestions but retains the rebuildable index on disk. A database publication already in progress may finish.
 
+Short non-Latin queries use a small SQLite index of adjacent character pairs. Seerr builds it from existing titles in the background and continues serving searches during the build.
+
 ## Preview
 
 <img src="./public/preview.jpg" alt="Seerr application preview" />

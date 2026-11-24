@@ -5,6 +5,21 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, it, mock } from 'node:test';
+import type sqlite3 from 'sqlite3';
+
+type IndexTestMethods = {
+  run: (
+    sql: string,
+    params?: (string | number | null)[],
+    database?: sqlite3.Database
+  ) => Promise<void>;
+  all: (
+    sql: string,
+    params?: (string | number)[],
+    database?: sqlite3.Database
+  ) => Promise<unknown[]>;
+  titlePairsBuild?: Promise<void>;
+};
 
 const movie = (
   sourceId: string,
@@ -41,12 +56,10 @@ it('continues to search the committed index while an update is being published',
     await index.writeBatch([movie('tt1', 'New Film')]);
 
     // Pause with the new rows written but the transaction uncommitted.
-    const methods = index as unknown as {
-      run: (sql: string, params?: (string | number | null)[]) => Promise<void>;
-    };
+    const methods = index as unknown as IndexTestMethods;
     const run = methods.run.bind(index);
-    methods.run = async (sql, params) => {
-      await run(sql, params);
+    methods.run = async (sql, params, database) => {
+      await run(sql, params, database);
       if (sql.startsWith('INSERT INTO titles ')) {
         entered();
         await gate;
@@ -72,6 +85,103 @@ it('continues to search the committed index while an update is being published',
     if (timeout) clearTimeout(timeout);
     release();
     await updating?.catch(() => undefined);
+    await index.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('uses the exact fallback during pair backfill and maintains indexed matches as imports change', async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'seerr-search-pairs-'));
+  const filename = path.join(directory, 'index.sqlite3');
+  let index = new SearchIndex(filename);
+  let release: () => void = () => undefined;
+  let entered: () => void = () => undefined;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const started = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  try {
+    const old = index as unknown as IndexTestMethods;
+    const oldRun = old.run.bind(index);
+    old.run = async (sql, params, database) => {
+      if (sql.startsWith('CREATE VIRTUAL TABLE IF NOT EXISTS title_pairs '))
+        throw new Error('unrecognized option: contentless_delete');
+      await oldRun(sql, params, database);
+    };
+    await index.initialize();
+    await old.titlePairsBuild;
+    await index.beginImport('imdb');
+    await index.writeBatch([
+      movie('tt1', 'Infernal Affairs', '無間道'),
+      movie('tt2', 'Parasite', '기생충'),
+      movie('tt3', 'a한c'),
+      movie('tt4', 'abc'),
+    ]);
+    await index.finishImport('titles');
+    assert.equal((await index.search('無間到'))[0]?.sourceId, 'tt1');
+    await index.close();
+
+    index = new SearchIndex(filename);
+    const methods = index as unknown as IndexTestMethods;
+    const run = methods.run.bind(index);
+    methods.run = async (sql, params, database) => {
+      if (sql.startsWith('INSERT OR REPLACE INTO title_pairs(rowid, pairs)')) {
+        entered();
+        await gate;
+      }
+      await run(sql, params, database);
+    };
+    await index.initialize();
+    const build = methods.titlePairsBuild;
+    assert.ok(build);
+    await Promise.race([
+      started,
+      build.then(() => {
+        throw new Error('Pair backfill did not reach the test gate');
+      }),
+    ]);
+    const queries = ['無間到', '기생총', 'a한b', 'abé'];
+    const fallback = await Promise.all(
+      queries.map((query) => index.search(query, 10))
+    );
+    assert.deepEqual(
+      fallback.map((matches) => matches[0]?.sourceId),
+      ['tt1', 'tt2', 'tt3', 'tt4']
+    );
+    release();
+    await build;
+    const sql = mock.method(methods, 'all');
+    try {
+      assert.deepEqual(
+        await Promise.all(queries.map((query) => index.search(query, 11))),
+        fallback
+      );
+      assert.equal(
+        sql.mock.calls.filter(({ arguments: [query] }) =>
+          query.includes('title_pairs MATCH')
+        ).length,
+        3
+      );
+
+      await index.beginImport('imdb');
+      await index.writeBatch([
+        movie('tt1', 'Other Film'),
+        movie('tt3', 'a한c'),
+        movie('tt5', 'New Film', '無間山'),
+      ]);
+      await index.finishImport('refresh');
+      assert.deepEqual(
+        (await index.search('無間到')).map(({ sourceId }) => sourceId),
+        ['tt5']
+      );
+      assert.deepEqual(await index.search('기생총'), []);
+    } finally {
+      sql.mock.restore();
+    }
+  } finally {
+    release();
     await index.close();
     await rm(directory, { recursive: true, force: true });
   }
