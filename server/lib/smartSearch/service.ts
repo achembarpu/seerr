@@ -1,6 +1,7 @@
 import { getSettings } from '@server/lib/settings';
 import logger from '@server/logger';
 import { appDataPath } from '@server/utils/appDataVolume';
+import { LRUCache } from 'lru-cache';
 import { performance } from 'node:perf_hooks';
 import path from 'path';
 import { setTimeout as delay } from 'timers/promises';
@@ -325,6 +326,10 @@ export class SmartSearchService {
     string,
     { document: SmartDocument; vector: Buffer }
   >();
+  private readonly relatedEmbeddings = new LRUCache<string, Buffer>({
+    max: 256,
+    ttl: 30 * 60 * 1000,
+  });
   private count = 0;
   private error?: string;
   private nextRefreshAt?: string;
@@ -576,6 +581,7 @@ export class SmartSearchService {
     if (!this.enabled()) {
       this.clearRerankScores();
       this.clearDenseCache();
+      this.relatedEmbeddings.clear();
       if (this.timer) clearTimeout(this.timer);
       this.timer = undefined;
       this.nextRefreshAt = undefined;
@@ -613,6 +619,7 @@ export class SmartSearchService {
   reconfigure(): void {
     this.clearRerankScores();
     this.clearDenseCache();
+    this.relatedEmbeddings.clear();
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     this.nextRefreshAt = undefined;
@@ -1305,8 +1312,9 @@ export class SmartSearchService {
   }
 
   private async seed(type: SmartMediaType, id: string) {
-    if (!this.store) return undefined;
+    if (!this.store || this.closing || !this.enabled()) return undefined;
     let seed = await this.store.find(this.source.id, type, id);
+    if (this.closing || !this.enabled()) return undefined;
     if (seed) {
       this.seedCache.delete(`${type}:${id}`);
       return seed;
@@ -1336,6 +1344,57 @@ export class SmartSearchService {
     }
   }
 
+  private async embedRelated(
+    store: SmartStore,
+    type: SmartMediaType,
+    documents: SmartDocument[]
+  ): Promise<Buffer[] | undefined> {
+    const runtime = this.runtimeController.signal;
+    // Indexed vectors are reusable only for the same input, including its
+    // synopsis language and genres. Prefer them when a title has since been
+    // indexed, then reuse previously computed embeddings for the rest.
+    const indexed = await store
+      .existing(
+        this.source.id,
+        type,
+        documents.map((doc) => doc.sourceId)
+      )
+      .catch(() => undefined);
+    const hashes = documents.map(documentHash);
+    const vectors = documents.map((doc, index) => {
+      const entry =
+        doc.source === this.source.id ? indexed?.get(doc.sourceId) : undefined;
+      const hash = hashes[index];
+      return entry?.hash === hash
+        ? entry.vector
+        : this.relatedEmbeddings.get(hash);
+    });
+    const missing = new Map<string, SmartDocument>();
+    for (const [index, doc] of documents.entries()) {
+      if (!vectors[index]) missing.set(hashes[index], doc);
+    }
+    if (!missing.size) return vectors as Buffer[];
+    if (this.engine.phase !== 'ready' || runtime.aborted) return undefined;
+
+    const embeddings = await this.engine.embed(
+      [...missing.values()].map(documentText),
+      AbortSignal.timeout(1200)
+    );
+    if (embeddings.length !== missing.size || runtime.aborted) return undefined;
+
+    const generated = new Map(
+      [...missing.keys()].map((hash, index) => [
+        hash,
+        quantize(embeddings[index]),
+      ])
+    );
+    for (const [hash, vector] of generated)
+      this.relatedEmbeddings.set(hash, vector);
+    return vectors.map(
+      (vector, index) => vector ?? generated.get(hashes[index])!
+    );
+  }
+
   async similar(
     type: SmartMediaType,
     id: string,
@@ -1349,67 +1408,46 @@ export class SmartSearchService {
         )
       : Promise.resolve([]);
     const seed =
-      this.enabled() && this.store
-        ? await withDeadline(this.seed(type, id), 2000).catch(() => undefined)
+      this.enabled() && !this.closing
+        ? await withDeadline(
+            this.open().then(() => this.seed(type, id)),
+            2000
+          ).catch(() => undefined)
         : undefined;
-    const local =
-      seed && this.store
-        ? await this.searchDense(seed.vector, applied, 250).catch(() => [])
-        : [];
+    const store = this.store;
+    const localPromise =
+      seed && store
+        ? this.runDenseScan(() =>
+            store.searchNeighbors([seed.vector], applied, 250)
+          ).then(
+            ([matches]) => matches,
+            () => []
+          )
+        : Promise.resolve([]);
     const remote = (await remotePromise)
       .filter((doc) => matchesFilters(doc, applied))
       .slice(0, 24);
-    let related: { doc: SmartDocument; score: number }[] = remote.map(
-      (doc, index) => ({ doc, score: 1 - index / 100 })
-    );
     const relatedScore = (doc: SmartDocument, similarity: number) =>
       similarity +
       (seed ? relatedPrior(seed.document, doc, similarity) : 0) +
       0.008 * ratingEvidence(doc) * relevanceStrength(similarity);
-    if (seed && remote.length && this.engine.phase === 'ready') {
-      try {
-        // A stored vector is eligible only if the embedding input is
-        // identical, including the overview language and genres.
-        const indexed = await this.store
-          ?.existing(
-            this.source.id,
-            type,
-            remote.map((doc) => doc.sourceId)
-          )
-          .catch(() => undefined);
-        const known = remote.map((doc) => {
-          const entry =
-            doc.source === this.source.id
-              ? indexed?.get(doc.sourceId)
-              : undefined;
-          return entry?.hash === documentHash(doc) ? entry.vector : undefined;
-        });
-        const missing = remote.filter((_, index) => !known[index]);
-        const embeddings = missing.length
-          ? await this.engine.embed(
-              missing.map(documentText),
-              AbortSignal.timeout(1200)
-            )
-          : [];
-        if (embeddings.length === missing.length) {
-          let next = 0;
-          related = remote
+    // Fetch and embed the remote candidates in parallel with the catalog scan.
+    // If any vectors are unavailable, keep the source's own ranking.
+    const vectors =
+      seed && store && remote.length
+        ? await this.embedRelated(store, type, remote).catch(() => undefined)
+        : undefined;
+    const related =
+      seed && vectors
+        ? remote
             .map((doc, index) => ({
               doc,
-              score: relatedScore(
-                doc,
-                cosine(
-                  seed.vector,
-                  known[index] ?? quantize(embeddings[next++])
-                )
-              ),
+              score: relatedScore(doc, cosine(seed.vector, vectors[index])),
             }))
-            .sort((a, b) => b.score - a.score);
-        }
-      } catch {
-        /* Local and TMDB ordering remain available if inference is busy. */
-      }
-    }
+            .sort((a, b) => b.score - a.score)
+            .map(({ doc }) => doc)
+        : remote;
+    const local = await localPromise;
     const localMatches = local
       .map((item) => ({ item, rank: relatedScore(item.document, item.score) }))
       .sort((a, b) => b.rank - a.rank)
@@ -1417,7 +1455,7 @@ export class SmartSearchService {
         ...item,
         methods: ['semantic'] as SmartMatch['methods'],
       }));
-    const remoteMatches = related.map(({ doc: document }) => ({
+    const remoteMatches = related.map((document) => ({
       document,
       score: 0,
       methods: ['tmdb-similar'] as SmartMatch['methods'],
@@ -1488,14 +1526,11 @@ export class SmartSearchService {
     const vectors = seedsBySource.flatMap((seed) =>
       seed ? [seed.vector] : []
     );
-    const localPools =
-      vectors.length > 1
-        ? await this.runDenseScan(() =>
-            store.searchMany(vectors, filters, 50)
-          ).catch(() => [])
-        : vectors.length === 1
-          ? [await this.searchDense(vectors[0], filters, 50).catch(() => [])]
-          : [];
+    const localPools = vectors.length
+      ? await this.runDenseScan(() =>
+          store.searchNeighbors(vectors, filters, 50)
+        ).catch(() => [])
+      : [];
     let localIndex = 0;
     for (const [index, { remote }] of sources.entries()) {
       const seed = seedsBySource[index];
@@ -1542,6 +1577,7 @@ export class SmartSearchService {
   async close(): Promise<void> {
     this.clearRerankScores();
     this.clearDenseCache();
+    this.relatedEmbeddings.clear();
     this.closing = true;
     if (this.timer) clearTimeout(this.timer);
     if (this.idleTimer) clearTimeout(this.idleTimer);

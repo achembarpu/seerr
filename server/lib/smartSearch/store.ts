@@ -1,7 +1,13 @@
 import { createHash, randomUUID } from 'crypto';
+import { LRUCache } from 'lru-cache';
 import { endianness } from 'node:os';
 import sqlite3 from 'sqlite3';
-import type { SmartDocument, SmartFilters, SmartMediaType } from './types';
+import {
+  smartMediaTypes,
+  type SmartDocument,
+  type SmartFilters,
+  type SmartMediaType,
+} from './types';
 import { prepareCosine } from './vectors';
 
 export interface SmartMatch {
@@ -81,7 +87,16 @@ const nativeVoteBonuses = Buffer.from(
 );
 const littleEndian = endianness() === 'LE';
 
-type DenseHit = { id: number; score: number };
+type DenseHit = { id: number; score: number; document?: string };
+type NeighborPool = {
+  revision: number;
+  hits: DenseHit[];
+  matches: SmartMatch[];
+  exhaustive: boolean;
+};
+const neighborReserve = 24;
+const neighborChangeRetention = 8192;
+const maxNeighborDelta = 4096;
 
 export class SmartStore {
   private db: sqlite3.Database;
@@ -93,11 +108,17 @@ export class SmartStore {
   private lexicalTotal = 0;
   private lexicalError?: string;
   private readonly activeSearches = new Set<Promise<void>>();
+  private readonly neighbors = new LRUCache<string, NeighborPool>({
+    max: 48,
+    maxSize: 4096,
+    sizeCalculation: ({ hits }) => Math.max(1, hits.length),
+  });
   private readonly documentVersionId = randomUUID();
   private documentRevision = 0;
   private activeDocumentWrites = 0;
   private canLoadVectorExtension = true;
   private vectorExtensionLoaded = false;
+  private denseCoverAvailable = false;
   constructor(
     private readonly filename: string,
     private readonly vectorExtension = process.env.SEERR_VECTOR_EXTENSION
@@ -143,9 +164,40 @@ export class SmartStore {
     await this.run(
       'CREATE INDEX IF NOT EXISTS smart_original_language ON smart_documents(language)'
     );
+    if (this.vectorExtension) {
+      // Bulk native scans read just these columns. Keep the original scan
+      // path available if there is insufficient space for this extra index.
+      this.denseCoverAvailable = await this.run(
+        `CREATE INDEX IF NOT EXISTS smart_dense_cover ON smart_documents(
+          mediaType, language, id, vector, voteCount, year, voteAverage, genres)`
+      ).then(
+        () => true,
+        () => false
+      );
+    }
     await this.run(
       'CREATE TABLE IF NOT EXISTS smart_state (key TEXT PRIMARY KEY, value TEXT NOT NULL)'
     );
+    await this.run(
+      'CREATE TABLE IF NOT EXISTS smart_neighbor_changes (seq INTEGER PRIMARY KEY AUTOINCREMENT, id INTEGER NOT NULL)'
+    );
+    for (const [action, row] of [
+      ['INSERT', 'new'],
+      ['UPDATE', 'new'],
+      ['DELETE', 'old'],
+    ]) {
+      // The log starts empty on an existing index. Each mutation publishes
+      // with the actual document, including on another SQLite connection.
+      await this
+        .run(`CREATE TRIGGER IF NOT EXISTS smart_neighbors_${action.toLowerCase()}
+        AFTER ${action} ON smart_documents BEGIN
+        ${action === 'UPDATE' ? 'INSERT INTO smart_neighbor_changes(id) SELECT old.id WHERE old.id != new.id;' : ''}
+        INSERT INTO smart_neighbor_changes(id) VALUES (${row}.id);
+        DELETE FROM smart_neighbor_changes
+        WHERE seq <= last_insert_rowid() - ${neighborChangeRetention}
+        AND last_insert_rowid() % 256 = 0;
+        END`);
+    }
     await this.run(
       `CREATE VIRTUAL TABLE IF NOT EXISTS smart_fts USING fts5(title, overview, tokenize='unicode61 remove_diacritics 2')`
     );
@@ -495,6 +547,7 @@ export class SmartStore {
   private async nativeSearch(
     snapshot: sqlite3.Database,
     vectors: readonly Buffer[],
+    scanIndex: string,
     conditions: string[],
     filters: (string | number)[],
     limit: number,
@@ -530,7 +583,7 @@ export class SmartStore {
           `seerr_top(?, ?, vector, seerr_votes(?, voteCount), id) AS hits${index}`
       );
       const [row] = await this.all<Record<string, Buffer | null>>(
-        `SELECT ${expressions.join(', ')} FROM smart_documents WHERE ${conditions.join(' AND ')}`,
+        `SELECT ${expressions.join(', ')} FROM smart_documents ${scanIndex} WHERE ${conditions.join(' AND ')}`,
         [
           ...vectors.flatMap((vector) => [vector, limit, nativeVoteBonuses]),
           0,
@@ -606,6 +659,25 @@ export class SmartStore {
     limit = 30,
     signal?: AbortSignal
   ): Promise<SmartMatch[][]> {
+    return this.searchVectors(vectors, filters, limit, signal);
+  }
+
+  /** Reuse exact neighbors for recurring title seeds as the catalog changes. */
+  async searchNeighbors(
+    vectors: readonly Buffer[],
+    filters: SmartFilters,
+    limit: number
+  ): Promise<SmartMatch[][]> {
+    return this.searchVectors(vectors, filters, limit, undefined, limit <= 250);
+  }
+
+  private async searchVectors(
+    vectors: readonly Buffer[],
+    filters: SmartFilters,
+    limit: number,
+    signal?: AbortSignal,
+    reuseNeighbors = false
+  ): Promise<SmartMatch[][]> {
     signal?.throwIfAborted();
     if (this.closing) throw new Error('Search index is closing');
     limit = Math.floor(limit);
@@ -637,123 +709,25 @@ export class SmartStore {
             );
           });
       if (!transient) await this.run('BEGIN', [], snapshot);
-      const conditions = ['id > ?'];
-      const params: (string | number)[] = [];
-      if (filters.mediaType) {
-        conditions.push('mediaType = ?');
-        params.push(filters.mediaType);
-      }
-      if (filters.language) {
-        conditions.push('language = ?');
-        params.push(filters.language);
-      }
-      if (filters.yearFrom !== undefined) {
-        conditions.push('year >= ?');
-        params.push(filters.yearFrom);
-      }
-      if (filters.yearTo !== undefined) {
-        conditions.push('year <= ?');
-        params.push(filters.yearTo);
-      }
-      if (filters.minRating !== undefined) {
-        conditions.push('voteAverage >= ?');
-        params.push(filters.minRating);
-      }
-      if (filters.minVotes !== undefined) {
-        conditions.push('voteCount >= ?');
-        params.push(filters.minVotes);
-      }
-      if (filters.genre !== undefined) {
-        conditions.push(
-          'EXISTS (SELECT 1 FROM json_each(genres) WHERE value = ?)'
-        );
-        params.push(filters.genre);
-      }
-      if (!transient) {
-        const native = await this.nativeSearch(
+      if (reuseNeighbors && !transient)
+        return await this.searchNeighborSnapshot(
           snapshot,
           vectors,
-          conditions,
-          params,
-          limit,
-          signal
+          filters,
+          limit
         );
-        if (native) return await this.loadDenseDocuments(native, snapshot);
-      }
-      // For a fixed language, this index walks matching row IDs in order
-      // without sorting or scanning titles in all the other languages.
-      const scanIndex = filters.language
-        ? 'INDEXED BY smart_original_language'
-        : 'NOT INDEXED';
-      let after = 0;
-      const queries = vectors.map((vector) => ({
-        score: prepareCosine(vector),
-        best: [] as {
-          id: number;
-          score: number;
-          rank: number;
-          document?: string;
-        }[],
-      }));
-      for (;;) {
-        signal?.throwIfAborted();
-        const rows = await this.all<
-          Pick<Row, 'id' | 'vector' | 'voteCount'> & { document?: string }
-        >(
-          `SELECT id, vector, voteCount${transient ? ', document' : ''} FROM smart_documents ${scanIndex} WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 1024`,
-          [after, ...params],
-          snapshot
-        );
-        signal?.throwIfAborted();
-        if (!rows.length) break;
-        for (const row of rows) {
-          // This bonus is independent of the query. Keep the exact order
-          // when scanning several independent seeds in the same transaction.
-          const votes = Math.max(0, row.voteCount);
-          const bonus =
-            denseVoteBonuses[votes] ??
-            0.015 * Math.min(1, Math.log1p(votes) / Math.log(1001));
-          const candidate = new Int8Array(
-            row.vector.buffer,
-            row.vector.byteOffset,
-            row.vector.byteLength
-          );
-          for (const { score: similarity, best } of queries) {
-            const score = similarity(candidate);
-            const rank = score + bonus;
-            if (best.length === limit && rank <= best[limit - 1].rank) continue;
-            let low = 0;
-            let high = best.length;
-            while (low < high) {
-              const middle = (low + high) >>> 1;
-              if (rank > best[middle].rank) high = middle;
-              else low = middle + 1;
-            }
-            best.splice(low, 0, {
-              id: row.id,
-              score,
-              rank,
-              document: row.document,
-            });
-            if (best.length > limit) best.pop();
-          }
-        }
-        after = rows[rows.length - 1].id;
-        await new Promise<void>((resolve) => setImmediate(resolve));
-      }
-      // Fetch descriptions only for the final shortlist; reading each large JSON
-      // document during the vector scan adds substantial SQLite and Node work.
+      const hits = await this.scanDense(snapshot, vectors, filters, limit, {
+        signal,
+        transient,
+      });
       if (transient)
-        return queries.map(({ best }) =>
-          best.map(({ document, score }) => ({
+        return hits.map((group) =>
+          group.map(({ document, score }) => ({
             document: JSON.parse(document!) as SmartDocument,
             score,
           }))
         );
-      return await this.loadDenseDocuments(
-        queries.map(({ best }) => best),
-        snapshot
-      );
+      return await this.loadDenseDocuments(hits, snapshot);
     } finally {
       try {
         if (!transient && snapshot)
@@ -766,6 +740,307 @@ export class SmartStore {
       }
     }
   }
+  private async scanDense(
+    snapshot: sqlite3.Database,
+    vectors: readonly Buffer[],
+    filters: SmartFilters,
+    limit: number,
+    {
+      signal,
+      transient,
+      ids,
+    }: {
+      signal?: AbortSignal;
+      transient?: boolean;
+      ids?: ReadonlySet<number>;
+    } = {}
+  ): Promise<DenseHit[][]> {
+    const conditions = ['id > ?'];
+    const params: (string | number)[] = [];
+    if (filters.mediaType) {
+      conditions.push('mediaType = ?');
+      params.push(filters.mediaType);
+    }
+    if (filters.language) {
+      conditions.push('language = ?');
+      params.push(filters.language);
+    }
+    if (filters.yearFrom !== undefined) {
+      conditions.push('year >= ?');
+      params.push(filters.yearFrom);
+    }
+    if (filters.yearTo !== undefined) {
+      conditions.push('year <= ?');
+      params.push(filters.yearTo);
+    }
+    if (filters.minRating !== undefined) {
+      conditions.push('voteAverage >= ?');
+      params.push(filters.minRating);
+    }
+    if (filters.minVotes !== undefined) {
+      conditions.push('voteCount >= ?');
+      params.push(filters.minVotes);
+    }
+    if (filters.genre !== undefined) {
+      conditions.push(
+        'EXISTS (SELECT 1 FROM json_each(genres) WHERE value = ?)'
+      );
+      params.push(filters.genre);
+    }
+    if (ids) {
+      if (!ids.size) return vectors.map(() => []);
+      conditions.push('id IN (SELECT value FROM json_each(?))');
+      params.push(JSON.stringify([...ids]));
+    }
+    if (!transient) {
+      const useCover = this.denseCoverAvailable && !ids;
+      // mediaType precedes language in the covering index. Equality on the
+      // supported types lets SQLite seek directly to a selected language.
+      const restrictCoverTypes =
+        useCover && filters.language && !filters.mediaType;
+      const native = await this.nativeSearch(
+        snapshot,
+        vectors,
+        ids ? 'NOT INDEXED' : useCover ? 'INDEXED BY smart_dense_cover' : '',
+        restrictCoverTypes
+          ? [
+              ...conditions,
+              `mediaType IN (${smartMediaTypes.map(() => '?').join(',')})`,
+            ]
+          : conditions,
+        restrictCoverTypes ? [...params, ...smartMediaTypes] : params,
+        limit,
+        signal
+      );
+      if (native) return native;
+    }
+    // For a fixed language, this index walks matching row IDs in order
+    // without sorting or scanning titles in all the other languages.
+    const scanIndex =
+      !ids && filters.language
+        ? 'INDEXED BY smart_original_language'
+        : 'NOT INDEXED';
+    let after = 0;
+    const queries = vectors.map((vector) => ({
+      score: prepareCosine(vector),
+      best: [] as {
+        id: number;
+        score: number;
+        rank: number;
+        document?: string;
+      }[],
+    }));
+    for (;;) {
+      signal?.throwIfAborted();
+      const rows = await this.all<
+        Pick<Row, 'id' | 'vector' | 'voteCount'> & { document?: string }
+      >(
+        `SELECT id, vector, voteCount${transient ? ', document' : ''} FROM smart_documents ${scanIndex} WHERE ${conditions.join(' AND ')} ORDER BY id LIMIT 1024`,
+        [after, ...params],
+        snapshot
+      );
+      signal?.throwIfAborted();
+      if (!rows.length) break;
+      for (const row of rows) {
+        // This bonus is independent of the query. Keep the exact order
+        // when scanning several independent seeds in the same transaction.
+        const votes = Math.max(0, row.voteCount);
+        const bonus =
+          denseVoteBonuses[votes] ??
+          0.015 * Math.min(1, Math.log1p(votes) / Math.log(1001));
+        const candidate = new Int8Array(
+          row.vector.buffer,
+          row.vector.byteOffset,
+          row.vector.byteLength
+        );
+        for (const { score: similarity, best } of queries) {
+          const score = similarity(candidate);
+          const rank = score + bonus;
+          if (best.length === limit && rank <= best[limit - 1].rank) continue;
+          let low = 0;
+          let high = best.length;
+          while (low < high) {
+            const middle = (low + high) >>> 1;
+            if (rank > best[middle].rank) high = middle;
+            else low = middle + 1;
+          }
+          best.splice(low, 0, {
+            id: row.id,
+            score,
+            rank,
+            document: row.document,
+          });
+          if (best.length > limit) best.pop();
+        }
+      }
+      after = rows[rows.length - 1].id;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    return queries.map(({ best }) => best);
+  }
+
+  private async searchNeighborSnapshot(
+    snapshot: sqlite3.Database,
+    vectors: readonly Buffer[],
+    filters: SmartFilters,
+    limit: number
+  ): Promise<SmartMatch[][]> {
+    const scope = [
+      filters.mediaType,
+      filters.language,
+      filters.yearFrom,
+      filters.yearTo,
+      filters.genre,
+      filters.minRating,
+      filters.minVotes,
+    ];
+    if (
+      scope.some(
+        (value) => typeof value === 'number' && !Number.isFinite(value)
+      )
+    )
+      return this.loadDenseDocuments(
+        await this.scanDense(snapshot, vectors, filters, limit),
+        snapshot
+      );
+    const [history] = await this.all<{ oldest: number; latest: number }>(
+      `SELECT
+        COALESCE((SELECT MIN(seq) FROM smart_neighbor_changes), 0) AS oldest,
+        COALESCE((SELECT MAX(seq) FROM smart_neighbor_changes), 0) AS latest`,
+      [],
+      snapshot
+    );
+    const capacity = limit + neighborReserve;
+    type Query = {
+      vector: Buffer;
+      key: string;
+      previous?: NeighborPool;
+      hits?: DenseHit[];
+      matches?: SmartMatch[];
+      safeCount: number;
+      canBeExhaustive: boolean;
+      changed?: Set<number>;
+    };
+    const queries: Query[] = vectors.map((vector) => {
+      const key = JSON.stringify([vector.toString('base64'), limit, scope]);
+      return {
+        vector,
+        key,
+        previous: this.neighbors.get(key),
+        safeCount: capacity,
+        canBeExhaustive: true,
+      };
+    });
+    const oldestCached = Math.min(
+      history.latest,
+      ...queries.flatMap(({ previous }) =>
+        previous && previous.revision >= history.oldest - 1
+          ? [previous.revision]
+          : []
+      )
+    );
+    const changes =
+      oldestCached < history.latest
+        ? await this.all<{ seq: number; id: number }>(
+            'SELECT seq, id FROM smart_neighbor_changes WHERE seq > ?',
+            [oldestCached],
+            snapshot
+          )
+        : [];
+    const cold: Query[] = [];
+    const refresh: Query[] = [];
+    const refreshIds = new Set<number>();
+    for (const query of queries) {
+      const previous = query.previous;
+      if (previous?.revision === history.latest) {
+        query.matches = previous.matches;
+        continue;
+      }
+      if (
+        previous &&
+        previous.revision >= history.oldest - 1 &&
+        previous.revision < history.latest
+      ) {
+        const changed = new Set(
+          changes
+            .filter(({ seq }) => seq > previous.revision)
+            .map(({ id }) => id)
+        );
+        const untouched = previous.hits.filter(
+          ({ id }) => !changed.has(id)
+        ).length;
+        // Unchanged cached hits still outrank every unchanged row outside the
+        // pool. If the reserve cannot cover removals, run the exact full scan.
+        const safeCount = previous.exhaustive ? capacity : untouched;
+        if (safeCount >= limit && changed.size <= maxNeighborDelta) {
+          query.safeCount = safeCount;
+          query.canBeExhaustive = previous.exhaustive;
+          query.changed = changed;
+          refresh.push(query);
+          for (const { id } of previous.hits) refreshIds.add(id);
+          for (const id of changed) refreshIds.add(id);
+          continue;
+        }
+      }
+      cold.push(query);
+    }
+    if (cold.length) {
+      const groups = await this.scanDense(
+        snapshot,
+        cold.map(({ vector }) => vector),
+        filters,
+        capacity
+      );
+      cold.forEach((query, index) => {
+        query.hits = groups[index];
+      });
+    }
+    if (refresh.length) {
+      const groups = await this.scanDense(
+        snapshot,
+        refresh.map(({ vector }) => vector),
+        filters,
+        capacity,
+        { ids: refreshIds }
+      );
+      refresh.forEach((query, index) => {
+        query.hits = groups[index].slice(0, query.safeCount);
+        const previous = query.previous!;
+        if (
+          query.hits
+            .slice(0, limit)
+            .every(
+              ({ id, score }, position) =>
+                previous.hits[position]?.id === id &&
+                previous.hits[position].score === score &&
+                !query.changed!.has(id)
+            ) &&
+          query.hits.slice(0, limit).length === previous.matches.length
+        )
+          query.matches = previous.matches;
+      });
+    }
+    const toLoad = queries.filter((query) => !query.matches);
+    const loaded = await this.loadDenseDocuments(
+      toLoad.map(({ hits }) => hits!.slice(0, limit)),
+      snapshot
+    );
+    toLoad.forEach((query, i) => {
+      query.matches = loaded[i];
+    });
+    for (const { key, hits, matches, canBeExhaustive } of queries) {
+      if (!hits || (this.neighbors.peek(key)?.revision ?? -1) > history.latest)
+        continue;
+      this.neighbors.set(key, {
+        revision: history.latest,
+        hits,
+        matches: matches!,
+        exhaustive: canBeExhaustive && hits.length < capacity,
+      });
+    }
+    return queries.map(({ matches }) => matches!);
+  }
+
   async close(): Promise<void> {
     this.closing = true;
     await this.lexicalTask;

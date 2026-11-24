@@ -1,4 +1,5 @@
-export type SmartMediaType = 'movie' | 'tv';
+export const smartMediaTypes = ['movie', 'tv'] as const;
+export type SmartMediaType = (typeof smartMediaTypes)[number];
 
 /** The fields discovery needs from a metadata source. */
 export interface SmartDocument {

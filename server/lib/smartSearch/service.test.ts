@@ -1680,8 +1680,10 @@ it('uses ratings only to resolve close library-recommendation matches', async ()
   };
   const service = new SmartSearchService(() => true, engine, source);
   const internal = service as unknown as {
-    store: { find: () => Promise<{ document: SmartDocument; vector: Buffer }> };
-    searchDense: () => Promise<{ document: SmartDocument; score: number }[]>;
+    store: {
+      find: () => Promise<{ document: SmartDocument; vector: Buffer }>;
+      searchNeighbors: SmartStore['searchNeighbors'];
+    };
   };
   internal.store = {
     async find() {
@@ -1690,45 +1692,50 @@ it('uses ratings only to resolve close library-recommendation matches', async ()
         vector: quantize([1, 0]),
       };
     },
+    async searchNeighbors(vectors) {
+      assert.equal(vectors.length, 1);
+      return [
+        [
+          {
+            document: {
+              ...document,
+              sourceId: 'lower',
+              voteAverage: 5,
+              voteCount: 1000,
+            },
+            score: 0.8,
+          },
+          {
+            document: {
+              ...document,
+              sourceId: 'higher',
+              voteAverage: 9,
+              voteCount: 1000,
+            },
+            score: 0.79,
+          },
+          ...Array.from({ length: 18 }, (_, index) => ({
+            document: {
+              ...document,
+              sourceId: `other-${index}`,
+              voteAverage: 0,
+              voteCount: 0,
+            },
+            score: 0.6 - index * 0.01,
+          })),
+          {
+            document: {
+              ...document,
+              sourceId: 'weak',
+              voteAverage: 10,
+              voteCount: 10000,
+            },
+            score: 0.2,
+          },
+        ],
+      ];
+    },
   };
-  internal.searchDense = async () => [
-    {
-      document: {
-        ...document,
-        sourceId: 'lower',
-        voteAverage: 5,
-        voteCount: 1000,
-      },
-      score: 0.8,
-    },
-    {
-      document: {
-        ...document,
-        sourceId: 'higher',
-        voteAverage: 9,
-        voteCount: 1000,
-      },
-      score: 0.79,
-    },
-    ...Array.from({ length: 18 }, (_, index) => ({
-      document: {
-        ...document,
-        sourceId: `other-${index}`,
-        voteAverage: 0,
-        voteCount: 0,
-      },
-      score: 0.6 - index * 0.01,
-    })),
-    {
-      document: {
-        ...document,
-        sourceId: 'weak',
-        voteAverage: 10,
-        voteCount: 10000,
-      },
-      score: 0.2,
-    },
-  ];
   const result = await service.recommendations(
     [{ type: 'movie', id: 'seed' }],
     {}
@@ -1764,7 +1771,7 @@ it('uses an established rating to break close similar-title ties', async () => {
   const internal = service as unknown as {
     store: {
       find: () => Promise<{ document: SmartDocument; vector: Buffer }>;
-      search: () => Promise<{ document: SmartDocument; score: number }[]>;
+      searchNeighbors: SmartStore['searchNeighbors'];
     };
   };
   internal.store = {
@@ -1774,26 +1781,28 @@ it('uses an established rating to break close similar-title ties', async () => {
         vector: quantize([1, 0]),
       };
     },
-    async search() {
+    async searchNeighbors() {
       return [
-        {
-          document: {
-            ...document,
-            sourceId: 'lower',
-            voteAverage: 5,
-            voteCount: 1000,
+        [
+          {
+            document: {
+              ...document,
+              sourceId: 'lower',
+              voteAverage: 5,
+              voteCount: 1000,
+            },
+            score: 0.5,
           },
-          score: 0.5,
-        },
-        {
-          document: {
-            ...document,
-            sourceId: 'higher',
-            voteAverage: 9,
-            voteCount: 1000,
+          {
+            document: {
+              ...document,
+              sourceId: 'higher',
+              voteAverage: 9,
+              voteCount: 1000,
+            },
+            score: 0.5,
           },
-          score: 0.5,
-        },
+        ],
       ];
     },
   };
@@ -1832,7 +1841,7 @@ it('keeps a stronger obscure similar title ahead of a weaker popular one', async
   const internal = service as unknown as {
     store: {
       find: () => Promise<{ document: SmartDocument; vector: Buffer }>;
-      search: () => Promise<{ document: SmartDocument; score: number }[]>;
+      searchNeighbors: SmartStore['searchNeighbors'];
     };
   };
   internal.store = {
@@ -1842,26 +1851,28 @@ it('keeps a stronger obscure similar title ahead of a weaker popular one', async
         vector: quantize([1, 0]),
       };
     },
-    async search() {
+    async searchNeighbors() {
       return [
-        {
-          document: {
-            ...document,
-            sourceId: 'relevant',
-            voteAverage: 0,
-            voteCount: 0,
+        [
+          {
+            document: {
+              ...document,
+              sourceId: 'relevant',
+              voteAverage: 0,
+              voteCount: 0,
+            },
+            score: 0.56,
           },
-          score: 0.56,
-        },
-        {
-          document: {
-            ...document,
-            sourceId: 'weak',
-            voteAverage: 9,
-            voteCount: 10000,
+          {
+            document: {
+              ...document,
+              sourceId: 'weak',
+              voteAverage: 9,
+              voteCount: 10000,
+            },
+            score: 0.5,
           },
-          score: 0.5,
-        },
+        ],
       ];
     },
   };
@@ -1873,7 +1884,7 @@ it('keeps a stronger obscure similar title ahead of a weaker popular one', async
   }
 });
 
-it('reuses indexed vectors only for identical remote descriptions and reranks the rest', async () => {
+it('reuses indexed and computed vectors only for identical remote descriptions', async () => {
   const settings = getSettings().main;
   const original = settings.smartSearchRerank;
   settings.smartSearchRerank = false;
@@ -1892,7 +1903,7 @@ it('reuses indexed vectors only for identical remote descriptions and reranks th
   };
   const embedded: string[] = [];
   const engine = {
-    phase: 'ready' as const,
+    phase: 'ready' as 'ready' | 'idle',
     downloadBytes: 0,
     downloadTotal: 1,
     async start() {},
@@ -1920,7 +1931,7 @@ it('reuses indexed vectors only for identical remote descriptions and reranks th
   const internal = service as unknown as {
     store: {
       find: () => Promise<{ document: SmartDocument; vector: Buffer }>;
-      search: () => Promise<never[]>;
+      searchNeighbors: SmartStore['searchNeighbors'];
       existing: SmartStore['existing'];
     };
   };
@@ -1943,8 +1954,8 @@ it('reuses indexed vectors only for identical remote descriptions and reranks th
     async find() {
       return { document: seed, vector: quantize([1, 0]) };
     },
-    async search() {
-      return [];
+    async searchNeighbors() {
+      return [[]];
     },
   };
   try {
@@ -1955,6 +1966,16 @@ it('reuses indexed vectors only for identical remote descriptions and reranks th
     );
     assert.equal(embedded.length, 1);
     assert.match(embedded[0], /Unrelated/);
+
+    engine.phase = 'idle';
+    assert.deepEqual(await service.similar('movie', '1', {}), result);
+    assert.equal(embedded.length, 1);
+
+    engine.phase = 'ready';
+    remoteNoise.overview = 'New Unrelated synopsis';
+    await service.similar('movie', '1', {});
+    assert.equal(embedded.length, 2);
+    assert.match(embedded[1], /New Unrelated synopsis/);
   } finally {
     settings.smartSearchRerank = original;
   }

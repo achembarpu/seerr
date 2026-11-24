@@ -228,6 +228,67 @@ it('keeps scored vectors and documents consistent while the index changes', asyn
   }
 });
 
+it('updates exact reusable neighbor pools from changed rows and rebuilds when history expires', async () => {
+  const { directory, filename, store } = await versionTestStore();
+  const other = new SmartStore(filename);
+  try {
+    const internal = store as unknown as VersionTestInternals;
+    const scanPlans: ('full' | 'subset')[] = [];
+    const all = internal.all.bind(store);
+    internal.all = async (...args) => {
+      if (args[0].startsWith('SELECT id, vector, voteCount')) {
+        scanPlans.push(args[0].includes('id IN') ? 'subset' : 'full');
+      }
+      return all(...args);
+    };
+    await store.upsertBatch(
+      Array.from({ length: 64 }, (_, i) => ({
+        document: doc(String(i + 1)),
+        vector: quantize([1, (i + 1) / 64]),
+      }))
+    );
+    const vectors = [quantize([1, 0]), quantize([-1, 0])];
+    const filters = { language: 'en', genre: 12 };
+    const limit = 3;
+    const cached = () => store.searchNeighbors(vectors, filters, limit);
+    const fresh = () => store.searchMany(vectors, filters, limit);
+
+    assert.deepEqual(await cached(), await fresh());
+    scanPlans.length = 0;
+    await cached();
+    assert.equal(scanPlans.length, 0);
+
+    await other.upsert(doc('70'), quantize([1, 0]));
+    const afterInsert = await cached();
+    assert.equal(afterInsert[0][0].document.sourceId, '70');
+    assert.ok(scanPlans.includes('subset'));
+    assert.ok(!scanPlans.includes('full'));
+    assert.deepEqual(afterInsert, await fresh());
+
+    scanPlans.length = 0;
+    await other.upsert(doc('70', { title: 'Changed' }), quantize([1, 0]));
+    await other.remove('tmdb', 'movie', '1');
+    const afterUpdate = await cached();
+    assert.equal(afterUpdate[0][0].document.title, 'Changed');
+    assert.ok(!scanPlans.includes('full'));
+    assert.deepEqual(afterUpdate, await fresh());
+
+    await store.upsert(doc('71'), quantize([-1, 0]));
+    await store.remove('tmdb', 'movie', '70');
+    await internal.run(
+      'DELETE FROM smart_neighbor_changes WHERE seq < (SELECT MAX(seq) FROM smart_neighbor_changes)'
+    );
+    scanPlans.length = 0;
+    const refreshed = await cached();
+    assert.ok(scanPlans.includes('full'));
+    assert.deepEqual(refreshed, await fresh());
+  } finally {
+    await other.close();
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 it('searches a transient in-memory index without a second connection', async () => {
   const store = new SmartStore(':memory:');
   try {
