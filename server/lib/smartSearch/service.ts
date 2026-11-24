@@ -314,6 +314,9 @@ export class SmartSearchService {
   private opening?: Promise<SmartStore>;
   private controller?: AbortController;
   private timer?: NodeJS.Timeout;
+  private keywordTimer?: NodeJS.Timeout;
+  private keywordController?: AbortController;
+  private keywordWork?: Promise<void>;
   private idleTimer?: NodeJS.Timeout;
   private runtimeController = new AbortController();
   private cursor?: Cursor;
@@ -586,6 +589,7 @@ export class SmartSearchService {
       this.timer = undefined;
       this.nextRefreshAt = undefined;
       this.controller?.abort();
+      this.stopKeywordEnrichment();
       this.store?.pauseLexical();
       this.runtimeController.abort();
       if (this.idleTimer) clearTimeout(this.idleTimer);
@@ -601,11 +605,13 @@ export class SmartSearchService {
         .then(() => this.releaseReranker())
         .catch(() => undefined);
     if (getSettings().main.smartSearchRefreshInterval === 'manual') {
+      this.stopKeywordEnrichment();
       void this.open().catch((error) => {
         this.error = String(error);
       });
       return;
     }
+    this.scheduleKeywordEnrichment(0);
     if (!this.controller && !this.timer) {
       this.inFlight = this.refresh().catch((error) => {
         logger.error('Smart search failed', {
@@ -637,7 +643,85 @@ export class SmartSearchService {
     this.timer = undefined;
     this.nextRefreshAt = undefined;
     this.inFlight = this.refresh();
+    this.enrichKeywords();
     return true;
+  }
+
+  private scheduleKeywordEnrichment(wait: number): void {
+    if (
+      this.closing ||
+      !this.enabled() ||
+      !this.source.fetchKeywords ||
+      this.keywordWork ||
+      this.keywordTimer ||
+      getSettings().main.smartSearchRefreshInterval === 'manual'
+    )
+      return;
+    this.keywordTimer = setTimeout(() => {
+      this.keywordTimer = undefined;
+      this.enrichKeywords();
+    }, wait);
+    this.keywordTimer.unref();
+  }
+
+  private stopKeywordEnrichment(): void {
+    if (this.keywordTimer) clearTimeout(this.keywordTimer);
+    this.keywordTimer = undefined;
+    this.keywordController?.abort();
+  }
+
+  private enrichKeywords(): void {
+    const fetchKeywords = this.source.fetchKeywords?.bind(this.source);
+    if (!fetchKeywords || this.keywordWork || this.closing || !this.enabled())
+      return;
+    if (this.keywordTimer) clearTimeout(this.keywordTimer);
+    this.keywordTimer = undefined;
+    const controller = new AbortController();
+    this.keywordController = controller;
+    const { signal } = controller;
+    const batchSize = 32;
+    let retryAfter = retryInterval;
+    this.keywordWork = (async () => {
+      const store = await this.open();
+      const entries = await store.nextKeywordEnrichment(
+        this.source.id,
+        batchSize
+      );
+      let stored = 0;
+      for (let offset = 0; offset < entries.length; offset += 4) {
+        signal.throwIfAborted();
+        const results = await Promise.allSettled(
+          entries
+            .slice(offset, offset + 4)
+            .map(async ({ mediaType, sourceId }) => {
+              const keywords = await fetchKeywords(mediaType, sourceId, signal);
+              signal.throwIfAborted();
+              if (keywords === undefined) return;
+              await store.setKeywords(
+                this.source.id,
+                mediaType,
+                sourceId,
+                keywords
+              );
+              stored++;
+            })
+        );
+        if (results.every((result) => result.status === 'rejected')) break;
+      }
+      if (entries.length === batchSize && stored > 0) retryAfter = 15000;
+    })()
+      .catch((error) => {
+        if (!signal.aborted)
+          logger.warn('Local plot keyword enrichment failed', {
+            label: 'Smart Search',
+            errorMessage: String(error),
+          });
+      })
+      .finally(() => {
+        this.keywordWork = undefined;
+        this.keywordController = undefined;
+        this.scheduleKeywordEnrichment(retryAfter);
+      });
   }
 
   private schedule(delay: number): void {
@@ -742,15 +826,23 @@ export class SmartSearchService {
   private async updateChanges(
     store: SmartStore,
     since: string,
-    signal: AbortSignal
+    signal: AbortSignal,
+    duringBackfill = false
   ): Promise<void> {
     if (!this.source.fetchChanges)
       throw new Error('Source does not support incremental updates');
     const today = new Date().toISOString().slice(0, 10);
+    // Reconcile settled days a page at a time while the historical scan runs.
+    const through = duringBackfill
+      ? new Date(Date.parse(`${today}T00:00:00Z`) - interval)
+          .toISOString()
+          .slice(0, 10)
+      : today;
+    if (since > through) return;
     const saved = await store.getState('changesCursor');
     let cursor: { date: string; mediaType: SmartMediaType; page: number } =
       saved ? JSON.parse(saved) : { date: since, mediaType: 'movie', page: 1 };
-    while (cursor.date <= today) {
+    while (cursor.date <= through) {
       signal.throwIfAborted();
       const batch = await this.source.fetchChanges(
         cursor.mediaType,
@@ -802,6 +894,7 @@ export class SmartSearchService {
           page: 1,
         };
       await store.setState('changesCursor', JSON.stringify(cursor));
+      if (duringBackfill && cursor.date <= through) return;
     }
     await store.setState('lastUpdated', today);
     await store.setState('changesCursor', '');
@@ -859,11 +952,11 @@ export class SmartSearchService {
         );
       }
       const lastUpdated = await store.getState('lastUpdated');
-      if (lastUpdated && this.source.fetchChanges) {
+      const saved = await store.getState('cursor');
+      if (!saved && lastUpdated && this.source.fetchChanges) {
         await this.updateChanges(store, lastUpdated, controller.signal);
         return;
       }
-      const saved = await store.getState('cursor');
       let scanStarted = await store.getState('scanStarted');
       if (!saved || !scanStarted) {
         scanStarted = new Date().toISOString().slice(0, 10);
@@ -879,8 +972,23 @@ export class SmartSearchService {
             month: 0,
             page: 1,
           };
+      let nextChangeCheck = 0;
       while (this.cursor.year >= firstYear) {
         controller.signal.throwIfAborted();
+        if (this.source.fetchChanges && Date.now() >= nextChangeCheck) {
+          nextChangeCheck = Date.now() + 30000;
+          try {
+            const since = (await store.getState('lastUpdated')) || scanStarted;
+            await this.updateChanges(store, since, controller.signal, true);
+          } catch (error) {
+            controller.signal.throwIfAborted();
+            nextChangeCheck = Date.now() + retryInterval;
+            logger.warn('Deferring recent changes while backfill continues', {
+              label: 'Smart Search',
+              errorMessage: String(error),
+            });
+          }
+        }
         const cursor: Cursor = this.cursor;
         const { year, month, page, mediaType } = cursor;
         const day = cursor.day ?? 0;
@@ -940,7 +1048,8 @@ export class SmartSearchService {
         await store.setState('cursor', JSON.stringify(this.cursor));
       }
       await store.setState('cursor', '');
-      await store.setState('lastUpdated', scanStarted);
+      if (!(await store.getState('lastUpdated')))
+        await store.setState('lastUpdated', scanStarted);
       await store.setState('scanStarted', '');
       this.cursor = undefined;
     } catch (error) {
@@ -1157,16 +1266,28 @@ export class SmartSearchService {
     const lexicalPromise = store
       ? store.searchLexical(query, filters, 500, signal)
       : Promise.resolve([]);
-    const remotePromise = this.source.searchRelated
-      ? withDeadline(this.source.searchRelated(query, filters, language))
+    const keywordsPromise = store
+      ? store.searchKeywords(query, filters, 80, signal)
       : Promise.resolve([]);
-    const [denseResult, lexicalResult, remoteResult] = await Promise.allSettled(
-      [densePromise, lexicalPromise, remotePromise]
-    );
+    const remotePromise =
+      this.source.searchRelated &&
+      getSettings().main.smartSearchLiveKeywords !== false
+        ? withDeadline(this.source.searchRelated(query, filters, language))
+        : Promise.resolve([]);
+    const [denseResult, lexicalResult, keywordsResult, remoteResult] =
+      await Promise.allSettled([
+        densePromise,
+        lexicalPromise,
+        keywordsPromise,
+        remotePromise,
+      ]);
     signal?.throwIfAborted();
-    const errors = [denseResult, lexicalResult, remoteResult].filter(
-      (result) => result.status === 'rejected'
-    );
+    const errors = [
+      denseResult,
+      lexicalResult,
+      keywordsResult,
+      remoteResult,
+    ].filter((result) => result.status === 'rejected');
     this.retrievalWarning = errors.length
       ? 'Some search sources are unavailable; showing available results.'
       : undefined;
@@ -1187,15 +1308,19 @@ export class SmartSearchService {
           score: 0,
           methods: ['tmdb-keyword'] as SmartMatch['methods'],
         }));
+      const keywordMatches =
+        remoteMatches.length || keywordsResult.status === 'rejected'
+          ? remoteMatches
+          : keywordsResult.value;
       const fused = fuseSmartCandidates(
-        [denseMatches, lexical, remoteMatches],
+        [denseMatches, lexical, keywordMatches],
         1000
       );
       // Reserve room for both strong dense candidates and high-ranked
       // on-demand metadata candidates; RRF alone over-rewards overlap and
       // can hide an older film that is not yet in the vector index.
       const protectedKeys = new Set(
-        [...denseMatches.slice(0, 20), ...remoteMatches.slice(0, 5)].map(
+        [...denseMatches.slice(0, 20), ...keywordMatches.slice(0, 5)].map(
           matchKey
         )
       );
@@ -1580,6 +1705,7 @@ export class SmartSearchService {
     this.relatedEmbeddings.clear();
     this.closing = true;
     if (this.timer) clearTimeout(this.timer);
+    this.stopKeywordEnrichment();
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.controller?.abort();
     this.runtimeController.abort();
@@ -1587,6 +1713,7 @@ export class SmartSearchService {
     this.reranker.stop();
     if (this.rerankerIdle) clearTimeout(this.rerankerIdle);
     await this.inFlight;
+    await this.keywordWork;
     await this.opening?.catch(() => undefined);
     await this.store?.close();
     this.store = undefined;

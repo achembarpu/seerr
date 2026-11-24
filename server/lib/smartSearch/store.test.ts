@@ -581,6 +581,129 @@ it('indexes lexical metadata without changing embeddings, and keeps it updated',
   }
 });
 
+it('retrieves compound keywords, prioritizes multiple matching terms and honors filters', async () => {
+  const { directory, store } = await versionTestStore();
+  const vector = quantize([1, 0]);
+  try {
+    await store.upsertBatch(
+      [
+        doc('1', { keywords: ['barbershop', 'murder'], voteCount: 150 }),
+        doc('2', { keywords: ['murder'], voteCount: 9500 }),
+        doc('3', { keywords: ['murder'], voteCount: 20 }),
+        doc('4', { keywords: ['barber', 'murder'], originalLanguage: 'ko' }),
+        doc('5', { keywords: ['barber', 'murder'], mediaType: 'tv' }),
+        doc('6', { keywords: ['barber', 'murder'], year: 1980 }),
+        doc('7', { keywords: ['barber', 'murder'], genreIds: [35] }),
+        doc('8', { keywords: ['barber', 'murder'], voteAverage: 5 }),
+        doc('9', { keywords: ['lucid dreaming', 'a risky heist'] }),
+        doc('10', { keywords: ['barber', 'murder'], voteCount: 25 }),
+        doc('11', { keywords: ['barber', 'murder'], year: 2030 }),
+      ].map((document) => ({ document, vector }))
+    );
+    const matches = await store.searchKeywords('barber murders', {
+      mediaType: 'movie',
+      language: 'en',
+      yearFrom: 2010,
+      yearTo: 2025,
+      minRating: 7,
+      minVotes: 50,
+      genre: 12,
+    });
+    assert.deepEqual(
+      matches.map(({ document }) => document.sourceId),
+      ['1', '2']
+    );
+    assert.ok(matches[0].score > matches[1].score);
+    assert.deepEqual(matches[0].methods, ['tmdb-keyword']);
+    assert.deepEqual(
+      (await store.searchKeywords('murder', { minVotes: 500 }, 1)).map(
+        ({ document }) => document.sourceId
+      ),
+      ['2']
+    );
+    assert.equal(
+      (await store.searchKeywords('film about a dream heist'))[0].document
+        .sourceId,
+      '9'
+    );
+    assert.deepEqual(await store.searchKeywords('barb'), []);
+    const stopped = AbortSignal.abort(new Error('Search cancelled'));
+    await assert.rejects(
+      store.searchKeywords('murder', {}, 10, stopped),
+      /Search cancelled/
+    );
+  } finally {
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+it('enriches high-vote titles without updating vectors, and maintains keyword coverage through refresh and deletion', async () => {
+  const { directory, store } = await versionTestStore();
+  const vector = quantize([1, 0]);
+  const pending = async () =>
+    (await store.nextKeywordEnrichment('tmdb', 16)).map(
+      ({ sourceId }) => sourceId
+    );
+  try {
+    await store.upsertBatch(
+      [
+        doc('1', { voteCount: 200 }),
+        doc('2', { voteCount: 3000 }),
+        doc('3', { voteCount: 99 }),
+        doc('4', { voteCount: 4000, keywords: [] }),
+        doc('5', { voteCount: 7000, source: 'other' }),
+      ].map((document) => ({ document, vector }))
+    );
+    assert.deepEqual(await pending(), ['2', '1']);
+    assert.equal((await store.nextKeywordEnrichment('tmdb', 1)).length, 1);
+    const before = await store.documentVersion();
+    await store.setKeywords('tmdb', 'movie', '2', ['barber', 'murder']);
+    await store.setKeywords('tmdb', 'movie', '1', []);
+    assert.equal(await store.documentVersion(), before);
+    assert.deepEqual((await store.find('tmdb', 'movie', '2'))?.vector, vector);
+    assert.deepEqual(await pending(), []);
+    assert.equal(
+      (await store.searchKeywords('barber'))[0]?.document.sourceId,
+      '2'
+    );
+
+    await store.upsert(
+      doc('2', { voteCount: 3200, title: 'New card' }),
+      vector
+    );
+    assert.equal(
+      (await store.searchKeywords('barber'))[0]?.document.title,
+      'New card'
+    );
+    assert.deepEqual(await pending(), []);
+    const explicit = doc('2', { voteCount: 3200, keywords: ['dream'] });
+    await store.upsert(explicit, vector);
+    assert.deepEqual(await store.searchKeywords('barber'), []);
+    assert.equal(
+      (await store.searchKeywords('dream'))[0]?.document.sourceId,
+      '2'
+    );
+    await store.setKeywords('tmdb', 'movie', '2', []);
+    await store.upsert(explicit, vector);
+    assert.equal(
+      (await store.searchKeywords('dream'))[0]?.document.sourceId,
+      '2'
+    );
+
+    await store.remove('tmdb', 'movie', '2');
+    assert.deepEqual(await store.searchKeywords('dream'), []);
+    await store.upsert(doc('2', { voteCount: 3200 }), vector);
+    assert.deepEqual(await pending(), ['2']);
+    assert.deepEqual(await store.searchKeywords('dream'), []);
+    await store.upsert(doc('2', { voteCount: 3200, keywords: [] }), vector);
+    assert.deepEqual(await pending(), []);
+  } finally {
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 it('interrupts an aborted lexical read on its own connection', async () => {
   const { directory, store } = await versionTestStore();
   const internal = store as unknown as VersionTestInternals & {

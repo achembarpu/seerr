@@ -161,6 +161,7 @@ export interface MainSettings {
   localTitleSearch: boolean;
   localTitleSearchRefreshInterval: 'daily' | 'weekly' | 'manual';
   smartSearch: boolean;
+  smartSearchLiveKeywords: boolean;
   smartSearchRerank: boolean;
   smartSearchRerankCandidates: number;
   smartSearchRefreshInterval: 'daily' | 'weekly' | 'manual';
@@ -447,6 +448,7 @@ class Settings {
         localTitleSearch: false,
         localTitleSearchRefreshInterval: 'daily',
         smartSearch: false,
+        smartSearchLiveKeywords: true,
         smartSearchRerank: false,
         smartSearchRerankCandidates: 40,
         smartSearchRefreshInterval: 'daily',

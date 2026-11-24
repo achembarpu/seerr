@@ -284,6 +284,9 @@ components:
         smartSearch:
           type: boolean
           example: false
+        smartSearchLiveKeywords:
+          type: boolean
+          example: true
         smartSearchRerank:
           type: boolean
           example: false

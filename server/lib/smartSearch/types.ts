@@ -11,6 +11,7 @@ export interface SmartDocument {
   originalLanguage: string;
   year: number | null;
   genreIds: number[];
+  keywords?: string[];
   voteAverage: number;
   voteCount: number;
   popularity: number;
@@ -35,6 +36,12 @@ export interface MetadataSource {
     id: string,
     signal?: AbortSignal
   ): Promise<SmartDocument | undefined>;
+  /** Undefined means keyword data was unavailable. An empty list is known. */
+  fetchKeywords?(
+    mediaType: SmartMediaType,
+    id: string,
+    signal?: AbortSignal
+  ): Promise<string[] | undefined>;
   searchRelated?(
     query: string,
     filters: SmartFilters,

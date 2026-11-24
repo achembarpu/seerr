@@ -399,6 +399,69 @@ describe('smart search lifecycle', () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+  it('reconciles one settled change page before resuming a historical scan', async () => {
+    const directory = await mkdtemp(
+      path.join(os.tmpdir(), 'smart-backfill-changes-')
+    );
+    const store = new SmartStore(path.join(directory, 'index.sqlite'));
+    await store.initialize();
+    const yesterday = new Date(Date.now() - 86400000)
+      .toISOString()
+      .slice(0, 10);
+    const cursor = { year: 1978, mediaType: 'movie', month: 0, page: 81 };
+    await store.setState('cursor', JSON.stringify(cursor));
+    await store.setState('scanStarted', yesterday);
+    const calls: string[] = [];
+    const engine = {
+      phase: 'ready' as const,
+      downloadBytes: 0,
+      downloadTotal: 1,
+      async start() {},
+      stop() {},
+      async embed() {
+        return [];
+      },
+    };
+    const source: MetadataSource = {
+      id: 'tmdb',
+      async fetchOne() {
+        return undefined;
+      },
+      async fetchChanges(type, from, to, page) {
+        calls.push(`changes:${type}:${from}:${page}`);
+        assert.equal(from, to);
+        return { ids: [], totalPages: 1 };
+      },
+      async fetchPage(type, from, _to, page) {
+        calls.push(`backfill:${type}:${from}:${page}`);
+        throw new Error('stop after checking the historical cursor');
+      },
+    };
+    const service = new SmartSearchService(
+      () => true,
+      engine,
+      source,
+      () => store
+    );
+    try {
+      assert.equal(service.refreshNow(), true);
+      await waitFor(() => !service.status().indexing);
+      assert.deepEqual(calls, [
+        `changes:movie:${yesterday}:1`,
+        'backfill:movie:1978-01-01:81',
+      ]);
+      assert.deepEqual(JSON.parse((await store.getState('changesCursor'))!), {
+        date: yesterday,
+        mediaType: 'tv',
+        page: 1,
+      });
+      assert.deepEqual(JSON.parse((await store.getState('cursor'))!), cursor);
+    } finally {
+      await service.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it('does not restart an enabled index while closing', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-close-'));
     let pages = 0;
@@ -513,7 +576,7 @@ describe('smart search lifecycle', () => {
 });
 
 describe('hybrid retrieval resilience', () => {
-  it('uses lexical and remote results when embedding startup fails', async () => {
+  it('uses the requested local or live keywords when embedding startup fails', async () => {
     const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-hybrid-'));
     const filename = path.join(directory, 'index.sqlite3');
     const store = new SmartStore(filename);
@@ -524,6 +587,7 @@ describe('hybrid retrieval resilience', () => {
         sourceId: '20',
         title: 'Barber drama',
         overview: 'A barber unravels a murder mystery',
+        keywords: ['barber', 'murder'],
         card: { id: 20 },
       },
       quantize([1, 0])
@@ -531,7 +595,10 @@ describe('hybrid retrieval resilience', () => {
     await store.close();
     const settings = getSettings().main;
     const original = settings.smartSearchRefreshInterval;
+    const originalLiveKeywords = settings.smartSearchLiveKeywords;
     settings.smartSearchRefreshInterval = 'manual';
+    settings.smartSearchLiveKeywords = true;
+    let liveLookups = 0;
     const source: MetadataSource = {
       id: 'tmdb',
       async fetchOne() {
@@ -541,6 +608,7 @@ describe('hybrid retrieval resilience', () => {
         return { documents: [], totalPages: 0 };
       },
       async searchRelated() {
+        liveLookups++;
         return [{ ...document, sourceId: '21', card: { id: 21 } }];
       },
     };
@@ -575,9 +643,17 @@ describe('hybrid retrieval resilience', () => {
       );
       assert.ok(results.some((result) => result.document.sourceId === '21'));
       assert.ok(service.status().retrievalWarning);
+      settings.smartSearchLiveKeywords = false;
+      const local = await service.search('barber murder', {});
+      assert.equal(liveLookups, 1);
+      assert.deepEqual(
+        local.map(({ document, methods }) => [document.sourceId, methods]),
+        [['20', ['lexical', 'tmdb-keyword']]]
+      );
     } finally {
       await service.close();
       settings.smartSearchRefreshInterval = original;
+      settings.smartSearchLiveKeywords = originalLiveKeywords;
       await rm(directory, { recursive: true, force: true });
     }
   });
@@ -1003,12 +1079,14 @@ it('gives short reranker queries media context without rewriting longer multilin
   const internal = service as unknown as {
     open: () => Promise<{
       searchLexical: (query: string) => Promise<unknown[]>;
+      searchKeywords: () => Promise<unknown[]>;
     }>;
     searchDense: () => Promise<typeof dense>;
     rerank: (query: string, candidates: typeof dense) => Promise<typeof dense>;
     idleTimer?: NodeJS.Timeout;
   };
   internal.open = async () => ({
+    searchKeywords: async () => [],
     searchLexical: async (query) => {
       lexical.push(query);
       return [];
@@ -1271,7 +1349,10 @@ it('reuses scores without caching filtered results or old ratings', async () => 
     },
   ];
   const internal = service as unknown as {
-    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    open: () => Promise<{
+      searchLexical: () => Promise<unknown[]>;
+      searchKeywords: () => Promise<unknown[]>;
+    }>;
     searchDense: (
       vector: Buffer,
       filters: { minRating?: number }
@@ -1283,7 +1364,10 @@ it('reuses scores without caching filtered results or old ratings', async () => 
     idleTimer?: NodeJS.Timeout;
     rerankerIdle?: NodeJS.Timeout;
   };
-  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.open = async () => ({
+    searchLexical: async () => [],
+    searchKeywords: async () => [],
+  });
   internal.searchDense = async (_vector, filters) =>
     items.filter(
       (item) =>
@@ -1445,12 +1529,18 @@ it('offers a deeper relevant candidate for reranking without rebuilding embeddin
   }));
   let offered: string[] = [];
   const internal = service as unknown as {
-    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    open: () => Promise<{
+      searchLexical: () => Promise<unknown[]>;
+      searchKeywords: () => Promise<unknown[]>;
+    }>;
     searchDense: () => Promise<typeof dense>;
     rerank: (query: string, candidates: typeof dense) => Promise<typeof dense>;
     idleTimer?: NodeJS.Timeout;
   };
-  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.open = async () => ({
+    searchLexical: async () => [],
+    searchKeywords: async () => [],
+  });
   internal.searchDense = async () => dense;
   internal.rerank = async (_query, candidates) => {
     offered = candidates.slice(0, 40).map((item) => item.document.sourceId);
@@ -1503,14 +1593,20 @@ it('does not boost a popular but irrelevant result as much as a relevant one', a
     },
   ];
   const internal = service as unknown as {
-    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    open: () => Promise<{
+      searchLexical: () => Promise<unknown[]>;
+      searchKeywords: () => Promise<unknown[]>;
+    }>;
     searchDense: () => Promise<typeof dense>;
     rerank: () => Promise<
       ((typeof dense)[number] & { relevanceScore: number })[]
     >;
     idleTimer?: NodeJS.Timeout;
   };
-  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.open = async () => ({
+    searchLexical: async () => [],
+    searchKeywords: async () => [],
+  });
   internal.searchDense = async () => dense;
   internal.rerank = async () =>
     dense.map((item, index) => ({
@@ -1572,13 +1668,19 @@ it('keeps a highly relevant obscure result ahead of an unrelated popular result'
     },
   ];
   const internal = service as unknown as {
-    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    open: () => Promise<{
+      searchLexical: () => Promise<unknown[]>;
+      searchKeywords: () => Promise<unknown[]>;
+    }>;
     searchDense: () => Promise<typeof dense>;
     reranker: { phase: string; rerank: () => Promise<number[]> };
     idleTimer?: NodeJS.Timeout;
     rerankerIdle?: NodeJS.Timeout;
   };
-  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.open = async () => ({
+    searchLexical: async () => [],
+    searchKeywords: async () => [],
+  });
   internal.searchDense = async () => dense;
   internal.reranker = {
     phase: 'ready',
@@ -1629,13 +1731,19 @@ it('keeps deeper audience candidates out when reranking is disabled or fails', a
     score: index === 0 ? 0.8 : 0.6 - index * 0.001,
   }));
   const internal = service as unknown as {
-    open: () => Promise<{ searchLexical: () => Promise<unknown[]> }>;
+    open: () => Promise<{
+      searchLexical: () => Promise<unknown[]>;
+      searchKeywords: () => Promise<unknown[]>;
+    }>;
     searchDense: () => Promise<typeof dense>;
     reranker: { phase: string; rerank: () => Promise<number[]> };
     idleTimer?: NodeJS.Timeout;
     rerankerIdle?: NodeJS.Timeout;
   };
-  internal.open = async () => ({ searchLexical: async () => [] });
+  internal.open = async () => ({
+    searchLexical: async () => [],
+    searchKeywords: async () => [],
+  });
   internal.searchDense = async () => dense;
   internal.reranker = {
     phase: 'ready',

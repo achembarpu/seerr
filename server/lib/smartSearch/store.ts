@@ -97,6 +97,101 @@ type NeighborPool = {
 const neighborReserve = 24;
 const neighborChangeRetention = 8192;
 const maxNeighborDelta = 4096;
+const minKeywordEnrichmentVotes = 100;
+const maxKeywords = 64;
+const maxKeywordLength = 120;
+const plotStopwords = new Set([
+  'the',
+  'and',
+  'for',
+  'with',
+  'from',
+  'into',
+  'about',
+  'this',
+  'that',
+  'their',
+  'have',
+  'who',
+  'are',
+  'was',
+  'were',
+  'where',
+  'when',
+  'what',
+  'film',
+  'movie',
+  'movies',
+  'show',
+  'shows',
+  'series',
+]);
+const wordsIn = (text: string): string[] =>
+  text.toLowerCase().match(/[\p{L}\p{M}\p{N}]+/gu) ?? [];
+const plotSearchWords = (query: string): string[] =>
+  [
+    ...new Set(
+      wordsIn(query).filter((word) =>
+        /^[a-z0-9]+$/u.test(word)
+          ? word.length >= 3 && !plotStopwords.has(word)
+          : Array.from(word).length >= 2
+      )
+    ),
+  ].slice(0, 8);
+const foldText = (value: string): string =>
+  value
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/(\p{Script=Latin})\p{M}+/gu, '$1')
+    .normalize('NFC');
+const keywordPrefix = (word: string): boolean => /^[a-z]{5,}$/u.test(word);
+const ftsTerms = (words: readonly string[], allowPrefixes = false): string =>
+  words
+    .map(
+      (word) =>
+        `"${word.replace(/"/g, '""')}"${allowPrefixes && keywordPrefix(word) ? '*' : ''}`
+    )
+    .join(' OR ');
+
+// Only explicit keyword arrays are published. An empty string is the
+// coverage row for titles whose source returned no keywords.
+const storedKeywords = (document: string): string =>
+  `COALESCE((SELECT group_concat(substr(value, 1, ${maxKeywordLength}), char(10))
+    FROM json_each(${document}, '$.keywords') WHERE type = 'text' AND key < ${maxKeywords}), '')`;
+
+const metadataConditions = (filters: SmartFilters) => {
+  const clauses = [];
+  const values: (string | number)[] = [];
+  if (filters.mediaType) {
+    clauses.push('d.mediaType = ?');
+    values.push(filters.mediaType);
+  }
+  if (filters.language) {
+    clauses.push('d.language = ?');
+    values.push(filters.language);
+  }
+  if (filters.yearFrom !== undefined) {
+    clauses.push('d.year >= ?');
+    values.push(filters.yearFrom);
+  }
+  if (filters.yearTo !== undefined) {
+    clauses.push('d.year <= ?');
+    values.push(filters.yearTo);
+  }
+  if (filters.minRating !== undefined) {
+    clauses.push('d.voteAverage >= ?');
+    values.push(filters.minRating);
+  }
+  if (filters.minVotes !== undefined) {
+    clauses.push('d.voteCount >= ?');
+    values.push(filters.minVotes);
+  }
+  if (filters.genre !== undefined) {
+    clauses.push('EXISTS (SELECT 1 FROM json_each(d.genres) WHERE value = ?)');
+    values.push(filters.genre);
+  }
+  return { clauses, values };
+};
 
 export class SmartStore {
   private db: sqlite3.Database;
@@ -192,6 +287,27 @@ export class SmartStore {
     }
   }
 
+  private readSearchRows<T>(
+    sql: string,
+    params: (string | number)[],
+    signal?: AbortSignal
+  ): Promise<T[]> {
+    return this.read(async (connection, transient) => {
+      signal?.throwIfAborted();
+      const interrupt = () => connection.interrupt();
+      if (!transient)
+        signal?.addEventListener('abort', interrupt, { once: true });
+      try {
+        return await this.all<T>(sql, params, connection);
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw error;
+      } finally {
+        if (!transient) signal?.removeEventListener('abort', interrupt);
+      }
+    });
+  }
+
   async initialize(): Promise<void> {
     await this.run('PRAGMA journal_mode=WAL');
     await this.run(`CREATE TABLE IF NOT EXISTS smart_documents (
@@ -254,6 +370,35 @@ export class SmartStore {
     await this
       .run(`CREATE TRIGGER IF NOT EXISTS smart_fts_delete AFTER DELETE ON smart_documents BEGIN
       DELETE FROM smart_fts WHERE rowid = old.id;
+    END`);
+    await this
+      .run(`CREATE VIRTUAL TABLE IF NOT EXISTS smart_keywords USING fts5(
+      keywords, detail=none, tokenize='porter unicode61 remove_diacritics 2'
+    )`);
+    await this.run(`CREATE INDEX IF NOT EXISTS smart_keyword_enrichment
+      ON smart_documents(source, voteCount DESC, id)
+      WHERE voteCount >= ${minKeywordEnrichmentVotes}`);
+    await this.run(`CREATE TRIGGER IF NOT EXISTS smart_keywords_insert
+      AFTER INSERT ON smart_documents
+      WHEN json_type(new.document, '$.keywords') = 'array' BEGIN
+      INSERT INTO smart_keywords(rowid, keywords)
+      VALUES (new.id, ${storedKeywords('new.document')});
+    END`);
+    await this.run(`CREATE TRIGGER IF NOT EXISTS smart_keywords_update
+      AFTER UPDATE OF id, document ON smart_documents
+      WHEN old.id != new.id OR json_type(new.document, '$.keywords') = 'array' BEGIN
+      DELETE FROM smart_keywords WHERE rowid = new.id;
+      INSERT INTO smart_keywords(rowid, keywords)
+      SELECT new.id, ${storedKeywords('new.document')}
+      WHERE json_type(new.document, '$.keywords') = 'array'
+      UNION ALL
+      SELECT new.id, keywords FROM smart_keywords
+      WHERE rowid = old.id AND json_type(new.document, '$.keywords') IS NOT 'array';
+      DELETE FROM smart_keywords WHERE rowid = old.id AND old.id != new.id;
+    END`);
+    await this.run(`CREATE TRIGGER IF NOT EXISTS smart_keywords_delete
+      AFTER DELETE ON smart_documents BEGIN
+      DELETE FROM smart_keywords WHERE rowid = old.id;
     END`);
     this.lexicalCount = (
       await this.all<{ n: number }>('SELECT count(*) AS n FROM smart_fts')
@@ -338,114 +483,27 @@ export class SmartStore {
     signal?: AbortSignal
   ): Promise<SmartMatch[]> {
     signal?.throwIfAborted();
-    const stopwords = new Set([
-      'the',
-      'and',
-      'for',
-      'with',
-      'from',
-      'into',
-      'about',
-      'this',
-      'that',
-      'their',
-      'have',
-      'who',
-      'are',
-      'was',
-      'were',
-      'where',
-      'when',
-      'what',
-      'film',
-      'movie',
-      'movies',
-      'show',
-      'shows',
-      'series',
-    ]);
-    const words = [
-      ...new Set(
-        (query.toLowerCase().match(/[\p{L}\p{M}\p{N}]+/gu) ?? []).filter(
-          (word) => {
-            if (/^[a-z0-9]+$/u.test(word))
-              return word.length >= 3 && !stopwords.has(word);
-            return Array.from(word).length >= 2;
-          }
-        )
-      ),
-    ].slice(0, 8);
+    const words = plotSearchWords(query);
     if (!words.length) return [];
     // Plot search uses whole terms; title typo/substring matching has its own
     // index. Prefix expansion of common words can stall SQLite for minutes.
-    const expression = words
-      .map((word) => `"${word.replace(/"/g, '""')}"`)
-      .join(' OR ');
+    const { clauses, values } = metadataConditions(filters);
     const conditions = [
       'smart_fts MATCH ?',
       "smart_fts.rank MATCH 'bm25(3.0, 1.0)'",
+      ...clauses,
     ];
-    const params: (string | number)[] = [expression];
-    if (filters.mediaType) {
-      conditions.push('d.mediaType = ?');
-      params.push(filters.mediaType);
-    }
-    if (filters.language) {
-      conditions.push('d.language = ?');
-      params.push(filters.language);
-    }
-    if (filters.yearFrom !== undefined) {
-      conditions.push('d.year >= ?');
-      params.push(filters.yearFrom);
-    }
-    if (filters.yearTo !== undefined) {
-      conditions.push('d.year <= ?');
-      params.push(filters.yearTo);
-    }
-    if (filters.minRating !== undefined) {
-      conditions.push('d.voteAverage >= ?');
-      params.push(filters.minRating);
-    }
-    if (filters.minVotes !== undefined) {
-      conditions.push('d.voteCount >= ?');
-      params.push(filters.minVotes);
-    }
-    if (filters.genre !== undefined) {
-      conditions.push(
-        'EXISTS (SELECT 1 FROM json_each(d.genres) WHERE value = ?)'
-      );
-      params.push(filters.genre);
-    }
-    params.push(limit);
     // FTS ranking can be expensive for broad terms. Isolate it so it cannot
     // delay indexing or the dense search's document-version checks.
-    const rows = await this.read(async (connection, transient) => {
-      signal?.throwIfAborted();
-      const interrupt = () => connection.interrupt();
-      if (!transient)
-        signal?.addEventListener('abort', interrupt, { once: true });
-      try {
-        return await this.all<{ document: string; rank: number }>(
-          `SELECT d.document, smart_fts.rank AS rank
-          FROM smart_fts CROSS JOIN smart_documents d ON d.id=smart_fts.rowid WHERE ${conditions.join(' AND ')} ORDER BY smart_fts.rank LIMIT ?`,
-          params,
-          connection
-        );
-      } catch (error) {
-        signal?.throwIfAborted();
-        throw error;
-      } finally {
-        if (!transient) signal?.removeEventListener('abort', interrupt);
-      }
-    });
+    const rows = await this.readSearchRows<{ document: string; rank: number }>(
+      `SELECT d.document, smart_fts.rank AS rank
+      FROM smart_fts CROSS JOIN smart_documents d ON d.id=smart_fts.rowid
+      WHERE ${conditions.join(' AND ')} ORDER BY smart_fts.rank LIMIT ?`,
+      [ftsTerms(words), ...values, limit],
+      signal
+    );
     signal?.throwIfAborted();
-    const fold = (value: string) =>
-      value
-        .toLowerCase()
-        .normalize('NFD')
-        .replace(/(\p{Script=Latin})\p{M}+/gu, '$1')
-        .normalize('NFC');
-    const terms = words.map(fold);
+    const terms = words.map(foldText);
     const minimum = words.length >= 4 ? Math.ceil(words.length / 3) : 1;
     return rows
       .map((row) => ({
@@ -454,10 +512,114 @@ export class SmartStore {
         methods: ['lexical'] as SmartMatch['methods'],
       }))
       .filter(({ document }) => {
-        const text = fold(`${document.title} ${document.overview}`);
+        const text = foldText(`${document.title} ${document.overview}`);
         return terms.filter((word) => text.includes(word)).length >= minimum;
       });
   }
+
+  async searchKeywords(
+    query: string,
+    filters: SmartFilters = {},
+    limit = 60,
+    signal?: AbortSignal
+  ): Promise<SmartMatch[]> {
+    signal?.throwIfAborted();
+    const words = plotSearchWords(query);
+    limit = Math.min(500, Math.floor(limit));
+    if (!(limit > 0) || !words.length) return [];
+    const { clauses, values } = metadataConditions(filters);
+    const conditions = ['smart_keywords MATCH ?', ...clauses];
+    const rows = await this.readSearchRows<{
+      id: number;
+      document: string;
+      keywords: string;
+      votes: number;
+      rank: number;
+    }>(
+      `WITH ranked AS MATERIALIZED (
+        SELECT smart_keywords.rowid AS id, smart_keywords.rank AS rank
+        FROM smart_keywords CROSS JOIN smart_documents d ON d.id = smart_keywords.rowid
+        WHERE ${conditions.join(' AND ')} ORDER BY smart_keywords.rank LIMIT ?
+      )
+      SELECT r.id, r.rank, d.document, d.voteCount AS votes, k.keywords
+      FROM ranked r JOIN smart_documents d ON d.id = r.id
+      JOIN smart_keywords k ON k.rowid = r.id`,
+      [ftsTerms(words, true), ...values, Math.max(100, limit * 4)],
+      signal
+    );
+    signal?.throwIfAborted();
+    // Prefer documents that match separate terms. A small audience prior
+    // cannot make a popular one-term hit outrank a two-term match.
+    const token = (word: string): string =>
+      foldText(word).replace(/^([a-z]{4,})(?:ing|s)$/u, '$1');
+    const terms = [...new Set(words.map(token))];
+    return rows
+      .map((row) => {
+        const keywords = wordsIn(row.keywords).map(token);
+        const matches = terms.filter((term) =>
+          keywords.some(
+            (keyword) =>
+              keyword === term ||
+              (keywordPrefix(term) && keyword.startsWith(term))
+          )
+        ).length;
+        const audience =
+          Math.log1p(Math.min(5000, Math.max(0, row.votes))) / Math.log1p(5000);
+        return { ...row, matches, audience };
+      })
+      .sort(
+        (a, b) =>
+          b.matches - a.matches ||
+          a.rank - b.rank ||
+          b.audience - a.audience ||
+          a.id - b.id
+      )
+      .slice(0, limit)
+      .map(({ document, matches, audience }) => ({
+        document: JSON.parse(document) as SmartDocument,
+        score: matches + 0.15 * audience,
+        methods: ['tmdb-keyword'],
+      }));
+  }
+
+  async nextKeywordEnrichment(
+    source: string,
+    limit: number
+  ): Promise<{ id: number; mediaType: SmartMediaType; sourceId: string }[]> {
+    limit = Math.min(128, Math.floor(limit));
+    if (!(limit > 0)) return [];
+    return this.read((connection) =>
+      this.all(
+        `SELECT d.id, d.mediaType, d.sourceId
+        FROM smart_documents d INDEXED BY smart_keyword_enrichment
+        WHERE d.source = ? AND d.voteCount >= ${minKeywordEnrichmentVotes}
+        AND NOT EXISTS (SELECT 1 FROM smart_keywords k WHERE k.rowid = d.id)
+        ORDER BY d.voteCount DESC, d.id LIMIT ?`,
+        [source, limit],
+        connection
+      )
+    );
+  }
+
+  async setKeywords(
+    source: string,
+    mediaType: SmartMediaType,
+    sourceId: string,
+    keywords: string[]
+  ): Promise<void> {
+    const text = keywords
+      .slice(0, maxKeywords)
+      .map((keyword) => Array.from(keyword).slice(0, maxKeywordLength).join(''))
+      .join('\n');
+    await this.run(
+      `INSERT OR REPLACE INTO smart_keywords(rowid, keywords)
+      SELECT d.id, ? FROM smart_documents d
+      WHERE d.source = ? AND d.mediaType = ? AND d.sourceId = ?
+        AND (SELECT keywords FROM smart_keywords WHERE rowid = d.id) IS NOT ?`,
+      [text, source, mediaType, sourceId, text]
+    );
+  }
+
   async getState(key: string): Promise<string | undefined> {
     return (
       await this.all<{ value: string }>(
@@ -552,7 +714,10 @@ export class SmartStore {
       this.run(
         `INSERT INTO smart_documents(source, sourceId, mediaType, language, year, voteAverage, voteCount, genres, hash, vector, document) VALUES ${values}
       ON CONFLICT(source, sourceId, mediaType) DO UPDATE SET language=excluded.language, year=excluded.year, voteAverage=excluded.voteAverage, voteCount=excluded.voteCount, genres=excluded.genres, hash=excluded.hash, vector=excluded.vector, document=excluded.document
-      WHERE smart_documents.hash != excluded.hash OR smart_documents.document != excluded.document`,
+      WHERE smart_documents.hash != excluded.hash OR smart_documents.document != excluded.document
+        OR (json_type(excluded.document, '$.keywords') = 'array'
+          AND (SELECT keywords FROM smart_keywords WHERE rowid = smart_documents.id)
+            IS NOT ${storedKeywords('excluded.document')})`,
         params
       )
     );

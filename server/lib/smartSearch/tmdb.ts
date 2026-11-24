@@ -1,5 +1,6 @@
 import TheMovieDb from '@server/api/themoviedb';
 import type {
+  TmdbKeyword,
   TmdbMovieResult,
   TmdbTvResult,
 } from '@server/api/themoviedb/interfaces';
@@ -9,6 +10,7 @@ import {
   mapTvDetailsToResult,
   mapTvResult,
 } from '@server/models/Search';
+import { isAxiosError } from 'axios';
 import type {
   MetadataSource,
   SmartDocument,
@@ -16,13 +18,19 @@ import type {
   SmartMediaType,
 } from './types';
 
+const keywordNames = (keywords: TmdbKeyword[] | undefined) =>
+  Array.isArray(keywords)
+    ? [...new Set(keywords.map(({ name }) => name.trim()).filter(Boolean))]
+    : undefined;
+
 export class TmdbMetadataSource implements MetadataSource {
   readonly id = 'tmdb';
   constructor(private readonly tmdb = new TheMovieDb({ timeout: 2000 })) {}
 
   private document(
     item: TmdbMovieResult | TmdbTvResult,
-    mediaType: SmartMediaType
+    mediaType: SmartMediaType,
+    keywords?: string[]
   ): SmartDocument | undefined {
     if (!item.overview?.trim() || ('adult' in item && item.adult))
       return undefined;
@@ -41,6 +49,7 @@ export class TmdbMetadataSource implements MetadataSource {
           10
         ) || null,
       genreIds: item.genre_ids ?? [],
+      ...(keywords !== undefined && { keywords }),
       voteAverage: item.vote_average ?? 0,
       voteCount: item.vote_count ?? 0,
       popularity: item.popularity ?? 0,
@@ -58,14 +67,23 @@ export class TmdbMetadataSource implements MetadataSource {
     id: number,
     language: string,
     signal?: AbortSignal
-  ): Promise<TmdbMovieResult | TmdbTvResult> {
-    return mediaType === 'movie'
-      ? mapMovieDetailsToResult(
-          await this.tmdb.getSmartMovieDetails(id, language, signal)
-        )
-      : mapTvDetailsToResult(
-          await this.tmdb.getSmartTvDetails(id, language, signal)
-        );
+  ): Promise<{ item: TmdbMovieResult | TmdbTvResult; keywords?: string[] }> {
+    if (mediaType === 'movie') {
+      const details = await this.tmdb.getSmartMovieDetails(
+        id,
+        language,
+        signal
+      );
+      return {
+        item: mapMovieDetailsToResult(details),
+        keywords: keywordNames(details.keywords?.keywords),
+      };
+    }
+    const details = await this.tmdb.getSmartTvDetails(id, language, signal);
+    return {
+      item: mapTvDetailsToResult(details),
+      keywords: keywordNames(details.keywords?.results),
+    };
   }
 
   async fetchOne(
@@ -74,18 +92,45 @@ export class TmdbMetadataSource implements MetadataSource {
     signal?: AbortSignal
   ): Promise<SmartDocument | undefined> {
     const number = Number(id);
-    const item = await this.load(mediaType, number, 'en-US', signal);
+    const { item, keywords } = await this.load(
+      mediaType,
+      number,
+      'en-US',
+      signal
+    );
     if (
       !item.overview?.trim() &&
       item.original_language &&
       item.original_language !== 'en'
     ) {
+      const localized = await this.load(
+        mediaType,
+        number,
+        item.original_language,
+        signal
+      );
       return this.document(
-        await this.load(mediaType, number, item.original_language, signal),
-        mediaType
+        localized.item,
+        mediaType,
+        keywords ?? localized.keywords
       );
     }
-    return this.document(item, mediaType);
+    return this.document(item, mediaType, keywords);
+  }
+
+  async fetchKeywords(
+    mediaType: SmartMediaType,
+    id: string,
+    signal?: AbortSignal
+  ): Promise<string[] | undefined> {
+    try {
+      return keywordNames(
+        await this.tmdb.getSmartKeywords(mediaType, Number(id), signal)
+      );
+    } catch (error) {
+      if (isAxiosError(error) && error.response?.status === 404) return [];
+      throw error;
+    }
   }
 
   async fetchRelated(
@@ -263,9 +308,16 @@ export class TmdbMetadataSource implements MetadataSource {
         item.original_language !== 'en'
       ) {
         try {
+          const localized = await this.load(
+            mediaType,
+            item.id,
+            item.original_language,
+            signal
+          );
           document = this.document(
-            await this.load(mediaType, item.id, item.original_language, signal),
-            mediaType
+            localized.item,
+            mediaType,
+            localized.keywords
           );
         } catch (error) {
           if (

@@ -129,6 +129,9 @@ const messages = defineMessages('components.Settings.SettingsMain', {
   titleRefreshIntervalTip:
     'Daily and weekly check for title updates automatically. Manual only uses the current index until Refresh now is pressed.',
   smartRefreshInterval: 'Description index refresh schedule',
+  liveKeywords: 'Use live TMDB plot keywords',
+  liveKeywordsTip:
+    'Look up additional plot matches on TMDB while searching. Turn this off to search only the local description and keyword indexes. Keywords are added during background refresh.',
   smartRefreshIntervalTip:
     'Daily and weekly run the initial scan and check for updates automatically. Manual only requires Refresh now to start or resume indexing and to check for updates.',
   refreshDaily: 'Daily',
@@ -230,6 +233,7 @@ const SettingsSearch = () => {
             localTitleSearchRefreshInterval:
               data.localTitleSearchRefreshInterval ?? 'daily',
             smartSearch: data.smartSearch,
+            smartSearchLiveKeywords: data.smartSearchLiveKeywords ?? true,
             smartSearchRerank: data.smartSearchRerank ?? false,
             smartSearchRerankCandidates: data.smartSearchRerankCandidates ?? 40,
             smartSearchRefreshInterval:
@@ -487,6 +491,26 @@ const SettingsSearch = () => {
                 </div>
                 {values.smartSearch && (
                   <div className="space-y-5 border-t border-gray-700 p-5 sm:p-6">
+                    <div>
+                      <label
+                        htmlFor="smartSearchLiveKeywords"
+                        className="flex items-center gap-2 text-sm text-gray-300"
+                      >
+                        <Field
+                          type="checkbox"
+                          id="smartSearchLiveKeywords"
+                          name="smartSearchLiveKeywords"
+                          aria-describedby="smart-search-live-keywords-tip"
+                        />
+                        {intl.formatMessage(messages.liveKeywords)}
+                      </label>
+                      <p
+                        id="smart-search-live-keywords-tip"
+                        className="mt-1.5 text-xs leading-5 text-gray-400"
+                      >
+                        {intl.formatMessage(messages.liveKeywordsTip)}
+                      </p>
+                    </div>
                     <div className="grid gap-4 sm:grid-cols-2">
                       <div>
                         <label htmlFor="smartSearchDevice">

@@ -65,11 +65,13 @@ it('updates reranking without changing existing search settings and restarts the
       .send({
         localTitleSearchRefreshInterval: 'weekly',
         smartSearchRerank: true,
+        smartSearchLiveKeywords: false,
         smartSearchRerankCandidates: 80,
         smartSearchRefreshInterval: 'weekly',
       })
       .expect(200);
     assert.equal(result.body.localTitleSearchRefreshInterval, 'weekly');
+    assert.equal(result.body.smartSearchLiveKeywords, false);
     assert.equal(titleRestart.mock.callCount(), 1);
     assert.equal(result.body.smartSearchRerank, true);
     assert.equal(result.body.smartSearchRerankCandidates, 80);

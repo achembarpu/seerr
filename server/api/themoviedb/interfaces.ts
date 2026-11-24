@@ -212,6 +212,9 @@ export type TmdbMovieSearchDetails = Pick<
   | 'vote_count'
 >;
 
+export type TmdbSmartMovieDetails = TmdbMovieSearchDetails &
+  Partial<Pick<TmdbMovieDetails, 'keywords'>>;
+
 export interface TmdbVideo {
   id: string;
   key: string;
@@ -340,6 +343,9 @@ export type TmdbTvSearchDetails = Pick<
   | 'vote_average'
   | 'vote_count'
 >;
+
+export type TmdbSmartTvDetails = TmdbTvSearchDetails &
+  Partial<Pick<TmdbTvDetails, 'keywords'>>;
 
 export interface TmdbTvScanDetails {
   id: number;

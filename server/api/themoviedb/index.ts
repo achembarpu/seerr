@@ -24,6 +24,8 @@ import type {
   TmdbSearchMultiResponse,
   TmdbSearchTvResponse,
   TmdbSeasonWithEpisodes,
+  TmdbSmartMovieDetails,
+  TmdbSmartTvDetails,
   TmdbTvDetails,
   TmdbTvScanDetails,
   TmdbTvSearchDetails,
@@ -753,12 +755,12 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     id: number,
     language: string,
     signal?: AbortSignal
-  ): Promise<TmdbMovieSearchDetails> {
+  ): Promise<TmdbSmartMovieDetails> {
     return (
-      await this.axios.get<TmdbMovieSearchDetails>(`/movie/${id}`, {
+      await this.axios.get<TmdbSmartMovieDetails>(`/movie/${id}`, {
         signal,
         timeout: 30000,
-        params: { language },
+        params: { language, append_to_response: 'keywords' },
       })
     ).data;
   }
@@ -767,14 +769,26 @@ class TheMovieDb extends ExternalAPI implements TvShowProvider {
     id: number,
     language: string,
     signal?: AbortSignal
-  ): Promise<TmdbTvSearchDetails> {
+  ): Promise<TmdbSmartTvDetails> {
     return (
-      await this.axios.get<TmdbTvSearchDetails>(`/tv/${id}`, {
+      await this.axios.get<TmdbSmartTvDetails>(`/tv/${id}`, {
         signal,
         timeout: 30000,
-        params: { language },
+        params: { language, append_to_response: 'keywords' },
       })
     ).data;
+  }
+
+  public async getSmartKeywords(
+    mediaType: 'movie' | 'tv',
+    id: number,
+    signal?: AbortSignal
+  ): Promise<TmdbKeyword[] | undefined> {
+    const { data } = await this.axios.get<{
+      keywords?: TmdbKeyword[];
+      results?: TmdbKeyword[];
+    }>(`/${mediaType}/${id}/keywords`, { signal, timeout: 30000 });
+    return mediaType === 'movie' ? data.keywords : data.results;
   }
 
   /** IDs changed in a bounded TMDB change-list window. */
