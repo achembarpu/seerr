@@ -151,6 +151,47 @@ export class SmartStore {
       )
     );
   }
+
+  private async read<T>(
+    query: (connection: sqlite3.Database, transient: boolean) => Promise<T>
+  ): Promise<T> {
+    if (this.closing) throw new Error('Search index is closing');
+    // In-memory and temporary databases cannot be reopened by filename.
+    const transient =
+      this.filename === ':memory:' ||
+      this.filename === '' ||
+      this.filename.startsWith('file::memory:') ||
+      /[?&]mode=memory(?:&|$)/u.test(this.filename);
+    let finish: () => void = () => undefined;
+    const active = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    this.activeSearches.add(active);
+    let connection: sqlite3.Database | undefined;
+    try {
+      connection = transient
+        ? this.db
+        : await new Promise<sqlite3.Database>((resolve, reject) => {
+            const reader: sqlite3.Database = new sqlite3.Database(
+              this.filename,
+              sqlite3.OPEN_READONLY,
+              (error) => (error ? reject(error) : resolve(reader))
+            );
+          });
+      return await query(connection, transient);
+    } finally {
+      try {
+        if (!transient && connection)
+          await new Promise<void>((resolve, reject) =>
+            connection!.close((error) => (error ? reject(error) : resolve()))
+          );
+      } finally {
+        this.activeSearches.delete(active);
+        finish();
+      }
+    }
+  }
+
   async initialize(): Promise<void> {
     await this.run('PRAGMA journal_mode=WAL');
     await this.run(`CREATE TABLE IF NOT EXISTS smart_documents (
@@ -293,8 +334,10 @@ export class SmartStore {
   async searchLexical(
     query: string,
     filters: SmartFilters = {},
-    limit = 60
+    limit = 60,
+    signal?: AbortSignal
   ): Promise<SmartMatch[]> {
+    signal?.throwIfAborted();
     const stopwords = new Set([
       'the',
       'and',
@@ -374,11 +417,28 @@ export class SmartStore {
       params.push(filters.genre);
     }
     params.push(limit);
-    const rows = await this.all<{ document: string; rank: number }>(
-      `SELECT d.document, smart_fts.rank AS rank
-      FROM smart_fts CROSS JOIN smart_documents d ON d.id=smart_fts.rowid WHERE ${conditions.join(' AND ')} ORDER BY smart_fts.rank LIMIT ?`,
-      params
-    );
+    // FTS ranking can be expensive for broad terms. Isolate it so it cannot
+    // delay indexing or the dense search's document-version checks.
+    const rows = await this.read(async (connection, transient) => {
+      signal?.throwIfAborted();
+      const interrupt = () => connection.interrupt();
+      if (!transient)
+        signal?.addEventListener('abort', interrupt, { once: true });
+      try {
+        return await this.all<{ document: string; rank: number }>(
+          `SELECT d.document, smart_fts.rank AS rank
+          FROM smart_fts CROSS JOIN smart_documents d ON d.id=smart_fts.rowid WHERE ${conditions.join(' AND ')} ORDER BY smart_fts.rank LIMIT ?`,
+          params,
+          connection
+        );
+      } catch (error) {
+        signal?.throwIfAborted();
+        throw error;
+      } finally {
+        if (!transient) signal?.removeEventListener('abort', interrupt);
+      }
+    });
+    signal?.throwIfAborted();
     const fold = (value: string) =>
       value
         .toLowerCase()
@@ -685,29 +745,8 @@ export class SmartStore {
     // The writer continues indexing on the main connection. A separate,
     // read-only transaction keeps the vector and final document in the same
     // snapshot even when a title is updated or removed during the scan.
-    // In-memory and temporary databases cannot be reopened by filename. Keep
-    // their original single-connection scan and capture documents as we go.
-    const transient =
-      this.filename === ':memory:' ||
-      this.filename === '' ||
-      this.filename.startsWith('file::memory:') ||
-      /[?&]mode=memory(?:&|$)/u.test(this.filename);
-    let finish: () => void = () => undefined;
-    const active = new Promise<void>((resolve) => {
-      finish = resolve;
-    });
-    this.activeSearches.add(active);
-    let snapshot: sqlite3.Database | undefined;
-    try {
-      snapshot = transient
-        ? this.db
-        : await new Promise<sqlite3.Database>((resolve, reject) => {
-            const connection: sqlite3.Database = new sqlite3.Database(
-              this.filename,
-              sqlite3.OPEN_READONLY,
-              (error) => (error ? reject(error) : resolve(connection))
-            );
-          });
+    return this.read(async (snapshot, transient) => {
+      signal?.throwIfAborted();
       if (!transient) await this.run('BEGIN', [], snapshot);
       if (reuseNeighbors && !transient)
         return await this.searchNeighborSnapshot(
@@ -728,17 +767,7 @@ export class SmartStore {
           }))
         );
       return await this.loadDenseDocuments(hits, snapshot);
-    } finally {
-      try {
-        if (!transient && snapshot)
-          await new Promise<void>((resolve, reject) =>
-            snapshot!.close((error) => (error ? reject(error) : resolve()))
-          );
-      } finally {
-        this.activeSearches.delete(active);
-        finish();
-      }
-    }
+    });
   }
   private async scanDense(
     snapshot: sqlite3.Database,

@@ -7,6 +7,7 @@ import { mkdir, rename, stat, unlink } from 'fs/promises';
 import net from 'net';
 import path from 'path';
 import { pipeline } from 'stream/promises';
+import { setTimeout as delay } from 'timers/promises';
 import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
@@ -38,10 +39,27 @@ const rerankerHash =
   '5290f5b9a2636be40baf807feafcfb222e0c4670a083fb3447d87993566190a9';
 const rerankerUrl = `https://huggingface.co/gorse-io/Qwen3-Reranker-0.6B-GGUF/resolve/7af0c7c371b5ad3daf771ce4f6d091a4d38c799a/${rerankerName}`;
 
-async function checksum(filename: string): Promise<string> {
+async function checksum(
+  filename: string,
+  signal: AbortSignal
+): Promise<string> {
   const hash = createHash('sha256');
-  for await (const chunk of createReadStream(filename)) hash.update(chunk);
+  for await (const chunk of createReadStream(filename, {
+    highWaterMark: 1024 * 1024,
+    signal,
+  }))
+    hash.update(chunk);
   return hash.digest('hex');
+}
+
+async function weightIdentity(filename: string): Promise<string | undefined> {
+  try {
+    const file = await stat(filename, { bigint: true });
+    if (!file.isFile()) throw new Error('Model weights must be a regular file');
+    return `${file.dev}:${file.ino}:${file.size}:${file.mtimeNs}:${file.ctimeNs}`;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
 }
 
 async function freePort(): Promise<number> {
@@ -63,6 +81,7 @@ export class EmbeddingEngine {
   private starting?: Promise<void>;
   private baseUrl = '';
   private externalKey?: string;
+  private verifiedWeights?: string;
   get externalAvailable(): boolean {
     return (
       !!process.env.SEERR_EMBEDDING_URL && !!process.env.SEERR_EMBEDDING_API_KEY
@@ -84,6 +103,23 @@ export class EmbeddingEngine {
   }
   phase: 'idle' | 'downloading' | 'starting' | 'ready' = 'idle';
 
+  private async verifyWeights(
+    filename: string,
+    expected: string,
+    signal: AbortSignal
+  ): Promise<boolean | undefined> {
+    signal.throwIfAborted();
+    const identity = await weightIdentity(filename);
+    if (!identity) return undefined;
+    const verifiedIdentity = `${expected}:${identity}`;
+    if (this.verifiedWeights === verifiedIdentity) return true;
+    const verified = (await checksum(filename, signal)) === expected;
+    if ((await weightIdentity(filename)) !== identity)
+      throw new Error('Model weights changed during SHA-256 verification');
+    if (verified) this.verifiedWeights = verifiedIdentity;
+    return verified;
+  }
+
   private async model(signal: AbortSignal): Promise<string> {
     const directory = path.join(appDataPath(), 'models');
     await mkdir(directory, { recursive: true });
@@ -91,15 +127,9 @@ export class EmbeddingEngine {
     const hash = this.mode === 'embedding' ? modelHash : rerankerHash;
     const url = this.mode === 'embedding' ? modelUrl : rerankerUrl;
     const filename = path.join(directory, name);
-    if (
-      await stat(filename).then(
-        () => true,
-        () => false
-      )
-    ) {
-      if ((await checksum(filename)) === hash) return filename;
-      await unlink(filename);
-    }
+    const verified = await this.verifyWeights(filename, hash, signal);
+    if (verified) return filename;
+    if (verified === false) await unlink(filename);
     this.phase = 'downloading';
     this.downloadBytes = 0;
     const temporary = `${filename}.partial`;
@@ -114,7 +144,7 @@ export class EmbeddingEngine {
         this.downloadBytes += chunk.length;
       });
       await pipeline(response.data, createWriteStream(temporary), { signal });
-      if ((await checksum(temporary)) !== hash)
+      if ((await checksum(temporary, signal)) !== hash)
         throw new Error('Downloaded model failed SHA-256 verification');
       await rename(temporary, filename);
       return filename;
@@ -149,21 +179,26 @@ export class EmbeddingEngine {
       await this.connectExternal(signal);
       return;
     }
-    const modelPath = await this.model(signal);
+    const binary = process.env.SEERR_LLAMA_SERVER || 'llama-server';
+    const deviceProbe = execFileAsync(binary, ['--list-devices'], {
+      timeout: 15000,
+      signal,
+      maxBuffer: 1024 * 1024,
+    }).then(
+      ({ stdout }) => ({ devices: parseDevices(stdout) }),
+      (error: unknown) => ({ error })
+    );
+    const [modelPath, probe] = await Promise.all([
+      this.model(signal),
+      deviceProbe,
+    ]);
     signal.throwIfAborted();
     this.phase = 'starting';
-    const binary = process.env.SEERR_LLAMA_SERVER || 'llama-server';
     this.deviceWarning = undefined;
-    try {
-      const { stdout } = await execFileAsync(binary, ['--list-devices'], {
-        timeout: 15000,
-        signal,
-        maxBuffer: 1024 * 1024,
-      });
-      this.devices = parseDevices(stdout);
-    } catch (error) {
-      signal.throwIfAborted();
-      if (selection !== 'auto' && selection !== 'cpu') throw error;
+    if ('devices' in probe) {
+      this.devices = probe.devices;
+    } else {
+      if (selection !== 'auto' && selection !== 'cpu') throw probe.error;
       this.devices = [];
       this.deviceWarning = 'Could not detect GPU devices; trying CPU inference';
     }
@@ -286,17 +321,25 @@ export class EmbeddingEngine {
       failure = new Error(`Embedding process exited (${code})`);
     });
     try {
-      for (let i = 0; i < 120; i++) {
+      const started = performance.now();
+      while (performance.now() - started < 30_000) {
         signal.throwIfAborted();
         if (failure) throw failure;
         try {
           await this.local.get(`${this.baseUrl}/health`, {
             timeout: 1000,
+            signal,
             headers: { Authorization: `Bearer ${this.key}` },
             proxy: false,
           });
         } catch {
-          await new Promise((resolve) => setTimeout(resolve, 250));
+          await delay(
+            performance.now() - started < 1000 ? 50 : 250,
+            undefined,
+            {
+              signal,
+            }
+          );
           continue;
         }
         this.phase = 'ready';

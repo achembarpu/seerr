@@ -581,6 +581,57 @@ it('indexes lexical metadata without changing embeddings, and keeps it updated',
   }
 });
 
+it('interrupts an aborted lexical read on its own connection', async () => {
+  const { directory, store } = await versionTestStore();
+  const internal = store as unknown as VersionTestInternals & {
+    db: unknown;
+  };
+  const original = internal.all.bind(store);
+  let started: () => void = () => undefined;
+  let release: () => void = () => undefined;
+  const running = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let reader: { interrupt: () => void } | undefined;
+  let interrupts = 0;
+  internal.all = async (...args) => {
+    if (args[0].includes('smart_fts.rank AS rank')) {
+      reader = args[2] as typeof reader;
+      if (reader && reader !== internal.db) {
+        const interrupt = reader.interrupt.bind(reader);
+        reader.interrupt = () => {
+          interrupts++;
+          interrupt();
+        };
+      }
+      started();
+      await held;
+    }
+    return original(...args);
+  };
+  try {
+    await store.upsert(doc('30'), quantize([1, 0]));
+    const controller = new AbortController();
+    const reason = new Error('New search started');
+    const search = store.searchLexical('family', {}, 5, controller.signal);
+    await running;
+    controller.abort(reason);
+    release();
+    await assert.rejects(search, (error) => error === reason);
+    assert.ok(reader);
+    assert.notEqual(reader, internal.db);
+    assert.equal(interrupts, 1);
+    assert.ok(await store.documentVersion());
+  } finally {
+    release();
+    await store.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 it('pauses lexical backfill at its checkpoint and resumes without changing vectors', async () => {
   const directory = await mkdtemp(
     path.join(os.tmpdir(), 'smart-lexical-pause-')

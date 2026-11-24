@@ -1,4 +1,5 @@
-import { mkdtemp, readFile, rm, writeFile } from 'fs/promises';
+import { createHash } from 'crypto';
+import { mkdtemp, readFile, rm, stat, utimes, writeFile } from 'fs/promises';
 import { createServer } from 'http';
 import type { AddressInfo } from 'net';
 import assert from 'node:assert/strict';
@@ -6,6 +7,31 @@ import { after, before, describe, it, mock } from 'node:test';
 import os from 'os';
 import path from 'path';
 import { EmbeddingEngine, parseDevices } from './engine';
+
+it('checks model weights again when the file changes before a restart', async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'smart-weights-'));
+  try {
+    const filename = path.join(directory, 'weights.gguf');
+    await writeFile(filename, 'valid');
+    const { atime, mtime } = await stat(filename);
+    const engine = new EmbeddingEngine() as unknown as {
+      verifyWeights: (
+        filename: string,
+        expected: string,
+        signal: AbortSignal
+      ) => Promise<boolean | undefined>;
+    };
+    const expected = createHash('sha256').update('valid').digest('hex');
+    const signal = new AbortController().signal;
+    assert.equal(await engine.verifyWeights(filename, expected, signal), true);
+    assert.equal(await engine.verifyWeights(filename, expected, signal), true);
+    await writeFile(filename, 'other');
+    await utimes(filename, atime, mtime);
+    assert.equal(await engine.verifyWeights(filename, expected, signal), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 
 describe('inference devices', () => {
   let directory: string;

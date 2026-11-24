@@ -1155,7 +1155,7 @@ export class SmartSearchService {
       return this.searchDense(quantize(vector), filters, 500, signal);
     })();
     const lexicalPromise = store
-      ? store.searchLexical(query, filters, 500)
+      ? store.searchLexical(query, filters, 500, signal)
       : Promise.resolve([]);
     const remotePromise = this.source.searchRelated
       ? withDeadline(this.source.searchRelated(query, filters, language))
