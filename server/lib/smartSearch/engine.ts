@@ -392,29 +392,63 @@ export class EmbeddingEngine {
     timeout = 120000
   ): Promise<number[][]> {
     if (this.phase !== 'ready') throw new Error('Embedding model is not ready');
+    const options = {
+      timeout,
+      signal,
+      headers: { Authorization: `Bearer ${this.externalKey ?? this.key}` },
+      proxy: false as const,
+    };
+    const request = (input: (string | number[])[]) =>
+      this.local.post<{ data: { embedding: number[]; index: number }[] }>(
+        `${this.baseUrl}/v1/embeddings`,
+        { input },
+        options
+      );
     let response;
     try {
-      response = await this.local.post<{
-        data: { embedding: number[]; index: number }[];
-      }>(
-        `${this.baseUrl}/v1/embeddings`,
-        { input: texts },
-        {
-          timeout,
-          signal,
-          headers: { Authorization: `Bearer ${this.externalKey ?? this.key}` },
-          proxy: false,
-        }
-      );
+      response = await request(texts);
     } catch (error) {
       // A host service may have restarted with another model. Force its model
       // identity to be checked again before accepting another embedding.
-      if (this.externalKey && !signal?.aborted) {
-        this.externalKey = undefined;
-        this.activeDevice = undefined;
-        this.phase = 'idle';
+      if (this.externalKey) {
+        if (!signal?.aborted) {
+          this.externalKey = undefined;
+          this.activeDevice = undefined;
+          this.phase = 'idle';
+        }
+        throw error;
       }
-      throw error;
+      if (signal?.aborted) throw error;
+      const message =
+        axios.isAxiosError<{ error?: { message?: unknown } }>(error) &&
+        error.response?.status === 400
+          ? error.response.data?.error?.message
+          : undefined;
+      const context =
+        typeof message === 'string'
+          ? /^input \(\d+ tokens\) is larger than the max context size \((\d+) tokens\)\. skipping$/.exec(
+              message
+            )
+          : null;
+      if (!context) throw error;
+      const limit = Number(context[1]);
+      if (!Number.isSafeInteger(limit) || limit <= 0) throw error;
+      // Use the model's tokenizer so multilingual text fits the actual slot.
+      // Keep the normal string path for the other inputs in this batch.
+      const input = await Promise.all(
+        texts.map(async (text) => {
+          const { data } = await this.local.post<{ tokens: number[] }>(
+            `${this.baseUrl}/tokenize`,
+            { content: text, add_special: true },
+            options
+          );
+          return data.tokens.length > limit
+            ? data.tokens.slice(0, limit)
+            : text;
+        })
+      );
+      if (!input.some(Array.isArray)) throw error;
+      response = await request(input);
     }
     const data = response.data.data
       .sort((a, b) => a.index - b.index)

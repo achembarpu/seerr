@@ -218,3 +218,66 @@ describe('host inference', () => {
     }
   });
 });
+
+it('retries an oversized local embedding with the model context limit', async () => {
+  const received: unknown[] = [];
+  const contextError =
+    'input (5 tokens) is larger than the max context size (4 tokens). skipping';
+  const server = createServer(async (request, response) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const payload = JSON.parse(Buffer.concat(chunks).toString());
+    received.push(payload);
+    if (request.url === '/tokenize') {
+      response.end(
+        JSON.stringify({
+          tokens: payload.content === 'long input' ? [1, 2, 3, 4, 5] : [1, 2],
+        })
+      );
+    } else if (payload.input[0] === 'long input') {
+      response
+        .writeHead(400, { 'Content-Type': 'application/json' })
+        .end(JSON.stringify({ error: { message: contextError } }));
+    } else if (payload.input[0] === 'invalid input') {
+      response
+        .writeHead(400, { 'Content-Type': 'application/json' })
+        .end(JSON.stringify({ error: { message: 'Unrelated bad request' } }));
+    } else {
+      response.end(
+        JSON.stringify({
+          data: [
+            { index: 1, embedding: Array(384).fill(2) },
+            { index: 0, embedding: Array(384).fill(1) },
+          ],
+        })
+      );
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const engine = new EmbeddingEngine();
+  engine.phase = 'ready';
+  Object.assign(engine, {
+    baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+  });
+  try {
+    const embeddings = await engine.embed(['long input', 'short input']);
+    assert.deepEqual(
+      embeddings.map((vector) => vector[0]),
+      [1, 2]
+    );
+    assert.deepEqual(received[0], { input: ['long input', 'short input'] });
+    assert.deepEqual(received[3], { input: [[1, 2, 3, 4], 'short input'] });
+    assert.deepEqual(
+      new Set(received.slice(1, 3)),
+      new Set([
+        { content: 'long input', add_special: true },
+        { content: 'short input', add_special: true },
+      ])
+    );
+    await assert.rejects(engine.embed(['invalid input']), /status code 400/);
+    assert.equal(received.length, 5);
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
